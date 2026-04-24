@@ -5,6 +5,7 @@ from universe import load_universe
 from scanner import get_global_quote, crossed_drop_threshold, REQUEST_SLEEP
 from state import already_alerted, mark_alerted, clear_old_state
 from telegram_client import send_telegram
+from universe import load_universe, build_universe, save_universe, universe_is_stale
 
 DROP_THRESHOLD = float(os.environ.get('DROP_THRESHOLD', '10'))
 MAX_SYMBOLS_PER_RUN = int(os.environ.get('MAX_SYMBOLS_PER_RUN', '25'))
@@ -14,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 def run_scan():
     universe = load_universe()
-    
+
     if not universe:
         logging.info("Universe vazio. A criar universe_us.csv...")
         universe = build_universe()
