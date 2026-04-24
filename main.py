@@ -31,7 +31,7 @@ FMP_API_KEY      = os.environ.get("FMP_API_KEY", "demo")
 DROP_THRESHOLD   = float(os.environ.get("DROP_THRESHOLD", "10"))
 
 # Market cap mínimo para filtrar micro-caps (default 1B)
-MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "1000000000"))
+MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
 
 # Cache de alertas do dia
 _alerted_today: set = set()
@@ -131,6 +131,12 @@ def run_scan() -> None:
             logging.info(f"A analisar {symbol} ({stock['change_pct']:.1f}%)...")
 
             fundamentals = get_fundamentals(symbol)
+
+            # Micro-cap detectado pelo yfinance — saltar
+            if fundamentals.get("skip"):
+                _alerted_today.add(alert_key)
+                continue
+
             sector = fundamentals.get("sector", "")
 
             # Score fundamentals pelo sector
