@@ -1,14 +1,12 @@
 """
 Trigger: Yahoo Finance day_losers (gratuito, sem API key)
-Fundamentais: yfinance (gratuito, sem API key)
-Sem dependências pagas.
+Fundamentais: yfinance com sleep aumentado + User-Agent
 """
 import time
 import logging
 import requests
 import yfinance as yf
 
-# ── Headers para simular browser — evita bloqueio por bot detection ───────────
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -19,18 +17,11 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Segundos entre chamadas yfinance
-_YF_SLEEP = 4.0
+_YF_SLEEP = 8.0  # segundos entre chamadas — conservador para evitar rate limit
 
-
-# ── 1. LOSERS (Yahoo Finance) ─────────────────────────────────────────────────
 
 def screen_big_drops(min_drop_pct: float = 10.0,
                      min_market_cap: int = 2_000_000_000) -> list[dict]:
-    """
-    Usa o screener predefinido do Yahoo Finance (day_losers).
-    Gratuito, sem API key, funciona no Railway.
-    """
     url = (
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
         "?formatted=false&scrIds=day_losers&count=100&start=0"
@@ -38,8 +29,7 @@ def screen_big_drops(min_drop_pct: float = 10.0,
     try:
         r = requests.get(url, headers=_HEADERS, timeout=15)
         r.raise_for_status()
-        data = r.json()
-
+        data  = r.json()
         quotes = (
             data.get("finance", {})
                 .get("result", [{}])[0]
@@ -51,49 +41,57 @@ def screen_big_drops(min_drop_pct: float = 10.0,
 
     results = []
     for q in quotes:
-        chg = q.get("regularMarketChangePercent", 0) or 0
+        chg   = q.get("regularMarketChangePercent", 0) or 0
         if chg > -min_drop_pct:
             continue
-
-        mc = q.get("marketCap") or 0
+        mc    = q.get("marketCap") or 0
         if mc and mc < min_market_cap:
             continue
-
-        # Saltar ETFs alavancados e warrants
-        sym = q.get("symbol", "")
+        sym   = q.get("symbol", "")
         qtype = q.get("quoteType", "")
-        if qtype in ("ETF", "MUTUALFUND"):
+        if qtype in ("ETF", "MUTUALFUND") or len(sym) > 5:
             continue
-        if len(sym) > 5:
-            continue
-
         results.append({
-            "symbol":      sym,
-            "name":        q.get("longName") or q.get("shortName") or sym,
-            "price":       q.get("regularMarketPrice"),
-            "change_pct":  round(chg, 2),
-            "market_cap":  mc,
+            "symbol":     sym,
+            "name":       q.get("longName") or q.get("shortName") or sym,
+            "price":      q.get("regularMarketPrice"),
+            "change_pct": round(chg, 2),
+            "market_cap": mc,
         })
 
-    logging.info(f"Yahoo day_losers: {len(results)} candidatos (queda >= {min_drop_pct}%, cap >= ${min_market_cap/1e9:.0f}B)")
+    logging.info(
+        f"Yahoo day_losers: {len(results)} candidatos "
+        f"(queda >= {min_drop_pct}%, cap >= ${min_market_cap/1e9:.0f}B)"
+    )
     return results
 
 
-# ── 2. FUNDAMENTAIS (yfinance) ────────────────────────────────────────────────
-
 def get_fundamentals(symbol: str) -> dict:
-    """Fundamentais via yfinance com backoff em caso de rate limit."""
+    """
+    yfinance com sleep generoso e backoff progressivo.
+    Usa session com User-Agent para reduzir rate limiting.
+    """
     result = {"symbol": symbol}
 
-    for attempt in range(3):
+    # Injectar User-Agent no yfinance via session customizada
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+
+    for attempt in range(4):
         try:
-            wait = _YF_SLEEP if attempt == 0 else 20 * attempt
+            wait = _YF_SLEEP + (15 * attempt)  # 8s, 23s, 38s, 53s
+            if attempt > 0:
+                logging.warning(f"  {symbol}: a aguardar {wait:.0f}s antes de tentar (tentativa {attempt+1}/4)")
             time.sleep(wait)
 
-            inf = yf.Ticker(symbol).info or {}
+            t   = yf.Ticker(symbol, session=session)
+            inf = t.info or {}
+
+            if not inf or len(inf) < 5:
+                logging.warning(f"  {symbol}: resposta vazia do yfinance")
+                continue
 
             mc = inf.get("marketCap") or 0
-            # Verificar cap real — rejeitar micro-caps que escaparam ao filtro
             if mc > 0 and mc < 1_000_000_000:
                 result["skip"] = True
                 logging.info(f"  {symbol}: micro-cap ${mc/1e6:.0f}M — a saltar")
@@ -129,23 +127,27 @@ def get_fundamentals(symbol: str) -> dict:
                 result["analyst_upside"] = (target - price) / price * 100
                 result["analyst_target"] = target
 
-            return result
+            return result  # sucesso
 
         except Exception as e:
-            if "Too Many Requests" in str(e) or "429" in str(e):
-                logging.warning(f"  {symbol}: rate limit (tentativa {attempt+1}/3)")
+            err = str(e)
+            if "429" in err or "Too Many Requests" in err or "Rate limit" in err:
+                logging.warning(f"  {symbol}: rate limited (tentativa {attempt+1}/4)")
                 continue
             logging.error(f"  {symbol}: {e}")
             break
 
+    logging.error(f"  {symbol}: falhou após todas as tentativas")
     return result
 
 
 def get_news(symbol: str, limit: int = 3) -> list[dict]:
     try:
-        time.sleep(2)
-        news = yf.Ticker(symbol).news or []
-        out = []
+        time.sleep(3)
+        session = requests.Session()
+        session.headers.update(_HEADERS)
+        news = yf.Ticker(symbol, session=session).news or []
+        out  = []
         for item in news[:limit]:
             content = item.get("content") or {}
             out.append({
@@ -161,8 +163,10 @@ def get_news(symbol: str, limit: int = 3) -> list[dict]:
 
 def get_historical_pe(symbol: str, years: int = 5) -> float | None:
     try:
-        time.sleep(2)
-        pe = (yf.Ticker(symbol).info or {}).get("trailingPE")
+        time.sleep(3)
+        session = requests.Session()
+        session.headers.update(_HEADERS)
+        pe = (yf.Ticker(symbol, session=session).info or {}).get("trailingPE")
         return round(pe, 1) if pe and 0 < pe < 300 else None
     except:
         return None
