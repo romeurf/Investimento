@@ -202,7 +202,19 @@ def get_historical_pe(symbol: str) -> Optional[float]:
         return round(pe, 1) if pe and 0 < pe < 300 else None
     except:
         return None
-
+        
+def get_rsi(symbol: str, period: int = 14) -> float | None:
+    try:
+        data = yf.download(symbol, period="1mo", progress=False)
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1]
+    except:
+        return None
+        
 if __name__ == "__main__":
     # Test the new global screening
     candidates = screen_global_dips()
