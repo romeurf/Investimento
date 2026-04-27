@@ -1,8 +1,10 @@
 """
 Trigger: Yahoo Finance day_losers (gratuito, sem API key)
 Fundamentais: yfinance — sem session customizada (deixar gerir crumb interno)
+Catalisadores: Tavily Search API (TAVILY_API_KEY)
 """
 
+import os
 import time
 import logging
 import requests
@@ -19,9 +21,32 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
-def screen_global_dips(min_drop_pct: float = 10.0,
-                       min_market_cap: int = 2_000_000_000) -> list[dict]:
+# Keywords que indicam catalisador real próximo
+_CATALYST_KEYWORDS = {
+    "earnings":     "📅 Earnings próximo",
+    "results":      "📅 Resultados próximos",
+    "fda":          "💊 Decisão FDA",
+    "approval":     "✅ Aprovação regulatória",
+    "buyback":      "🔁 Recompra de acções",
+    "repurchase":   "🔁 Recompra de acções",
+    "dividend":     "💰 Dividendo especial",
+    "merger":       "🤝 M&A",
+    "acquisition":  "🤝 Aquisição",
+    "spin":         "🔀 Spin-off",
+    "split":        "✂️ Stock split",
+    "guidance":     "📈 Guidance update",
+    "upgrade":      "⬆️ Upgrade analistas",
+    "contract":     "📄 Contrato importante",
+    "partnership":  "🤝 Parceria estratégica",
+}
+
+
+def screen_global_dips(
+    min_drop_pct: float = 10.0,
+    min_market_cap: int = 2_000_000_000,
+) -> list[dict]:
     """Yahoo Finance day_losers — sem API key, gratuito."""
     url = (
         "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
@@ -46,6 +71,7 @@ def screen_global_dips(min_drop_pct: float = 10.0,
         if chg > -min_drop_pct:
             continue
         mc = q.get("marketCap") or 0
+        # Se market_cap vier do Yahoo e for claramente abaixo do mínimo, descarta já aqui
         if mc and mc < min_market_cap:
             continue
         sym = q.get("symbol", "")
@@ -65,6 +91,22 @@ def screen_global_dips(min_drop_pct: float = 10.0,
         f"(>={min_drop_pct}%, cap>=${min_market_cap/1e9:.0f}B)"
     )
     return results
+
+
+def get_spy_change() -> float | None:
+    """
+    Devolve a variação % do SPY (S&P 500 ETF) no dia actual.
+    Usado para distinguir quedas idiossincráticas de quedas macro.
+    """
+    try:
+        time.sleep(2)
+        inf = yf.Ticker("SPY").info or {}
+        chg = inf.get("regularMarketChangePercent")
+        if chg is not None:
+            return round(float(chg), 2)
+    except Exception as e:
+        logging.warning(f"SPY change: {e}")
+    return None
 
 
 def _yf_info(symbol: str) -> dict:
@@ -93,7 +135,7 @@ def _yf_info(symbol: str) -> dict:
     return {}
 
 
-def get_fundamentals(symbol: str, region: str = "") -> dict:
+def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_000_000) -> dict:
     result = {"symbol": symbol}
     inf = _yf_info(symbol)
 
@@ -102,9 +144,10 @@ def get_fundamentals(symbol: str, region: str = "") -> dict:
         return result
 
     mc = inf.get("marketCap") or 0
-    if mc > 0 and mc < 1_000_000_000:
+    # Fix: usa o MIN_MARKET_CAP real (2B por defeito), não o hardcoded de 1B
+    if mc > 0 and mc < min_market_cap:
         result["skip"] = True
-        logging.info(f"  {symbol}: micro-cap ${mc/1e6:.0f}M — a saltar")
+        logging.info(f"  {symbol}: cap ${mc/1e9:.1f}B < mínimo ${min_market_cap/1e9:.0f}B — a saltar")
         return result
 
     price = inf.get("currentPrice") or inf.get("regularMarketPrice")
@@ -149,6 +192,69 @@ def get_fundamentals(symbol: str, region: str = "") -> dict:
     return result
 
 
+def get_catalyst(symbol: str, company_name: str = "") -> dict:
+    """
+    Usa Tavily para procurar catalisadores próximos para a empresa.
+    Devolve dict com:
+      - found: bool
+      - label: str descritivo (ex: "📅 Earnings próximo")
+      - snippet: str (excerto relevante)
+    Requer TAVILY_API_KEY nas variáveis de ambiente.
+    Só é chamado para Tier 3 top 5 e Ranking Flip — ~10-15 calls/dia.
+    """
+    if not TAVILY_API_KEY:
+        return {"found": False, "label": "⚠️ Tavily não configurado", "snippet": ""}
+
+    name = company_name or symbol
+    query = f"{symbol} {name} catalyst earnings FDA buyback guidance 2026"
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 5,
+                "include_answer": True,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logging.warning(f"Tavily {symbol}: {e}")
+        return {"found": False, "label": "⚠️ Sem catalisador identificado", "snippet": ""}
+
+    # Agrega todo o texto (answer + snippets dos resultados)
+    texts = []
+    if data.get("answer"):
+        texts.append(data["answer"].lower())
+    for r in data.get("results", []):
+        texts.append((r.get("content") or "").lower())
+        texts.append((r.get("title") or "").lower())
+    full_text = " ".join(texts)
+
+    # Procura keywords de catalisador
+    for keyword, label in _CATALYST_KEYWORDS.items():
+        if keyword in full_text:
+            # Extrai snippet relevante (primeira frase com a keyword)
+            snippet = ""
+            for r in data.get("results", []):
+                content = r.get("content") or ""
+                idx = content.lower().find(keyword)
+                if idx != -1:
+                    start = max(0, idx - 40)
+                    end = min(len(content), idx + 100)
+                    snippet = content[start:end].strip()
+                    break
+            logging.info(f"  {symbol}: catalisador encontrado — {label}")
+            return {"found": True, "label": label, "snippet": snippet[:120]}
+
+    # Nenhum catalisador encontrado — verifica se analistas têm upside forte
+    return {"found": False, "label": "⚠️ Sem catalisador identificado", "snippet": ""}
+
+
 def get_earnings_date(symbol: str) -> str | None:
     """
     Devolve data dos próximos earnings como string 'dd/mm/yyyy' se nos próximos 45 dias,
@@ -159,7 +265,6 @@ def get_earnings_date(symbol: str) -> str | None:
         cal = yf.Ticker(symbol).calendar
         if cal is None:
             return None
-        # calendar pode ser dict ou DataFrame
         if hasattr(cal, "to_dict"):
             cal = cal.to_dict()
         earnings_raw = None
@@ -170,10 +275,8 @@ def get_earnings_date(symbol: str) -> str | None:
                 break
         if earnings_raw is None:
             return None
-        # pode ser lista
         if isinstance(earnings_raw, list):
             earnings_raw = earnings_raw[0]
-        # normaliza para datetime
         if isinstance(earnings_raw, (int, float)):
             dt = datetime.fromtimestamp(earnings_raw, tz=timezone.utc)
         elif hasattr(earnings_raw, "to_pydatetime"):
@@ -191,10 +294,6 @@ def get_earnings_date(symbol: str) -> str | None:
 
 
 def get_52w_drawdown(symbol: str) -> float | None:
-    """
-    Devolve a % de queda desde o máximo de 52 semanas.
-    Exemplo: -23.5 significa que está 23.5% abaixo do máximo anual.
-    """
     try:
         time.sleep(3)
         inf = yf.Ticker(symbol).info or {}

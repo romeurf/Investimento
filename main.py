@@ -2,6 +2,7 @@
 DipRadar — Stock Alert Bot
 Trigger: Yahoo Finance day_losers (gratuito)
 Fundamentais: yfinance (gratuito)
+Catalisadores: Tavily Search API
 Deploy: Railway.app
 
 Variáveis Railway obrigatórias:
@@ -11,7 +12,8 @@ Variáveis opcionais:
   DROP_THRESHOLD=8          (% queda mínima para Tier 1)
   MIN_MARKET_CAP=2000000000
   SCAN_EVERY_MINUTES=30
-  MIN_DIP_SCORE=5           (score mínimo quantitativo para enviar alerta)
+  MIN_DIP_SCORE=5
+  TAVILY_API_KEY            (catalisadores Tier 3 + Ranking Flip)
 """
 
 import os
@@ -23,6 +25,7 @@ from datetime import datetime
 from market_client import (
     screen_global_dips, get_fundamentals, get_news,
     get_historical_pe, get_52w_drawdown, get_earnings_date,
+    get_catalyst, get_spy_change,
 )
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
@@ -66,10 +69,8 @@ def send_telegram(message: str) -> bool:
 
 # ── Target Sell robusto (estratégia Flip 2-3 meses) ───────────────────────────
 
-# Sectores considerados blue chip / hold eterno (sem flip forçado)
 _BLUECHIP_SECTORS = {"Consumer Defensive", "Utilities", "Financial Services"}
 
-# Cap de upside realista em 2-3 meses por sector (baseado em beta médio)
 _SECTOR_FLIP_CAP = {
     "Technology": 0.55,
     "Communication Services": 0.45,
@@ -84,22 +85,25 @@ _SECTOR_FLIP_CAP = {
     "Utilities": 0.15,
 }
 
+
 def calculate_flip_target(
     fundamentals: dict,
     dip_score: float,
     earnings_date: str | None = None,
+    catalyst: dict | None = None,
+    spy_change: float | None = None,
 ) -> tuple[str, str]:
     """
     Devolve (target_str, strategy_label).
 
-    Lógica (3 âncoras):
-      1. PE rerating: preço justo se o PE reverter ao pe_fair do sector
-      2. Analyst target: consenso externo de 20-30 analistas
-      3. Beta recovery: upside realista dado o beta e um recovery de mercado de +12%
-         (estimativa conservadora de recuperação de mercado após dip)
+    3 âncoras ponderadas:
+      1. PE rerating (peso 2x) — só se PE < pe_fair
+      2. Analyst target (peso 2x)
+      3. Beta recovery (peso 1x) — +12% mercado, conservador
 
-    Target final = min(âncoras válidas) com cap por sector.
-    Blue chips (Consumer Defensive, Utilities, Financials) → HOLD ETERNO.
+    Cap por sector ajustado por dip_score.
+    Blue chips → HOLD ETERNO.
+    Flag macro se queda ≈ SPY (dip não idiossincrático).
     """
     price = fundamentals.get("price") or 0
     if not price or price <= 0:
@@ -110,97 +114,106 @@ def calculate_flip_target(
     pe_current = fundamentals.get("pe") or 0
     pe_fair = sector_cfg.get("pe_fair", 22)
     analyst_target = fundamentals.get("analyst_target")
+    analyst_upside = fundamentals.get("analyst_upside") or 0
     beta = fundamentals.get("beta") or 1.0
     dividend_yield = fundamentals.get("dividend_yield") or 0
 
-    # ── Blue chip: nunca flip forçado ────────────────────────────────────────
+    # ── Blue chip: hold eterno ────────────────────────────────────────────────
     is_bluechip = sector in _BLUECHIP_SECTORS or (dividend_yield and dividend_yield > 0.025)
     if is_bluechip and dip_score >= 8:
         return "HOLD ETERNO", "💎 Blue chip — Adicionar em dips, nunca vender"
 
-    # ── Âncora 1: PE rerating ────────────────────────────────────────────────
+    # ── Âncora 1: PE rerating ─────────────────────────────────────────────────
     anchors = []
     if pe_current and pe_current > 0 and pe_current < pe_fair:
-        # só calcula se estiver abaixo do fair (verdadeiro dip de valuation)
         pe_target_price = price * (pe_fair / pe_current)
         pe_upside = (pe_target_price / price) - 1
         anchors.append(("PE rerating", pe_target_price, pe_upside))
 
-    # ── Âncora 2: Analyst target ─────────────────────────────────────────────
+    # ── Âncora 2: Analyst target ──────────────────────────────────────────────
     if analyst_target and analyst_target > price:
-        analyst_upside = (analyst_target / price) - 1
-        anchors.append(("Analistas", analyst_target, analyst_upside))
+        a_upside = (analyst_target / price) - 1
+        anchors.append(("Analistas", analyst_target, a_upside))
 
-    # ── Âncora 3: Beta recovery (+12% mercado em recovery, conservador) ──────
+    # ── Âncora 3: Beta recovery ───────────────────────────────────────────────
     market_recovery = 0.12
-    beta_target_price = price * (1 + beta * market_recovery)
-    beta_upside = (beta_target_price / price) - 1
-    anchors.append(("Beta recovery", beta_target_price, beta_upside))
+    beta_target = price * (1 + beta * market_recovery)
+    beta_upside = (beta_target / price) - 1
+    anchors.append(("Beta recovery", beta_target, beta_upside))
 
-    if not anchors:
-        return "N/D", "SEM DADOS"
-
-    # ── Target = média ponderada das âncoras disponíveis ─────────────────────
-    # PE rerating peso 2x (mais fundamental), analistas 2x, beta 1x
+    # ── Média ponderada ───────────────────────────────────────────────────────
     weights = {"PE rerating": 2, "Analistas": 2, "Beta recovery": 1}
     total_w = sum(weights[name] for name, _, _ in anchors)
-    weighted_price = sum(
-        weights[name] * target for name, target, _ in anchors
-    ) / total_w
+    weighted_price = sum(weights[name] * t for name, t, _ in anchors) / total_w
     weighted_upside = (weighted_price / price) - 1
 
-    # ── Cap por sector ───────────────────────────────────────────────────────
+    # ── Cap por sector + score ────────────────────────────────────────────────
     sector_cap = _SECTOR_FLIP_CAP.get(sector, 0.30)
     if dip_score >= 9:
-        sector_cap *= 1.20   # gem rara: cap 20% mais alto
+        sector_cap *= 1.20
     elif dip_score >= 8:
         sector_cap *= 1.10
 
     final_upside = min(weighted_upside, sector_cap)
     final_target = price * (1 + final_upside)
 
-    # ── Catalisador de earnings ───────────────────────────────────────────────
-    catalyst_str = ""
-    if earnings_date:
-        catalyst_str = f" | ✅ Earnings {earnings_date}"
-    else:
-        catalyst_str = " | ⚠️ Sem catalisador próximo"
+    # ── Flag macro vs idiossincrático ─────────────────────────────────────────
+    macro_flag = ""
+    if spy_change is not None and spy_change <= -2.0:
+        macro_flag = " | 🌍 Queda macro (SPY {:.1f}%) — timeline incerta".format(spy_change)
 
-    strategy = f"🎯 Flip target: ${final_target:.1f} (+{final_upside*100:.0f}%){catalyst_str}"
+    # ── Flag catalisador (Tavily > earnings > analyst upside) ─────────────────
+    catalyst_flag = ""
+    if catalyst and catalyst.get("found"):
+        catalyst_flag = f" | {catalyst['label']}"
+        if catalyst.get("snippet"):
+            catalyst_flag += f": _{catalyst['snippet']}_"
+    elif earnings_date:
+        catalyst_flag = f" | ✅ Earnings {earnings_date}"
+    elif analyst_upside and analyst_upside > 20:
+        catalyst_flag = " | 📡 Analistas vêem upside forte — possível catalisador"
+    else:
+        catalyst_flag = " | ⚠️ Sem catalisador identificado"
+
+    strategy = (
+        f"🎯 Flip: ${final_target:.1f} (+{final_upside*100:.0f}%)"
+        f"{catalyst_flag}{macro_flag}"
+    )
     return f"${final_target:.1f} (+{final_upside*100:.0f}%)", strategy
 
 
-# ── Ranking Flip (todos os tiers com score ≥7) ─────────────────────────────────
+# ── Ranking Flip ───────────────────────────────────────────────────────────────
 
-def build_flip_ranking(ranked_entries: list[dict]) -> str:
-    """
-    ranked_entries: lista de dicts com keys:
-      symbol, dip_score, fundamentals, tier, earnings_date
-    Ordenado por dip_score DESC.
-    """
+def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> str:
     if not ranked_entries:
         return ""
 
-    lines = ["", "*🏆 RANKING FLIP — Top compras de hoje*", ""]
+    lines = ["", "*🏆 RANKING FLIP — Top compras de hoje*"]
+    if spy_change is not None:
+        spy_str = f"+{spy_change:.1f}%" if spy_change >= 0 else f"{spy_change:.1f}%"
+        lines.append(f"_SPY hoje: {spy_str}_")
+    lines.append("")
+
     top = sorted(ranked_entries, key=lambda x: x["dip_score"], reverse=True)[:8]
 
     for i, entry in enumerate(top, 1):
-        sym = entry["symbol"]
-        score = entry["dip_score"]
-        tier = entry["tier"]
-        f = entry["fundamentals"]
+        sym      = entry["symbol"]
+        score    = entry["dip_score"]
+        tier     = entry["tier"]
+        f        = entry["fundamentals"]
         earnings = entry.get("earnings_date")
-        price = f.get("price", 0)
-        mc_b = (f.get("market_cap") or 0) / 1e9
+        catalyst = entry.get("catalyst")
+        price    = f.get("price", 0)
+        mc_b     = (f.get("market_cap") or 0) / 1e9
 
-        target_str, strategy = calculate_flip_target(f, score, earnings)
+        target_str, strategy = calculate_flip_target(
+            f, score, earnings, catalyst, spy_change
+        )
 
         score_stars = "⭐" * min(int(score // 2), 5)
-        tier_badge = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
+        tier_badge  = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
 
-        lines.append(
-            f"*{i}. {sym}* {tier_badge} | Score {score:.1f} {score_stars}"
-        )
+        lines.append(f"*{i}. {sym}* {tier_badge} | Score {score:.1f} {score_stars}")
         lines.append(f"   💰 ${price} | 🏦 ${mc_b:.1f}B")
         lines.append(f"   {strategy}")
         lines.append("")
@@ -213,7 +226,7 @@ def build_flip_ranking(ranked_entries: list[dict]) -> str:
 def build_alert(
     stock: dict,
     fundamentals: dict,
-    historical_pe: dict | None,
+    historical_pe: float | None,
     news: list,
     verdict: str,
     emoji: str,
@@ -221,20 +234,16 @@ def build_alert(
     dip_score: float,
     rsi_str: str | None,
 ) -> str:
-
-    sector = fundamentals.get("sector", "")
+    sector     = fundamentals.get("sector", "")
     sector_cfg = get_sector_config(sector)
-    name = fundamentals.get("name", stock.get("name", stock.get("symbol", "N/A")))
-
-    symbol = stock["symbol"]
-    change = stock["change_pct"]
-    price = fundamentals.get("price") or stock.get("price", "N/D")
-    mc_b = (fundamentals.get("market_cap") or 0) / 1e9
-
-    drawdown = fundamentals.get("drawdown_from_high")
+    name       = fundamentals.get("name", stock.get("name", stock.get("symbol", "N/A")))
+    symbol     = stock["symbol"]
+    change     = stock["change_pct"]
+    price      = fundamentals.get("price") or stock.get("price", "N/D")
+    mc_b       = (fundamentals.get("market_cap") or 0) / 1e9
+    drawdown   = fundamentals.get("drawdown_from_high")
     drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
-
-    region = stock.get("region")
+    region     = stock.get("region")
     region_part = f" ({region})" if region else ""
 
     if dip_score >= 8:
@@ -255,7 +264,6 @@ def build_alert(
         "",
         f"*{emoji} Veredito: {verdict}*",
     ]
-
     for reason in reasons:
         lines.append(f"  _{reason}_")
 
@@ -265,10 +273,10 @@ def build_alert(
     if news:
         lines += ["", "*📰 Notícias:*"]
         for item in news[:3]:
-            title = item["title"][:70]
-            url = item["url"]
+            title  = item["title"][:70]
+            url    = item["url"]
             source = item.get("source", "")
-            lines.append(f"  [{title}]({url}){' _' + source + '_ ' if source else ''}")
+            lines.append(f"  [{title}]({url}){' _' + source + '_' if source else ''}")
 
     lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)
@@ -296,7 +304,7 @@ def run_scan() -> None:
 
         try:
             logging.info(f"A analisar {symbol} ({stock['change_pct']:.1f}%)...")
-            fundamentals = get_fundamentals(symbol, stock.get("region", ""))
+            fundamentals = get_fundamentals(symbol, stock.get("region", ""), MIN_MARKET_CAP)
             if fundamentals.get("skip"):
                 _alerted_today.add(alert_key)
                 continue
@@ -342,28 +350,31 @@ def send_open_summary() -> None:
     if not tier1:
         return
 
+    spy_change = get_spy_change()
+    spy_str = ""
+    if spy_change is not None:
+        sign = "+" if spy_change >= 0 else ""
+        spy_str = f" | SPY: {sign}{spy_change:.1f}%"
+
     lines = [
         f"*⚡ Abertura +1h — {datetime.now().strftime('%d/%m %H:%M')}*",
-        f"_{len(tier1)} candidato(s) com queda ≥{DROP_THRESHOLD:.0f}% — investiga antes do fecho_",
+        f"_{len(tier1)} candidato(s) com queda ≥{DROP_THRESHOLD:.0f}%{spy_str}_",
         "",
     ]
     for s in tier1[:8]:
         mc_b = (s.get("market_cap") or 0) / 1e9
-        region = s.get("region", "")
-        region_str = f" ({region})" if region else ""
-        lines.append(f"  📉 *{s['symbol']}*{region_str}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
+        lines.append(f"  📉 *{s['symbol']}*: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
 
-    lines += [
-        "",
-        "_Resumo completo com drawdown 52w às 21h15_",
-    ]
+    lines += ["", "_Resumo completo às 21h15_"]
     send_telegram("\n".join(lines))
 
 
 # ── Resumo fecho (21h15 Lisboa) ────────────────────────────────────────────────
 
 def send_close_summary() -> None:
-    # Scan amplo: apanha Tier 1 (>=DROP_THRESHOLD), Tier 2 (7–DROP), Tier 3 (3–8)
+    # Uma chamada SPY no início — flag macro para todo o resumo
+    spy_change = get_spy_change()
+
     all_losers = screen_global_dips(
         min_drop_pct=3.0,
         min_market_cap=MIN_MARKET_CAP,
@@ -371,17 +382,17 @@ def send_close_summary() -> None:
     if not all_losers:
         return
 
-    tier1 = [s for s in all_losers if s["change_pct"] <= -DROP_THRESHOLD]
-    tier2 = [s for s in all_losers if -DROP_THRESHOLD < s["change_pct"] <= -7.0]
+    tier1            = [s for s in all_losers if s["change_pct"] <= -DROP_THRESHOLD]
+    tier2            = [s for s in all_losers if -DROP_THRESHOLD < s["change_pct"] <= -7.0]
     tier3_candidates = [s for s in all_losers if -8.0 < s["change_pct"] <= -3.0]
 
-    # Cache de fundamentals partilhado entre todos os tiers
-    fund_cache: dict[str, dict] = {}
+    # Cache partilhado
+    fund_cache:  dict[str, dict]  = {}
     score_cache: dict[str, float] = {}
 
     def _get_fund(sym, region=""):
         if sym not in fund_cache:
-            fund_cache[sym] = get_fundamentals(sym, region)
+            fund_cache[sym] = get_fundamentals(sym, region, MIN_MARKET_CAP)
         return fund_cache[sym]
 
     def _get_score(sym, fund):
@@ -389,10 +400,10 @@ def send_close_summary() -> None:
             score_cache[sym], _ = calculate_dip_score(fund, sym)
         return score_cache[sym]
 
-    # ── Tier 3: filtrar por score ≥8 ──────────────────────────────────────────
+    # ── Tier 3: score ≥8 ──────────────────────────────────────────────────────
     tier3 = []
     for s in tier3_candidates:
-        sym = s["symbol"]
+        sym  = s["symbol"]
         fund = _get_fund(sym, s.get("region", ""))
         if fund.get("skip"):
             continue
@@ -402,29 +413,28 @@ def send_close_summary() -> None:
             tier3.append(s)
     tier3.sort(key=lambda x: x.get("_score", 0), reverse=True)
 
+    # ── Header ────────────────────────────────────────────────────────────────
+    spy_header = ""
+    if spy_change is not None:
+        sign = "+" if spy_change >= 0 else ""
+        macro_warn = " 🌍 DIA MACRO" if spy_change <= -2.0 else ""
+        spy_header = f"_SPY: {sign}{spy_change:.1f}%{macro_warn}_\n"
+
     lines = [
         f"*📋 Resumo Fecho — {datetime.now().strftime('%d/%m/%Y')}*",
-        "",
+        spy_header,
     ]
 
     # ── TIER 1 ────────────────────────────────────────────────────────────────
     if tier1:
         lines.append(f"*🔴 TIER 1 — Análise completa (≥{DROP_THRESHOLD:.0f}%):*")
         for s in tier1[:6]:
-            mc_b = (s.get("market_cap") or 0) / 1e9
-            sym  = s["symbol"]
-            region = s.get("region", "")
-            region_str = f" ({region})" if region else ""
+            mc_b     = (s.get("market_cap") or 0) / 1e9
+            sym      = s["symbol"]
             drawdown = get_52w_drawdown(sym)
-            d_str = f" | 52w: *{drawdown:.0f}%*" if drawdown is not None else ""
-            lines.append(
-                f"  📉 *{sym}*{region_str}: {s['change_pct']:.1f}% hoje{d_str} — ${mc_b:.1f}B"
-            )
-        lines += [
-            "",
-            "_→ Para cada Tier 1: verifica catalisador, FCF e 4 critérios Flip_",
-            "",
-        ]
+            d_str    = f" | 52w: *{drawdown:.0f}%*" if drawdown is not None else ""
+            lines.append(f"  📉 *{sym}*: {s['change_pct']:.1f}% hoje{d_str} — ${mc_b:.1f}B")
+        lines += ["", "_→ Verifica catalisador, FCF e 4 critérios Flip_", ""]
     else:
         lines += [f"_Sem quedas ≥{DROP_THRESHOLD:.0f}% hoje_", ""]
 
@@ -433,38 +443,30 @@ def send_close_summary() -> None:
         lines.append(f"*🟡 TIER 2 — Watchlist (7–{DROP_THRESHOLD:.0f}%):*")
         for s in tier2[:6]:
             mc_b = (s.get("market_cap") or 0) / 1e9
-            region = s.get("region", "")
-            region_str = f" ({region})" if region else ""
-            lines.append(f"  👀 *{s['symbol']}*{region_str}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
-        lines += [
-            "",
-            "_→ Tier 2: monitorizar apenas, sem acção imediata_",
-            "",
-        ]
+            lines.append(f"  👀 *{s['symbol']}*: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
+        lines += ["", "_→ Monitorizar apenas, sem acção imediata_", ""]
 
-    # ── TIER 3: TOP 5 detalhadas + lista score 9+ restantes ───────────────────
+    # ── TIER 3: TOP 5 detalhadas + score 9+ adicionais ────────────────────────
     if tier3:
         lines.append("*🔵 TIER 3 — Gems Raras (-3/-8%, score ≥8):*")
         lines.append("")
-
-        top5 = tier3[:5]
+        top5       = tier3[:5]
         rest_9plus = [s for s in tier3[5:] if s.get("_score", 0) >= 9]
 
         for s in top5:
-            sym   = s["symbol"]
-            score = s.get("_score", 0)
-            fund  = fund_cache.get(sym, {})
-            mc_b  = (fund.get("market_cap") or 0) / 1e9
-            sector = fund.get("sector", "")
-            sector_cfg = get_sector_config(sector)
-            sector_label = sector_cfg.get("label", sector) or sector
-            price = fund.get("price", 0)
+            sym          = s["symbol"]
+            score        = s.get("_score", 0)
+            fund         = fund_cache.get(sym, {})
+            mc_b         = (fund.get("market_cap") or 0) / 1e9
+            sector       = fund.get("sector", "")
+            sector_label = get_sector_config(sector).get("label", sector) or sector
+            price        = fund.get("price", 0)
+            earnings     = get_earnings_date(sym)
+            catalyst     = get_catalyst(sym, fund.get("name", ""))
+            _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change)
 
-            earnings = get_earnings_date(sym)
-            target_str, strategy = calculate_flip_target(fund, score, earnings)
-
-            score_badge = "🔥" if score >= 9 else "⭐"
-            lines.append(f"  {score_badge} *{sym}* — Score {score:.1f} | ${price} | ${mc_b:.1f}B | {sector_label}")
+            badge = "🔥" if score >= 9 else "⭐"
+            lines.append(f"  {badge} *{sym}* — Score {score:.1f} | ${price} | ${mc_b:.1f}B | {sector_label}")
             lines.append(f"     {strategy}")
             lines.append("")
 
@@ -473,9 +475,8 @@ def send_close_summary() -> None:
             lines.append(f"  _Score 9+ adicionais: {tickers_9}_")
             lines.append("")
 
-    # ── RANKING FLIP (todos os tiers com score ≥7) ────────────────────────────
+    # ── RANKING FLIP ──────────────────────────────────────────────────────────
     ranking_entries = []
-
     for tier_num, tier_list in [(1, tier1), (2, tier2), (3, tier3)]:
         for s in tier_list:
             sym  = s["symbol"]
@@ -485,15 +486,17 @@ def send_close_summary() -> None:
             score = _get_score(sym, fund)
             if score >= 7:
                 earnings = get_earnings_date(sym)
+                catalyst = get_catalyst(sym, fund.get("name", ""))
                 ranking_entries.append({
-                    "symbol": sym,
-                    "dip_score": score,
+                    "symbol":       sym,
+                    "dip_score":    score,
                     "fundamentals": fund,
-                    "tier": tier_num,
+                    "tier":         tier_num,
                     "earnings_date": earnings,
+                    "catalyst":     catalyst,
                 })
 
-    ranking_block = build_flip_ranking(ranking_entries)
+    ranking_block = build_flip_ranking(ranking_entries, spy_change)
     if ranking_block:
         lines.append(ranking_block)
 
@@ -512,8 +515,9 @@ if __name__ == "__main__":
 
     send_telegram(
         f"🤖 *DipRadar iniciado*\n"
-        f"Threshold Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥8)\n"
+        f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥8)\n"
         f"Cap mínimo: ${MIN_MARKET_CAP/1e9:.0f}B | Score mínimo: {MIN_DIP_SCORE}/10\n"
+        f"Catalisadores: Tavily {'✅' if os.environ.get('TAVILY_API_KEY') else '⚠️ não configurado'}\n"
         f"Resumos: 15h30 (abertura) e 21h15 (fecho) Lisboa\n"
         f"_Scan a cada {SCAN_MINUTES} minutos_"
     )
