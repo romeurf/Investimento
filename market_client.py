@@ -1,4 +1,3 @@
-
 """ 
 DipRadar - Multi-region stock dip screener
 US + Europe + UK + Asia via Yahoo Finance (free & unlimited)
@@ -97,7 +96,7 @@ def screen_global_dips(
 def _yf_info(symbol: str) -> dict:
     """Get yfinance info with retry and backoff."""
     for attempt in range(4):
-        wait = 10 + (20 * attempt)
+        wait = 15 + (30 * attempt)  # 15s, 45s, 75s, 105s
         time.sleep(wait)
         try:
             inf = yf.Ticker(symbol).info

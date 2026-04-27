@@ -149,7 +149,7 @@ def run_scan() -> None:
             if send_telegram(message):
                 _alerted_today.add(alert_key)
                 logging.info(f"  ✅ Alerta enviado: {symbol} ({verdict})")
-            time.sleep(2)
+            time.sleep(5)  # increased from 2s to reduce 429s
 
         except Exception as e:
             logging.error(f"Erro {symbol}: {e}")
