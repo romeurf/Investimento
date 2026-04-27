@@ -10,7 +10,7 @@ import requests
 import yfinance as yf
 from typing import List, Dict, Optional
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _HEADERS = {
