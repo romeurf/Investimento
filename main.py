@@ -1,5 +1,5 @@
 """
-Stock Alert Bot
+DipRadar — Stock Alert Bot
 Trigger: Yahoo Finance day_losers (gratuito)
 Fundamentais: yfinance (gratuito)
 Deploy: Railway.app
@@ -8,10 +8,10 @@ Variáveis Railway obrigatórias:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
   TZ=Europe/Lisbon
 Variáveis opcionais:
-  DROP_THRESHOLD=10         (% queda mínima para Tier 1)
+  DROP_THRESHOLD=8          (% queda mínima para Tier 1)
   MIN_MARKET_CAP=2000000000
   SCAN_EVERY_MINUTES=30
-  MIN_DIP_SCORE=4           (score mínimo quantitativo para enviar alerta)
+  MIN_DIP_SCORE=5           (score mínimo quantitativo para enviar alerta)
 """
 
 import os
@@ -35,10 +35,10 @@ logging.basicConfig(
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-DROP_THRESHOLD   = float(os.environ.get("DROP_THRESHOLD", "10"))
+DROP_THRESHOLD   = float(os.environ.get("DROP_THRESHOLD", "8"))
 MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
 SCAN_MINUTES     = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
-MIN_DIP_SCORE    = int(os.environ.get("MIN_DIP_SCORE", "4"))
+MIN_DIP_SCORE    = int(os.environ.get("MIN_DIP_SCORE", "5"))
 
 _alerted_today: set = set()
 
@@ -64,11 +64,19 @@ def send_telegram(message: str) -> bool:
         return False
 
 
-# ── Alerta individual (scan contínuo) ─────────────────────────────────────────
+# ── Alerta individual ──────────────────────────────────────────────────────────────
 
-def buildalertstock(stock: dict, fundamentals: dict, historical_pe: float | None,
-                   news: list, verdict: str, emoji: str, reasons: list,
-                   dip_score: int, rsi_str: str | None) -> str:
+def build_alert(
+    stock: dict,
+    fundamentals: dict,
+    historical_pe: dict | None,
+    news: list,
+    verdict: str,
+    emoji: str,
+    reasons: list,
+    dip_score: int,
+    rsi_str: str | None,
+) -> str:
 
     sector = fundamentals.get("sector", "")
     sector_cfg = get_sector_config(sector)
@@ -85,7 +93,6 @@ def buildalertstock(stock: dict, fundamentals: dict, historical_pe: float | None
     region = stock.get("region")
     region_part = f" ({region})" if region else ""
 
-    # Score badge
     if dip_score >= 8:
         score_badge = f"🔥 Score: {dip_score}/10"
     elif dip_score >= 6:
@@ -123,6 +130,8 @@ def buildalertstock(stock: dict, fundamentals: dict, historical_pe: float | None
     return "\n".join(lines)
 
 
+# ── Scan contínuo ──────────────────────────────────────────────────────────────
+
 def run_scan() -> None:
     today = datetime.now().date().isoformat()
     logging.info(f"A correr scan — {datetime.now().strftime('%H:%M')}")
@@ -156,18 +165,21 @@ def run_scan() -> None:
                 _alerted_today.add(alert_key)
                 continue
 
-            # Score quantitativo — filtro adicional
+            # Score quantitativo — RSI já vem dentro de fundamentals
             dip_score, rsi_str = calculate_dip_score(fundamentals, symbol)
             if dip_score < MIN_DIP_SCORE:
                 logging.info(f"  {symbol}: score {dip_score} < {MIN_DIP_SCORE} — a saltar")
                 _alerted_today.add(alert_key)
                 continue
 
+            # P/E histórico real (3 anos de dados)
             historical_pe = get_historical_pe(symbol)
             news          = get_news(symbol)
-            message       = buildalertstock(stock, fundamentals, historical_pe,
-                                            news, verdict, emoji, reasons,
-                                            dip_score, rsi_str)
+            message       = build_alert(
+                stock, fundamentals, historical_pe,
+                news, verdict, emoji, reasons,
+                dip_score, rsi_str,
+            )
 
             if send_telegram(message):
                 _alerted_today.add(alert_key)
@@ -245,7 +257,7 @@ def send_close_summary() -> None:
         lines += [f"_Sem quedas ≥{DROP_THRESHOLD:.0f}% hoje_", ""]
 
     if tier2:
-        lines.append("*🟡 TIER 2 — Watchlist (7–10%):*")
+        lines.append("*🟡 TIER 2 — Watchlist (7–{:.0f}%):*".format(DROP_THRESHOLD))
         for s in tier2[:6]:
             mc_b = (s.get("market_cap") or 0) / 1e9
             region = s.get("region", "")
@@ -263,14 +275,14 @@ def send_close_summary() -> None:
 
 if __name__ == "__main__":
     logging.info("=" * 60)
-    logging.info("Stock Alert Bot iniciado")
+    logging.info("DipRadar iniciado")
     logging.info(f"Threshold: {DROP_THRESHOLD}% | Min cap: ${MIN_MARKET_CAP/1e9:.0f}B")
     logging.info(f"Scan a cada {SCAN_MINUTES} minutos | Min score: {MIN_DIP_SCORE}")
     logging.info(f"Timezone activo: {datetime.now().strftime('%Z %z')}")
     logging.info("=" * 60)
 
     send_telegram(
-        f"🤖 *Bot iniciado*\n"
+        f"🤖 *DipRadar iniciado*\n"
         f"Threshold Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}%\n"
         f"Cap mínimo: ${MIN_MARKET_CAP/1e9:.0f}B | Score mínimo: {MIN_DIP_SCORE}/10\n"
         f"Resumos: 15h30 (abertura) e 21h15 (fecho) Lisboa\n"

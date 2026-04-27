@@ -43,7 +43,6 @@ def estimate_wacc(sector: str, beta: float | None = None) -> float:
     risk_free = 0.045
     equity_premium = 0.055  # historical ERP
 
-    # Beta por defeito por sector se não tivermos o real
     default_betas = {
         "Technology": 1.3,
         "Healthcare": 0.9,
@@ -60,8 +59,6 @@ def estimate_wacc(sector: str, beta: float | None = None) -> float:
 
     b = beta or default_betas.get(sector, 1.0)
     cost_of_equity = risk_free + b * equity_premium
-
-    # Custo de dívida aproximado (simplificado — sem estrutura de capital real)
     cost_of_debt_after_tax = 0.035
     equity_weight = 0.7
     debt_weight = 0.3
@@ -70,8 +67,15 @@ def estimate_wacc(sector: str, beta: float | None = None) -> float:
     return round(wacc, 4)
 
 
-def format_valuation_block(fundamentals: dict, historical_pe: float | None, sector: str) -> str:
-    """Formata bloco de avaliação para mensagem Telegram."""
+def format_valuation_block(
+    fundamentals: dict,
+    historical_pe: dict | None,
+    sector: str,
+) -> str:
+    """
+    Formata bloco de avaliação para mensagem Telegram.
+    historical_pe: dict com pe_hist_avg, pe_hist_median, pe_hist_min, pe_hist_max
+    """
     lines = []
 
     price = fundamentals.get("price")
@@ -87,12 +91,19 @@ def format_valuation_block(fundamentals: dict, historical_pe: float | None, sect
     gross_margin = fundamentals.get("gross_margin")
     roe = fundamentals.get("roe")
 
-    # P/E comparisons
+    # P/E actual vs histórico real
     if pe:
         pe_str = f"{pe:.1f}x"
         if historical_pe:
-            disc = (historical_pe - pe) / historical_pe * 100
-            pe_str += f" vs hist. {historical_pe:.1f}x ({disc:+.0f}%)"
+            avg = historical_pe.get("pe_hist_median")  # mediana é mais robusta
+            if avg:
+                disc = (avg - pe) / avg * 100
+                pe_str += f" vs hist. {avg:.1f}x ({disc:+.0f}%)"
+                # Mostra range histórico também
+                lo = historical_pe.get("pe_hist_min")
+                hi = historical_pe.get("pe_hist_max")
+                if lo and hi:
+                    pe_str += f" \u2014 range 3a: {lo:.0f}–{hi:.0f}x"
         lines.append(f"  • P/E: {pe_str}")
 
     # FCF
@@ -102,7 +113,7 @@ def format_valuation_block(fundamentals: dict, historical_pe: float | None, sect
     # DCF
     if fcf_ps and fcf_ps > 0 and rev_growth is not None and price:
         wacc = estimate_wacc(sector)
-        growth = min(max(rev_growth, 0), 0.30)  # cap entre 0 e 30%
+        growth = min(max(rev_growth, 0), 0.30)
         intrinsic = dcf_intrinsic_value(fcf_ps, growth, wacc)
         mos = margin_of_safety(intrinsic, price)
         lines.append(f"  • DCF intrínseco: ${intrinsic:.1f} (margem: {mos:+.0f}%)")
@@ -120,8 +131,7 @@ def format_valuation_block(fundamentals: dict, historical_pe: float | None, sect
         lines.append(f"  • ROE: {roe*100:.1f}%")
 
     if dy and dy > 0:
-        # yfinance devolve sempre decimal (0.047 = 4.7%) — normalizar defensivamente
-        dy_pct = dy * 100 if dy < 1 else dy  # fix: evitar 470% se já vier em %
+        dy_pct = dy * 100 if dy < 1 else dy
         payout_str = f" (payout {payout*100:.0f}%)" if payout else ""
         lines.append(f"  • Dividendo: {dy_pct:.2f}%{payout_str}")
 
