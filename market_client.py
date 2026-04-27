@@ -4,13 +4,14 @@ DipRadar - Multi-region stock dip screener
 US + Europe + UK + Asia via Yahoo Finance (free & unlimited)
 Fundamentals via yfinance
 """
-logging.getLogger().setLevel(logging.DEBUG)
-
 import time
 import logging
 import requests
 import yfinance as yf
 from typing import List, Dict, Optional
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 _HEADERS = {
     "User-Agent": (
@@ -84,13 +85,13 @@ def screen_global_dips(
                 seen_symbols.add(symbol)
                 region_count += 1
 
-            logging.info(f"{region_name}: {region_count} candidates")
+            logger.info(f"{region_name}: {region_count} candidates")
 
         except Exception as e:
             logging.warning(f"{region_name} failed: {e}")
             continue
 
-    logging.info(f"Total global dips: {len(all_losers)}")
+    logger.info(f"Total global dips: {len(all_losers)}")
     return all_losers
 
 def _yf_info(symbol: str) -> dict:
@@ -123,7 +124,7 @@ def get_fundamentals(symbol: str, region: str = "") -> dict:
     mc = inf.get("marketCap", 0) or 0
     if 0 < mc < 1_000_000_000:
         result["skip"] = True
-        logging.info(f"{symbol}: micro-cap ${mc/1e6:.0f}M — skip")
+        logger.info(f"{symbol}: micro-cap ${mc/1e6:.0f}M — skip")
         return result
 
     price = inf.get("currentPrice") or inf.get("regularMarketPrice")
