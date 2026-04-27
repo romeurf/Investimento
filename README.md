@@ -11,7 +11,7 @@
 **DipRadar** is designed to cut through market noise. Instead of blindly buying every dip, it acts as an intelligent funnel: it detects sharp selloffs, automatically filters them through fundamental sector rules, and provides actionable data (Valuation, DCF, Recent News) directly to your Telegram.
 
 ### 🚀 At a Glance
-- 📉 **Automated Screening**: Tracks Yahoo Finance\\'s `day_losers` list.
+- 📉 **Automated Screening**: Tracks Yahoo Finance\'s `day_losers` list.
 - 🎯 **Sector Precision**: Uses sector-specific rules (Tech vs. Utilities).
 - 📊 **Valuation Layer**: Includes simplified DCF & Margin of Safety.
 - 🔔 **Actionable Alerts**: Verdict-based (COMPRAR, MONITORIZAR, EVITAR).
