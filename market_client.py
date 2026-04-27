@@ -9,7 +9,7 @@ import time
 import logging
 import requests
 import yfinance as yf
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 
 _HEADERS = {
     "User-Agent": (
@@ -41,22 +41,34 @@ _CATALYST_KEYWORDS = {
     "partnership": "🤝 Parceria estratégica",
 }
 
-# ── Horas de mercado NYSE/NASDAQ (hora Lisboa = ET+5 no verão) ────────────────
-# Mercado abre 14h30 Lisboa (09h30 ET) e fecha 21h00 Lisboa (16h00 ET)
-# Usamos UTC para não depender de DST local
-_MARKET_OPEN_UTC  = 13  # 14h30 Lisboa = 13h30 UTC (verão)
+# ── Feriados NYSE hardcoded (anos 2025-2027) ────────────────────────────────
+_NYSE_HOLIDAYS = {
+    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17),
+    date(2025, 4, 18), date(2025, 5, 26), date(2025, 6, 19),
+    date(2025, 7, 4), date(2025, 9, 1), date(2025, 11, 27),
+    date(2025, 12, 25),
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16),
+    date(2026, 4, 3),  date(2026, 5, 25), date(2026, 6, 19),
+    date(2026, 7, 3),  date(2026, 9, 7),  date(2026, 11, 26),
+    date(2026, 12, 25),
+    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15),
+    date(2027, 3, 26), date(2027, 5, 31), date(2027, 6, 18),
+    date(2027, 7, 5),  date(2027, 9, 6),  date(2027, 11, 25),
+    date(2027, 12, 24),
+}
+
+# ── Horas de mercado NYSE/NASDAQ ─────────────────────────────────────────
+_MARKET_OPEN_UTC  = 13
 _MARKET_OPEN_MIN  = 30
-_MARKET_CLOSE_UTC = 20  # 21h00 Lisboa = 20h00 UTC (verão)
+_MARKET_CLOSE_UTC = 20
 _MARKET_CLOSE_MIN = 0
 
 
 def is_market_open() -> bool:
-    """
-    Verdadeiro se estamos dentro do horário NYSE/NASDAQ (14h30–21h00 Lisboa).
-    Não verifica feriados (raro, aceita-se o falso positivo).
-    """
     now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:   # sábado ou domingo
+    if now.weekday() >= 5:
+        return False
+    if now.date() in _NYSE_HOLIDAYS:
         return False
     open_dt  = now.replace(hour=_MARKET_OPEN_UTC,  minute=_MARKET_OPEN_MIN,  second=0, microsecond=0)
     close_dt = now.replace(hour=_MARKET_CLOSE_UTC, minute=_MARKET_CLOSE_MIN, second=0, microsecond=0)
@@ -111,6 +123,70 @@ def screen_global_dips(
     return results
 
 
+def screen_structural_dips(
+    min_drawdown_pct: float = 25.0,
+    min_market_cap: int = 2_000_000_000,
+    max_results: int = 60,
+) -> list[dict]:
+    """
+    Varre stocks no mínimo de 52 semanas (dips graduais/estruturais).
+    Não depende de queda diária — apanha o PINS a $14, o TTD a $23, etc.
+    Usa o endpoint undervalued_large_caps do Yahoo + filtra pelo drawdown.
+    Corre uma vez por semana (segunda-feira 8h45).
+    """
+    candidates = []
+    screener_ids = ["undervalued_large_caps", "day_losers", "most_actives"]
+
+    for scrId in screener_ids:
+        url = (
+            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+            f"?formatted=false&scrIds={scrId}&count=100&start=0"
+        )
+        try:
+            r = requests.get(url, headers=_HEADERS, timeout=15)
+            r.raise_for_status()
+            quotes = (
+                r.json()
+                .get("finance", {})
+                .get("result", [{}])[0]
+                .get("quotes", [])
+            )
+            for q in quotes:
+                sym   = q.get("symbol", "")
+                qtype = q.get("quoteType", "")
+                mc    = q.get("marketCap") or 0
+                if not sym or qtype in ("ETF", "MUTUALFUND") or len(sym) > 5:
+                    continue
+                if mc and mc < min_market_cap:
+                    continue
+                price  = q.get("regularMarketPrice") or 0
+                high52 = q.get("fiftyTwoWeekHigh") or 0
+                if high52 and price and high52 > 0:
+                    drawdown = (price - high52) / high52 * 100
+                    if drawdown <= -min_drawdown_pct:
+                        candidates.append({
+                            "symbol":      sym,
+                            "name":        q.get("longName") or q.get("shortName") or sym,
+                            "price":       price,
+                            "change_pct":  q.get("regularMarketChangePercent") or 0,
+                            "market_cap":  mc,
+                            "drawdown_52w": round(drawdown, 1),
+                        })
+        except Exception as e:
+            logging.warning(f"Structural dip screener {scrId}: {e}")
+
+    # Deduplica e ordena por drawdown mais profundo
+    seen = set()
+    unique = []
+    for c in sorted(candidates, key=lambda x: x["drawdown_52w"]):
+        if c["symbol"] not in seen:
+            seen.add(c["symbol"])
+            unique.append(c)
+
+    logging.info(f"Structural dip scan: {len(unique)} candidatos (drawdown ≥{min_drawdown_pct}%)")
+    return unique[:max_results]
+
+
 def get_spy_change() -> float | None:
     try:
         time.sleep(2)
@@ -124,7 +200,6 @@ def get_spy_change() -> float | None:
 
 
 def get_usdeur() -> float:
-    """Taxa USD/EUR actual via yfinance. Fallback 0.92."""
     try:
         time.sleep(1)
         inf = yf.Ticker("EURUSD=X").info or {}
@@ -158,12 +233,6 @@ def get_rsi(symbol: str, period: int = 14) -> float | None:
 
 
 def get_historical_pe(symbol: str, years: int = 3) -> dict | None:
-    """
-    Calcula PE histórico real a N anos via yfinance:
-      - Busca preços diários dos últimos N anos
-      - Usa EPS TTM actual como proxy constante (melhor disponível gratuitamente)
-      - Devolve {pe_hist_avg, pe_hist_median, pe_hist_min, pe_hist_max}
-    """
     try:
         time.sleep(5)
         ticker = yf.Ticker(symbol)
@@ -171,19 +240,13 @@ def get_historical_pe(symbol: str, years: int = 3) -> dict | None:
         eps    = inf.get("trailingEps")
         if not eps or eps <= 0:
             return None
-
-        period_str = f"{years}y"
-        hist = ticker.history(period=period_str, interval="1mo")["Close"]
+        hist = ticker.history(period=f"{years}y", interval="1mo")["Close"]
         if hist is None or len(hist) < 6:
             return None
-
         pe_series = hist / eps
-        pe_series = pe_series[(pe_series > 0) & (pe_series < 500)]  # remove outliers
-
+        pe_series = pe_series[(pe_series > 0) & (pe_series < 500)]
         if len(pe_series) < 4:
             return None
-
-        import statistics
         return {
             "pe_hist_avg":    round(float(pe_series.mean()), 1),
             "pe_hist_median": round(float(pe_series.median()), 1),
@@ -250,11 +313,13 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
         "payout_ratio":     inf.get("payoutRatio"),
         "week52_high":      week52_high,
         "drawdown_from_high": drawdown_from_high,
+        "volume":           inf.get("volume") or inf.get("regularMarketVolume"),
+        "average_volume":   inf.get("averageVolume") or inf.get("averageDailyVolume10Day"),
     })
 
     fcf    = inf.get("freeCashflow")
     shares = inf.get("sharesOutstanding")
-    if fcf and mc > 0:
+    if fcf is not None and mc > 0:
         result["fcf_yield"] = fcf / mc
     if fcf and shares and shares > 0:
         result["fcf_per_share"] = fcf / shares
@@ -267,25 +332,58 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
     return result
 
 
-def get_portfolio_snapshot(holdings: list, cashback_eur: dict, ppr_shares: float, ppr_avg_cost: float, usd_eur: float) -> dict:
+def get_earnings_days(symbol: str) -> int | None:
     """
-    Calcula valor actual da carteira, P&L diario, semanal e mensal.
-
-    holdings: lista de (symbol, shares, avg_cost_eur) de portfolio.py
-    cashback_eur: dict symbol->valor_eur (CashBack Pie)
-    ppr_shares: número de unidades PPR
-    ppr_avg_cost: custo médio EUR por unidade
-    usd_eur: taxa de câmbio actual
-
-    Devolve dict com total_eur, pnl_day, pnl_week, pnl_month, positions[]
+    Devolve o número de dias até aos próximos earnings (0-45 dias)
+    ou None se desconhecido / fora do intervalo.
     """
+    try:
+        time.sleep(3)
+        cal = yf.Ticker(symbol).calendar
+        if cal is None:
+            return None
+        if hasattr(cal, "to_dict"):
+            cal = cal.to_dict()
+        earnings_raw = None
+        for key in ("Earnings Date", "earningsDate", "Earnings High"):
+            val = cal.get(key)
+            if val is not None:
+                earnings_raw = val
+                break
+        if earnings_raw is None:
+            return None
+        if isinstance(earnings_raw, list):
+            earnings_raw = earnings_raw[0]
+        if isinstance(earnings_raw, (int, float)):
+            dt = datetime.fromtimestamp(earnings_raw, tz=timezone.utc)
+        elif hasattr(earnings_raw, "to_pydatetime"):
+            dt = earnings_raw.to_pydatetime()
+        else:
+            return None
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        days = (dt - datetime.now(tz=timezone.utc)).days
+        return days if 0 <= days <= 45 else None
+    except Exception as e:
+        logging.warning(f"Earnings days {symbol}: {e}")
+        return None
+
+
+def get_earnings_date(symbol: str) -> str | None:
+    """Compat wrapper: devolve string dd/mm/yyyy ou None."""
+    days = get_earnings_days(symbol)
+    if days is None:
+        return None
+    dt = datetime.now(tz=timezone.utc) + timedelta(days=days)
+    return dt.strftime("%d/%m/%Y")
+
+
+def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd_eur):
     from portfolio import USD_TICKERS, EUR_TICKERS
 
-    positions   = []
-    total_eur   = 0.0
-    total_cost  = 0.0
-
-    # Preços históricos: fecha de ontem, há 5 dias, há 30 dias
+    positions  = []
+    total_eur  = 0.0
+    total_cost = 0.0
     price_cache: dict[str, dict] = {}
 
     def _get_prices(symbol: str) -> dict:
@@ -296,48 +394,38 @@ def get_portfolio_snapshot(holdings: list, cashback_eur: dict, ppr_shares: float
             hist = yf.Ticker(symbol).history(period="35d", interval="1d")["Close"].dropna()
             if len(hist) < 2:
                 return {}
-            result = {
+            r = {
                 "now":       float(hist.iloc[-1]),
                 "yesterday": float(hist.iloc[-2]) if len(hist) >= 2 else None,
                 "week_ago":  float(hist.iloc[-6]) if len(hist) >= 6 else None,
                 "month_ago": float(hist.iloc[-22]) if len(hist) >= 22 else None,
             }
-            price_cache[symbol] = result
-            return result
+            price_cache[symbol] = r
+            return r
         except Exception as e:
             logging.warning(f"Portfolio price {symbol}: {e}")
             return {}
 
-    # ── Posições directas com shares conhecidas ──────────────────────────────
     for symbol, shares, avg_cost in holdings:
-        if shares is None:
-            continue  # CashBack Pie tratado abaixo via cashback_eur
+        if not shares:
+            continue
         prices = _get_prices(symbol)
         if not prices:
             continue
 
+        # EUNL é cotado em EUR (LSE) — não converte
         fx = usd_eur if symbol in USD_TICKERS else 1.0
-        price_now  = prices["now"] * fx
-        value_eur  = shares * price_now
+        price_now = prices["now"] * fx
+        value_eur = shares * price_now
 
-        # P&L diário
-        pnl_d = None
-        if prices.get("yesterday"):
-            pnl_d = (prices["now"] - prices["yesterday"]) * fx * shares
+        pnl_d = ((prices["now"] - prices["yesterday"]) * fx * shares
+                 if prices.get("yesterday") else None)
+        pnl_w = ((prices["now"] - prices["week_ago"]) * fx * shares
+                 if prices.get("week_ago") else None)
+        pnl_m = ((prices["now"] - prices["month_ago"]) * fx * shares
+                 if prices.get("month_ago") else None)
 
-        # P&L semanal
-        pnl_w = None
-        if prices.get("week_ago"):
-            pnl_w = (prices["now"] - prices["week_ago"]) * fx * shares
-
-        # P&L mensal
-        pnl_m = None
-        if prices.get("month_ago"):
-            pnl_m = (prices["now"] - prices["month_ago"]) * fx * shares
-
-        # P&L total (só se tivermos avg_cost)
-        pnl_total = None
-        cost_eur  = None
+        pnl_total = cost_eur = None
         if avg_cost:
             cost_eur  = shares * avg_cost
             pnl_total = value_eur - cost_eur
@@ -355,67 +443,48 @@ def get_portfolio_snapshot(holdings: list, cashback_eur: dict, ppr_shares: float
         })
         total_eur += value_eur
 
-    # ── CashBack Pie (valores em EUR directamente) ─────────────────────────
+    # CashBack Pie
     cashback_total = sum(cashback_eur.values())
     total_eur     += cashback_total
-    # P&L diário do pie: soma proporcional de cada ticker
-    pie_pnl_day = 0.0
+    pie_pnl_day    = 0.0
     for sym, val_eur in cashback_eur.items():
         p = _get_prices(sym)
         if p and p.get("yesterday") and p["yesterday"] > 0:
-            day_pct      = (p["now"] - p["yesterday"]) / p["yesterday"]
-            pie_pnl_day += val_eur * day_pct
+            pie_pnl_day += val_eur * (p["now"] - p["yesterday"]) / p["yesterday"]
 
-    # ── PPR proxy (ACWI) ──────────────────────────────────────────────────
-    ppr_value_eur = 0.0
-    ppr_pnl_day   = None
-    ppr_pnl_week  = None
-    ppr_pnl_month = None
-    ppr_prices    = _get_prices("ACWI")
-    if ppr_prices:
-        # O NAV do PPR está em EUR; ACWI está em USD → normaliza pelo ratio
-        # Usamos ACWI como índice directional, não preço absoluto
-        acwi_now  = ppr_prices["now"] * usd_eur
-        acwi_y    = (ppr_prices.get("yesterday") or ppr_prices["now"]) * usd_eur
-        acwi_w    = (ppr_prices.get("week_ago")  or ppr_prices["now"]) * usd_eur
-        acwi_m    = (ppr_prices.get("month_ago") or ppr_prices["now"]) * usd_eur
-        # Valor actual estimado: proporcional à variação do ACWI desde custo médio
-        # Custo total PPR em EUR
-        ppr_cost    = ppr_shares * ppr_avg_cost
-        acwi_base   = acwi_now  # usamos preço actual como referência
-        ppr_value_eur = ppr_cost * (acwi_now / acwi_base)  # = ppr_cost (proxy simples)
-        # Aproximação mais útil: mostra P&L directional usando % do ACWI
-        if acwi_y > 0:
-            ppr_pnl_day   = ppr_cost * (acwi_now - acwi_y) / acwi_y
-        if acwi_w > 0:
-            ppr_pnl_week  = ppr_cost * (acwi_now - acwi_w) / acwi_w
-        if acwi_m > 0:
-            ppr_pnl_month = ppr_cost * (acwi_now - acwi_m) / acwi_m
-        ppr_value_eur = ppr_cost  # valor contabilístico (NAV real não disponível)
-        total_eur += ppr_value_eur
-        total_cost += ppr_cost
+    # PPR proxy ACWI
+    ppr_value_eur = ppr_cost = ppr_shares * ppr_avg_cost
+    ppr_pnl_day = ppr_pnl_week = ppr_pnl_month = None
+    pp = _get_prices("ACWI")
+    if pp:
+        acwi_now = pp["now"] * usd_eur
+        if pp.get("yesterday") and pp["yesterday"] > 0:
+            ppr_pnl_day   = ppr_cost * (acwi_now - pp["yesterday"] * usd_eur) / (pp["yesterday"] * usd_eur)
+        if pp.get("week_ago") and pp["week_ago"] > 0:
+            ppr_pnl_week  = ppr_cost * (acwi_now - pp["week_ago"]  * usd_eur) / (pp["week_ago"]  * usd_eur)
+        if pp.get("month_ago") and pp["month_ago"] > 0:
+            ppr_pnl_month = ppr_cost * (acwi_now - pp["month_ago"] * usd_eur) / (pp["month_ago"] * usd_eur)
+    total_eur  += ppr_value_eur
+    total_cost += ppr_cost
 
-    # ── Agrega P&L totais ────────────────────────────────────────────────────
-    agg_pnl_day   = sum(p["pnl_day"]   for p in positions if p["pnl_day"]   is not None)
-    agg_pnl_week  = sum(p["pnl_week"]  for p in positions if p["pnl_week"]  is not None)
-    agg_pnl_month = sum(p["pnl_month"] for p in positions if p["pnl_month"] is not None)
-
-    agg_pnl_day   += pie_pnl_day
-    if ppr_pnl_day   is not None: agg_pnl_day   += ppr_pnl_day
-    if ppr_pnl_week  is not None: agg_pnl_week  += ppr_pnl_week
-    if ppr_pnl_month is not None: agg_pnl_month += ppr_pnl_month
+    agg_day   = sum(p["pnl_day"]   for p in positions if p["pnl_day"]   is not None) + pie_pnl_day
+    agg_week  = sum(p["pnl_week"]  for p in positions if p["pnl_week"]  is not None)
+    agg_month = sum(p["pnl_month"] for p in positions if p["pnl_month"] is not None)
+    if ppr_pnl_day   is not None: agg_day   += ppr_pnl_day
+    if ppr_pnl_week  is not None: agg_week  += ppr_pnl_week
+    if ppr_pnl_month is not None: agg_month += ppr_pnl_month
 
     return {
-        "total_eur":   round(total_eur, 2),
-        "total_cost":  round(total_cost, 2),
-        "pnl_day":     round(agg_pnl_day, 2),
-        "pnl_week":    round(agg_pnl_week, 2),
-        "pnl_month":   round(agg_pnl_month, 2),
-        "pnl_total":   round(total_eur - total_cost, 2) if total_cost > 0 else None,
-        "positions":   positions,
+        "total_eur":    round(total_eur, 2),
+        "total_cost":   round(total_cost, 2),
+        "pnl_day":      round(agg_day, 2),
+        "pnl_week":     round(agg_week, 2),
+        "pnl_month":    round(agg_month, 2),
+        "pnl_total":    round(total_eur - total_cost, 2) if total_cost > 0 else None,
+        "positions":    positions,
         "cashback_eur": cashback_total,
-        "ppr_value":   round(ppr_value_eur, 2),
-        "usd_eur":     usd_eur,
+        "ppr_value":    round(ppr_value_eur, 2),
+        "usd_eur":      usd_eur,
     }
 
 
@@ -457,42 +526,6 @@ def get_catalyst(symbol: str, company_name: str = "") -> dict:
             return {"found": True, "label": label, "snippet": snippet[:120]}
 
     return {"found": False, "label": "⚠️ Sem catalisador identificado", "snippet": ""}
-
-
-def get_earnings_date(symbol: str) -> str | None:
-    try:
-        time.sleep(3)
-        cal = yf.Ticker(symbol).calendar
-        if cal is None:
-            return None
-        if hasattr(cal, "to_dict"):
-            cal = cal.to_dict()
-        earnings_raw = None
-        for key in ("Earnings Date", "earningsDate", "Earnings High"):
-            val = cal.get(key)
-            if val is not None:
-                earnings_raw = val
-                break
-        if earnings_raw is None:
-            return None
-        if isinstance(earnings_raw, list):
-            earnings_raw = earnings_raw[0]
-        if isinstance(earnings_raw, (int, float)):
-            dt = datetime.fromtimestamp(earnings_raw, tz=timezone.utc)
-        elif hasattr(earnings_raw, "to_pydatetime"):
-            dt = earnings_raw.to_pydatetime()
-        else:
-            return None
-        if not dt.tzinfo:
-            dt = dt.replace(tzinfo=timezone.utc)
-        now        = datetime.now(tz=timezone.utc)
-        days_ahead = (dt - now).days
-        if 0 <= days_ahead <= 45:
-            return dt.strftime("%d/%m/%Y")
-        return None
-    except Exception as e:
-        logging.warning(f"Earnings date {symbol}: {e}")
-        return None
 
 
 def get_52w_drawdown(symbol: str) -> float | None:

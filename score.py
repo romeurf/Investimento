@@ -1,7 +1,7 @@
 """
 Score quantitativo de qualidade do dip (0-10 pts).
 
-Critérios:
+Critérios positivos:
   +2  FCF yield > 5%  |  +1 se > 3%
   +2  Revenue growth > 10%  |  +1 se > 5%
   +1  Gross margin > 40%
@@ -10,6 +10,11 @@ Critérios:
   +1  PE atual < 75% do pe_fair do sector
   +1  Drawdown 52w < -20%
   +1  Analyst upside > 25%
+  +2  Earnings dentro de 30 dias  |  +1 dentro de 60 dias
+  +1  Volume spike: volume > 1.5x average (capitulação)
+
+Penalizações:
+  -1  FCF negativo (não é dip de qualidade, é especulativo)
 
 Total máximo: 10 pts (cap)
 """
@@ -18,23 +23,29 @@ from market_client import get_rsi
 from sectors import get_sector_config
 
 
-def calculate_dip_score(fundamentals: dict, symbol: str) -> tuple[float, str | None]:
+def calculate_dip_score(
+    fundamentals: dict,
+    symbol: str,
+    earnings_days: int | None = None,
+) -> tuple[float, str | None]:
     """
     Devolve (score, rsi_str).
-    score é float para consistência com o resto do código.
+    earnings_days: dias até próximos earnings (None = desconhecido).
     """
     score = 0
 
     rsi_val = fundamentals.get("rsi") or get_rsi(symbol)
 
-    # ── FCF yield ────────────────────────────────────────────────────
-    fcf_yield = fundamentals.get("fcf_yield", 0) or 0
+    # ── FCF yield / penalização FCF negativo ─────────────────────────────
+    fcf_yield = fundamentals.get("fcf_yield") or 0
     if fcf_yield > 0.05:
         score += 2
     elif fcf_yield > 0.03:
         score += 1
+    elif fcf_yield < 0:          # FCF negativo — penalização explícita
+        score -= 1
 
-    # ── Revenue growth ──────────────────────────────────────────────
+    # ── Revenue growth ─────────────────────────────────────────────────
     rev_growth = fundamentals.get("revenue_growth", 0) or 0
     if rev_growth > 0.10:
         score += 2
@@ -71,10 +82,23 @@ def calculate_dip_score(fundamentals: dict, symbol: str) -> tuple[float, str | N
         score += 1
 
     # ── Analyst upside forte ─────────────────────────────────────────
-    # Consenso de analistas > 25% de upside é sinal de que a queda é exagerada
     analyst_upside = fundamentals.get("analyst_upside") or 0
     if analyst_upside > 25:
         score += 1
+
+    # ── Earnings próximos (catalisador concreto) ─────────────────────────
+    if earnings_days is not None and earnings_days >= 0:
+        if earnings_days <= 30:
+            score += 2
+        elif earnings_days <= 60:
+            score += 1
+
+    # ── Volume spike: capitulação real ─────────────────────────────────
+    volume         = fundamentals.get("volume") or 0
+    average_volume = fundamentals.get("average_volume") or 0
+    if volume and average_volume and average_volume > 0:
+        if volume > average_volume * 1.5:
+            score += 1
 
     score = min(score, 10)
     rsi_str = f"{rsi_val:.0f}" if rsi_val is not None else None
