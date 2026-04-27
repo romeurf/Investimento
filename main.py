@@ -12,7 +12,7 @@ Variáveis opcionais:
   DROP_THRESHOLD=8
   MIN_MARKET_CAP=2000000000
   SCAN_EVERY_MINUTES=30
-  MIN_DIP_SCORE=5
+  MIN_DIP_SCORE=10
   TAVILY_API_KEY
   PORTFOLIO_STRESS_PCT=5
   RECOVERY_TARGET_PCT=15
@@ -58,7 +58,7 @@ TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 DROP_THRESHOLD    = float(os.environ.get("DROP_THRESHOLD", "8"))
 MIN_MARKET_CAP    = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
 SCAN_MINUTES      = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
-MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "5"))
+MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "10"))  # escala 0-20; equiv. a 5/10 da escala antiga
 STRESS_PCT        = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
 RECOVERY_PCT      = float(os.environ.get("RECOVERY_TARGET_PCT", "15"))
 WATCHLIST_ENABLED = os.environ.get("WATCHLIST_SCAN_ENABLED", "true").lower() == "true"
@@ -326,7 +326,7 @@ def send_weekly_dip_scan() -> None:
             if fund.get("skip"): continue
             earnings_days  = get_earnings_days(sym)
             score, rsi_str = calculate_dip_score(fund, sym, earnings_days)
-            if score >= 7:
+            if score >= 14:  # escala 0-20: equiv. a 7/10 da escala antiga
                 scored.append({
                     "symbol":         sym,
                     "score":          score,
@@ -347,7 +347,7 @@ def send_weekly_dip_scan() -> None:
     scored.sort(key=lambda x: x["score"], reverse=True)
     lines = [
         f"*📶 Weekly Structural Dip Scan — {datetime.now().strftime('%d/%m/%Y')}*",
-        f"_Stocks ≥25% abaixo dos máximos de 52 semanas com score ≥7_",
+        f"_Stocks ≥25% abaixo dos máximos de 52 semanas com score ≥14_",
         "",
     ]
     for s in scored[:12]:
