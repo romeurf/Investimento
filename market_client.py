@@ -8,6 +8,7 @@ import os
 import time
 import logging
 import requests
+import numpy as np
 import yfinance as yf
 from datetime import datetime, timezone
 
@@ -23,23 +24,22 @@ _HEADERS = {
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
-# Keywords que indicam catalisador real próximo
 _CATALYST_KEYWORDS = {
-    "earnings":     "📅 Earnings próximo",
-    "results":      "📅 Resultados próximos",
-    "fda":          "💊 Decisão FDA",
-    "approval":     "✅ Aprovação regulatória",
-    "buyback":      "🔁 Recompra de acções",
-    "repurchase":   "🔁 Recompra de acções",
-    "dividend":     "💰 Dividendo especial",
-    "merger":       "🤝 M&A",
-    "acquisition":  "🤝 Aquisição",
-    "spin":         "🔀 Spin-off",
-    "split":        "✂️ Stock split",
-    "guidance":     "📈 Guidance update",
-    "upgrade":      "⬆️ Upgrade analistas",
-    "contract":     "📄 Contrato importante",
-    "partnership":  "🤝 Parceria estratégica",
+    "earnings":    "📅 Earnings próximo",
+    "results":     "📅 Resultados próximos",
+    "fda":         "💊 Decisão FDA",
+    "approval":    "✅ Aprovação regulatória",
+    "buyback":     "🔁 Recompra de acções",
+    "repurchase":  "🔁 Recompra de acções",
+    "dividend":    "💰 Dividendo especial",
+    "merger":      "🤝 M&A",
+    "acquisition": "🤝 Aquisição",
+    "spin":        "🔀 Spin-off",
+    "split":       "✂️ Stock split",
+    "guidance":    "📈 Guidance update",
+    "upgrade":     "⬆️ Upgrade analistas",
+    "contract":    "📄 Contrato importante",
+    "partnership": "🤝 Parceria estratégica",
 }
 
 
@@ -71,7 +71,6 @@ def screen_global_dips(
         if chg > -min_drop_pct:
             continue
         mc = q.get("marketCap") or 0
-        # Se market_cap vier do Yahoo e for claramente abaixo do mínimo, descarta já aqui
         if mc and mc < min_market_cap:
             continue
         sym = q.get("symbol", "")
@@ -79,9 +78,9 @@ def screen_global_dips(
         if qtype in ("ETF", "MUTUALFUND") or len(sym) > 5:
             continue
         results.append({
-            "symbol": sym,
-            "name": q.get("longName") or q.get("shortName") or sym,
-            "price": q.get("regularMarketPrice"),
+            "symbol":     sym,
+            "name":       q.get("longName") or q.get("shortName") or sym,
+            "price":      q.get("regularMarketPrice"),
             "change_pct": round(chg, 2),
             "market_cap": mc,
         })
@@ -94,10 +93,7 @@ def screen_global_dips(
 
 
 def get_spy_change() -> float | None:
-    """
-    Devolve a variação % do SPY (S&P 500 ETF) no dia actual.
-    Usado para distinguir quedas idiossincráticas de quedas macro.
-    """
+    """Variação % do SPY no dia — flag macro."""
     try:
         time.sleep(2)
         inf = yf.Ticker("SPY").info or {}
@@ -109,13 +105,34 @@ def get_spy_change() -> float | None:
     return None
 
 
+def get_rsi(symbol: str, period: int = 14) -> float | None:
+    """
+    Calcula o RSI de 14 dias via yfinance (histórico 60 dias).
+    Usado em calculate_dip_score quando 'rsi' não está em fundamentals.
+    """
+    try:
+        time.sleep(3)
+        hist = yf.Ticker(symbol).history(period="60d", interval="1d")["Close"]
+        if hist is None or len(hist) < period + 1:
+            return None
+        delta  = hist.diff().dropna()
+        gain   = delta.clip(lower=0)
+        loss   = (-delta).clip(lower=0)
+        avg_gain = gain.rolling(period).mean().iloc[-1]
+        avg_loss = loss.rolling(period).mean().iloc[-1]
+        if avg_loss == 0:
+            return 100.0
+        rs  = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return round(float(rsi), 1)
+    except Exception as e:
+        logging.warning(f"RSI {symbol}: {e}")
+        return None
+
+
 def _yf_info(symbol: str) -> dict:
-    """
-    Obtém info do yfinance com retry e backoff.
-    NÃO injeta session customizada — deixa o yfinance gerir o crumb internamente.
-    """
     for attempt in range(4):
-        wait = 10 + (20 * attempt)  # 10s, 30s, 50s, 70s
+        wait = 10 + (20 * attempt)
         time.sleep(wait)
         try:
             inf = yf.Ticker(symbol).info
@@ -125,10 +142,7 @@ def _yf_info(symbol: str) -> dict:
         except Exception as e:
             err = str(e)
             if any(x in err for x in ("429", "Too Many Requests", "Rate limit", "401", "406")):
-                logging.warning(
-                    f"  {symbol}: rate/auth error (tentativa {attempt+1}/4) — "
-                    f"a aguardar {wait}s"
-                )
+                logging.warning(f"  {symbol}: rate/auth error (tentativa {attempt+1}/4) — {wait}s")
             else:
                 logging.error(f"  {symbol}: {e}")
                 break
@@ -144,40 +158,37 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
         return result
 
     mc = inf.get("marketCap") or 0
-    # Fix: usa o MIN_MARKET_CAP real (2B por defeito), não o hardcoded de 1B
     if mc > 0 and mc < min_market_cap:
         result["skip"] = True
         logging.info(f"  {symbol}: cap ${mc/1e9:.1f}B < mínimo ${min_market_cap/1e9:.0f}B — a saltar")
         return result
 
-    price = inf.get("currentPrice") or inf.get("regularMarketPrice")
-
-    # Drawdown desde máximo de 52 semanas
+    price      = inf.get("currentPrice") or inf.get("regularMarketPrice")
     week52_high = inf.get("fiftyTwoWeekHigh")
     drawdown_from_high = None
     if week52_high and price and week52_high > 0:
         drawdown_from_high = round((price - week52_high) / week52_high * 100, 1)
 
     result.update({
-        "name": inf.get("longName") or inf.get("shortName") or symbol,
-        "sector": inf.get("sector", ""),
-        "industry": inf.get("industry", ""),
-        "price": price,
-        "beta": inf.get("beta"),
-        "market_cap": mc,
-        "pe": inf.get("trailingPE") or inf.get("forwardPE"),
-        "revenue_growth": inf.get("revenueGrowth"),
-        "gross_margin": inf.get("grossMargins"),
-        "ev_ebitda": inf.get("enterpriseToEbitda"),
-        "roe": inf.get("returnOnEquity"),
-        "debt_equity": inf.get("debtToEquity"),
-        "dividend_yield": inf.get("dividendYield"),
-        "payout_ratio": inf.get("payoutRatio"),
-        "week52_high": week52_high,
+        "name":             inf.get("longName") or inf.get("shortName") or symbol,
+        "sector":           inf.get("sector", ""),
+        "industry":         inf.get("industry", ""),
+        "price":            price,
+        "beta":             inf.get("beta"),
+        "market_cap":       mc,
+        "pe":               inf.get("trailingPE") or inf.get("forwardPE"),
+        "revenue_growth":   inf.get("revenueGrowth"),
+        "gross_margin":     inf.get("grossMargins"),
+        "ev_ebitda":        inf.get("enterpriseToEbitda"),
+        "roe":              inf.get("returnOnEquity"),
+        "debt_equity":      inf.get("debtToEquity"),
+        "dividend_yield":   inf.get("dividendYield"),
+        "payout_ratio":     inf.get("payoutRatio"),
+        "week52_high":      week52_high,
         "drawdown_from_high": drawdown_from_high,
     })
 
-    fcf = inf.get("freeCashflow")
+    fcf    = inf.get("freeCashflow")
     shares = inf.get("sharesOutstanding")
     if fcf and mc > 0:
         result["fcf_yield"] = fcf / mc
@@ -194,18 +205,14 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
 
 def get_catalyst(symbol: str, company_name: str = "") -> dict:
     """
-    Usa Tavily para procurar catalisadores próximos para a empresa.
-    Devolve dict com:
-      - found: bool
-      - label: str descritivo (ex: "📅 Earnings próximo")
-      - snippet: str (excerto relevante)
-    Requer TAVILY_API_KEY nas variáveis de ambiente.
-    Só é chamado para Tier 3 top 5 e Ranking Flip — ~10-15 calls/dia.
+    Usa Tavily para procurar catalisadores próximos.
+    Devolve {found, label, snippet}.
+    Só é chamado para Tier 3 top 5 e Ranking Flip (~10-15 calls/dia).
     """
     if not TAVILY_API_KEY:
         return {"found": False, "label": "⚠️ Tavily não configurado", "snippet": ""}
 
-    name = company_name or symbol
+    name  = company_name or symbol
     query = f"{symbol} {name} catalyst earnings FDA buyback guidance 2026"
 
     try:
@@ -226,7 +233,6 @@ def get_catalyst(symbol: str, company_name: str = "") -> dict:
         logging.warning(f"Tavily {symbol}: {e}")
         return {"found": False, "label": "⚠️ Sem catalisador identificado", "snippet": ""}
 
-    # Agrega todo o texto (answer + snippets dos resultados)
     texts = []
     if data.get("answer"):
         texts.append(data["answer"].lower())
@@ -235,31 +241,25 @@ def get_catalyst(symbol: str, company_name: str = "") -> dict:
         texts.append((r.get("title") or "").lower())
     full_text = " ".join(texts)
 
-    # Procura keywords de catalisador
     for keyword, label in _CATALYST_KEYWORDS.items():
         if keyword in full_text:
-            # Extrai snippet relevante (primeira frase com a keyword)
             snippet = ""
             for r in data.get("results", []):
                 content = r.get("content") or ""
                 idx = content.lower().find(keyword)
                 if idx != -1:
-                    start = max(0, idx - 40)
-                    end = min(len(content), idx + 100)
+                    start   = max(0, idx - 40)
+                    end     = min(len(content), idx + 100)
                     snippet = content[start:end].strip()
                     break
-            logging.info(f"  {symbol}: catalisador encontrado — {label}")
+            logging.info(f"  {symbol}: catalisador — {label}")
             return {"found": True, "label": label, "snippet": snippet[:120]}
 
-    # Nenhum catalisador encontrado — verifica se analistas têm upside forte
     return {"found": False, "label": "⚠️ Sem catalisador identificado", "snippet": ""}
 
 
 def get_earnings_date(symbol: str) -> str | None:
-    """
-    Devolve data dos próximos earnings como string 'dd/mm/yyyy' se nos próximos 45 dias,
-    ou None se não disponível ou distante.
-    """
+    """Próximos earnings nos 45 dias seguintes, formato 'dd/mm/yyyy'."""
     try:
         time.sleep(3)
         cal = yf.Ticker(symbol).calendar
@@ -283,7 +283,9 @@ def get_earnings_date(symbol: str) -> str | None:
             dt = earnings_raw.to_pydatetime()
         else:
             return None
-        now = datetime.now(tz=timezone.utc)
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now        = datetime.now(tz=timezone.utc)
         days_ahead = (dt - now).days
         if 0 <= days_ahead <= 45:
             return dt.strftime("%d/%m/%Y")
@@ -296,8 +298,8 @@ def get_earnings_date(symbol: str) -> str | None:
 def get_52w_drawdown(symbol: str) -> float | None:
     try:
         time.sleep(3)
-        inf = yf.Ticker(symbol).info or {}
-        high = inf.get("fiftyTwoWeekHigh")
+        inf   = yf.Ticker(symbol).info or {}
+        high  = inf.get("fiftyTwoWeekHigh")
         price = inf.get("currentPrice") or inf.get("regularMarketPrice")
         if high and price and high > 0:
             return round((price - high) / high * 100, 1)
@@ -310,12 +312,12 @@ def get_news(symbol: str, limit: int = 3) -> list[dict]:
     try:
         time.sleep(5)
         news = yf.Ticker(symbol).news or []
-        out = []
+        out  = []
         for item in news[:limit]:
             content = item.get("content") or {}
             out.append({
-                "title": content.get("title") or item.get("title", ""),
-                "url": (content.get("canonicalUrl") or {}).get("url") or item.get("link", ""),
+                "title":  content.get("title") or item.get("title", ""),
+                "url":    (content.get("canonicalUrl") or {}).get("url") or item.get("link", ""),
                 "source": (content.get("provider") or {}).get("displayName") or "",
             })
         return out
@@ -324,7 +326,7 @@ def get_news(symbol: str, limit: int = 3) -> list[dict]:
         return []
 
 
-def get_historical_pe(symbol: str, years: int = 5) -> float | None:
+def get_historical_pe(symbol: str) -> float | None:
     try:
         time.sleep(5)
         pe = (yf.Ticker(symbol).info or {}).get("trailingPE")
