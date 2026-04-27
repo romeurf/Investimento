@@ -48,7 +48,11 @@ MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
 SCAN_MINUTES     = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
 MIN_DIP_SCORE    = int(os.environ.get("MIN_DIP_SCORE", "5"))
 
-_ALERTS_FILE = Path("/tmp/dipadar_alerts.json")
+_ALERTS_FILE  = Path("/tmp/dipadar_alerts.json")
+_WEEKLY_FILE  = Path("/tmp/dipadar_weekly.json")
+
+
+# ── Cache de alertas ─────────────────────────────────────────────────────────────
 
 def _load_alerts() -> set:
     try:
@@ -67,51 +71,65 @@ def _save_alerts(alert_set: set) -> None:
         logging.warning(f"Alert cache save: {e}")
 
 _alerted_today: set = _load_alerts()
-_scan_running: bool = False
+_scan_running:  bool = False
+
+
+# ── Weekly log (acumula alertas da semana) ───────────────────────────────────
+
+def _load_weekly_log() -> list:
+    try:
+        if _WEEKLY_FILE.exists():
+            return json.loads(_WEEKLY_FILE.read_text()).get("alerts", [])
+    except Exception:
+        pass
+    return []
+
+def _save_weekly_log(entries: list) -> None:
+    try:
+        _WEEKLY_FILE.write_text(json.dumps({"alerts": entries}))
+    except Exception as e:
+        logging.warning(f"Weekly log save: {e}")
+
+def _log_alert(symbol: str, verdict: str, score: float, change_pct: float, sector: str) -> None:
+    entries = _load_weekly_log()
+    entries.append({
+        "symbol":  symbol,
+        "verdict": verdict,
+        "score":   score,
+        "change":  change_pct,
+        "sector":  sector,
+        "date":    datetime.now().strftime("%d/%m"),
+        "time":    datetime.now().strftime("%H:%M"),
+    })
+    _save_weekly_log(entries)
 
 
 # ── Blue chip detection (por fundamentais, não por sector) ───────────────────
-# Threshold de margem bruta mínima por sector (para o critério OR de qualidade)
+
 _BLUECHIP_MARGIN_THRESHOLD = {
-    "Technology":          0.40,
-    "Healthcare":          0.35,
+    "Technology":             0.40,
+    "Healthcare":             0.35,
     "Communication Services": 0.35,
-    "Real Estate":         0.20,   # REITs — margin não é o indicador certo
-    "Industrials":         0.30,
-    "Consumer Defensive":  0.30,
-    "Consumer Cyclical":   0.30,
-    "Financial Services":  0.25,
-    "Energy":              0.25,
-    "Utilities":           0.20,
-    "Basic Materials":     0.25,
+    "Real Estate":            0.20,
+    "Industrials":            0.30,
+    "Consumer Defensive":     0.30,
+    "Consumer Cyclical":      0.30,
+    "Financial Services":     0.25,
+    "Energy":                 0.25,
+    "Utilities":              0.20,
+    "Basic Materials":        0.25,
 }
 
 def is_bluechip(fundamentals: dict) -> bool:
-    """
-    Blue chip = empresa madura de qualidade, para guardar em dips profundos.
-    Critério:
-      market_cap > $50B
-      AND (
-        dividend_yield >= 1.5%    (compromisso real de cash flow)
-        OR (revenue_growth > 5% AND gross_margin > threshold_sector)  (moat por qualidade)
-      )
-    Exemplos correctos: NVO ✅, ADP ✅, MSFT ✅, VICI ✅
-    Exemplos correctos fora: TSLA ❌, UBER ❌ (sem yield + margens abaixo do threshold)
-    """
     mc             = fundamentals.get("market_cap") or 0
     dividend_yield = fundamentals.get("dividend_yield") or 0
     rev_growth     = fundamentals.get("revenue_growth") or 0
     gross_margin   = fundamentals.get("gross_margin") or 0
     sector         = fundamentals.get("sector", "")
     margin_threshold = _BLUECHIP_MARGIN_THRESHOLD.get(sector, 0.40)
-
     if mc < 50_000_000_000:
         return False
-
-    has_real_dividend = dividend_yield >= 0.015
-    has_quality_moat  = rev_growth > 0.05 and gross_margin > margin_threshold
-
-    return has_real_dividend or has_quality_moat
+    return (dividend_yield >= 0.015) or (rev_growth > 0.05 and gross_margin > margin_threshold)
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
@@ -171,7 +189,6 @@ def send_heartbeat() -> None:
     total      = snapshot["total_eur"]
     total_cost = snapshot.get("total_cost", 0)
 
-    # Aviso se vars da carteira não estão configuradas
     if total == 0:
         send_telegram(
             f"🤖 *DipRadar — Bom dia!* {datetime.now().strftime('%d/%m/%Y')}\n"
@@ -233,10 +250,9 @@ def send_heartbeat() -> None:
 
 
 # ── Weekly structural dip scan (segunda-feira 8h45) ─────────────────────────
-# O "PINS detector" — apanha dips graduais que o scan diário nunca vê
 
 def send_weekly_dip_scan() -> None:
-    if datetime.now().weekday() != 0:  # só à segunda-feira
+    if datetime.now().weekday() != 0:
         return
     logging.info("A correr weekly structural dip scan...")
     candidates = screen_structural_dips(min_drawdown_pct=25.0, min_market_cap=MIN_MARKET_CAP)
@@ -244,24 +260,23 @@ def send_weekly_dip_scan() -> None:
         return
 
     scored = []
-    for stock in candidates[:40]:   # limita para não abusar do yfinance
+    for stock in candidates[:40]:
         sym = stock["symbol"]
         try:
             fund = get_fundamentals(sym, min_market_cap=MIN_MARKET_CAP)
-            if fund.get("skip"):
-                continue
-            earnings_days = get_earnings_days(sym)
+            if fund.get("skip"): continue
+            earnings_days  = get_earnings_days(sym)
             score, rsi_str = calculate_dip_score(fund, sym, earnings_days)
             if score >= 7:
                 scored.append({
-                    "symbol":   sym,
-                    "score":    score,
-                    "drawdown": stock["drawdown_52w"],
-                    "price":    fund.get("price") or stock["price"],
-                    "mc_b":     (fund.get("market_cap") or 0) / 1e9,
-                    "sector":   get_sector_config(fund.get("sector", "")).get("label", "") or fund.get("sector", ""),
-                    "rsi":      rsi_str,
-                    "bluechip": is_bluechip(fund),
+                    "symbol":        sym,
+                    "score":         score,
+                    "drawdown":      stock["drawdown_52w"],
+                    "price":         fund.get("price") or stock["price"],
+                    "mc_b":          (fund.get("market_cap") or 0) / 1e9,
+                    "sector":        get_sector_config(fund.get("sector", "")).get("label", "") or fund.get("sector", ""),
+                    "rsi":           rsi_str,
+                    "bluechip":      is_bluechip(fund),
                     "earnings_days": earnings_days,
                     "analyst_upside": fund.get("analyst_upside") or 0,
                 })
@@ -276,25 +291,90 @@ def send_weekly_dip_scan() -> None:
     scored.sort(key=lambda x: x["score"], reverse=True)
     lines = [
         f"*📶 Weekly Structural Dip Scan — {datetime.now().strftime('%d/%m/%Y')}*",
-        f"_Stocks ≥25% abaixo dos máximos de 52 semanas com score ≧7_",
-        f"_Este é o scan que teria apanhado o PINS a $14._",
+        f"_Stocks ≥25% abaixo dos máximos de 52 semanas com score ≧7 (escala 0-20)_",
         "",
     ]
     for s in scored[:12]:
-        badge       = "🔥" if s["score"] >= 9 else ("⭐" if s["score"] >= 8 else "📊")
-        bc_tag      = " 💎" if s["bluechip"] else ""
-        rsi_tag     = f" | RSI {s['rsi']}" if s["rsi"] else ""
-        earn_tag    = f" | 📅 Earnings em {s['earnings_days']}d" if s["earnings_days"] is not None else ""
-        upside_tag  = f" | 📡 +{s['analyst_upside']:.0f}% analistas" if s["analyst_upside"] > 20 else ""
+        badge      = "🔥" if s["score"] >= 16 else ("⭐" if s["score"] >= 11 else "📊")
+        bc_tag     = " 💎" if s["bluechip"] else ""
+        rsi_tag    = f" | RSI {s['rsi']}" if s["rsi"] else ""
+        earn_tag   = f" | 📅 Earnings em {s['earnings_days']}d" if s["earnings_days"] is not None else ""
+        upside_tag = f" | 📡 +{s['analyst_upside']:.0f}% analistas" if s["analyst_upside"] > 20 else ""
         lines.append(
-            f"{badge} *{s['symbol']}*{bc_tag} — Score {s['score']:.0f} | "
+            f"{badge} *{s['symbol']}*{bc_tag} — Score {s['score']:.0f}/20 | "
             f"${s['price']:.2f} | ${s['mc_b']:.1f}B | {s['drawdown']:.0f}% do topo"
         )
         lines.append(f"   _{s['sector']}{rsi_tag}{earn_tag}{upside_tag}_")
         lines.append("")
-
     send_telegram("\n".join(lines))
     logging.info(f"Weekly scan enviado: {len(scored)} candidatos")
+
+
+# ── Saturday Weekly Report (sábado 10h) ────────────────────────────────────
+
+def send_saturday_report() -> None:
+    if datetime.now().weekday() != 5:  # só ao sábado
+        return
+    logging.info("A gerar Saturday Weekly Report...")
+
+    entries = _load_weekly_log()
+    now     = datetime.now()
+    week_start = (now - timedelta(days=now.weekday() + 1)).strftime("%d/%m")
+    week_end   = (now - timedelta(days=1)).strftime("%d/%m")
+
+    lines = [
+        f"*📊 Weekly Report — {week_start} a {week_end}*",
+        "",
+    ]
+
+    if not entries:
+        lines.append("_Sem alertas esta semana._")
+    else:
+        # Agrupa por dia
+        by_date: dict[str, list] = {}
+        for e in entries:
+            by_date.setdefault(e["date"], []).append(e)
+
+        total_alerts  = len(entries)
+        comprar_count = sum(1 for e in entries if e["verdict"] == "COMPRAR")
+        avg_score     = sum(e["score"] for e in entries) / total_alerts
+        best          = max(entries, key=lambda x: x["score"])
+
+        lines += [
+            f"*📊 Resumo da semana:*",
+            f"  Alertas totais: *{total_alerts}*",
+            f"  COMPRAR: *{comprar_count}* | MONITORIZAR: *{total_alerts - comprar_count}*",
+            f"  Score médio: *{avg_score:.1f}/20*",
+            f"  Melhor alerta: *{best['symbol']}* (score {best['score']:.0f}, {best['date']} {best['time']})",
+            "",
+        ]
+
+        # Detalhe por dia
+        lines.append("*🗓️ Alertas por dia:*")
+        for date_str in sorted(by_date.keys()):
+            day_entries = by_date[date_str]
+            lines.append(f"  *{date_str}* — {len(day_entries)} alerta(s)")
+            for e in sorted(day_entries, key=lambda x: x["score"], reverse=True):
+                verdict_badge = "🟢" if e["verdict"] == "COMPRAR" else "🟡"
+                lines.append(
+                    f"    {verdict_badge} *{e['symbol']}* — Score {e['score']:.0f}/20 | "
+                    f"{e['change']:+.1f}% | _{e['sector']}_"
+                )
+        lines.append("")
+
+        # Top 3 da semana
+        top3 = sorted(entries, key=lambda x: x["score"], reverse=True)[:3]
+        lines.append("*🏆 Top 3 da semana:*")
+        for i, e in enumerate(top3, 1):
+            lines.append(
+                f"  {i}. *{e['symbol']}* — Score {e['score']:.0f}/20 | {e['verdict']} | {e['date']}"
+            )
+
+    # Limpa o log semanal após o report
+    _save_weekly_log([])
+    lines += ["", f"_⏰ Próximo report: sábado às 10h_"]
+    send_telegram("\n".join(lines))
+    logging.info("Saturday report enviado e log semanal limpo.")
 
 
 # ── Target Sell ─────────────────────────────────────────────────────────────
@@ -324,8 +404,7 @@ def calculate_flip_target(
     if not price or price <= 0:
         return "N/D", "SEM DADOS"
 
-    # Blue chip override
-    if is_bluechip(fundamentals) and dip_score >= 8:
+    if is_bluechip(fundamentals) and dip_score >= 12:
         return "HOLD ETERNO", "💎 Blue chip — Adicionar em dips, nunca vender"
 
     sector         = fundamentals.get("sector", "")
@@ -343,14 +422,15 @@ def calculate_flip_target(
         anchors.append(("Analistas", float(analyst_target)))
     anchors.append(("Beta recovery", price * (1 + (beta or 1.0) * 0.12)))
 
-    weights        = {"PE rerating": 2, "Analistas": 2, "Beta recovery": 1}
-    total_w        = sum(weights[n] for n, _ in anchors)
-    weighted_price = sum(weights[n] * t for n, t in anchors) / total_w
+    weights         = {"PE rerating": 2, "Analistas": 2, "Beta recovery": 1}
+    total_w         = sum(weights[n] for n, _ in anchors)
+    weighted_price  = sum(weights[n] * t for n, t in anchors) / total_w
     weighted_upside = (weighted_price / price) - 1
 
     sector_cap = _SECTOR_FLIP_CAP.get(sector, 0.30)
-    if dip_score >= 9:   sector_cap *= 1.20
-    elif dip_score >= 8: sector_cap *= 1.10
+    # Ajuste do cap pelo score (escala 0-20)
+    if dip_score >= 18:   sector_cap *= 1.20
+    elif dip_score >= 15: sector_cap *= 1.10
 
     final_upside = min(weighted_upside, sector_cap)
     final_target = price * (1 + final_upside)
@@ -391,14 +471,11 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> 
         catalyst = entry.get("catalyst")
         price    = f.get("price", 0)
         mc_b     = (f.get("market_cap") or 0) / 1e9
-        # Tag se é posição já em carteira
         in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
         _, strategy  = calculate_flip_target(f, score, earnings, catalyst, spy_change)
-        score_stars  = "⭐" * min(int(score // 2), 5)
-        tier_badge   = {
-            1: "🔴T1", 2: "🟡T2", 3: "🔵T3"
-        }.get(tier, "")
-        lines.append(f"*{i}. {sym}*{in_portfolio} {tier_badge} | Score {score:.0f} {score_stars}")
+        badge        = "🔥" if score >= 16 else ("⭐" if score >= 11 else "📊")
+        tier_badge   = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
+        lines.append(f"*{i}. {sym}*{in_portfolio} {tier_badge} | Score {score:.0f}/20 {badge}")
         lines.append(f"   💰 ${price} | 🏦 ${mc_b:.1f}B")
         lines.append(f"   {strategy}")
         lines.append("")
@@ -422,11 +499,10 @@ def build_alert(
     drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
     region_part  = f" ({stock['region']})" if stock.get("region") else ""
     in_portfolio = " 💼 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
-    if dip_score >= 8:   score_badge = f"🔥 Score: {dip_score:.0f}/10"
-    elif dip_score >= 6: score_badge = f"⭐ Score: {dip_score:.0f}/10"
-    else:                score_badge = f"📊 Score: {dip_score:.0f}/10"
+    if dip_score >= 16:   score_badge = f"🔥 Score: {dip_score:.0f}/20"
+    elif dip_score >= 11: score_badge = f"⭐ Score: {dip_score:.0f}/20"
+    else:                 score_badge = f"📊 Score: {dip_score:.0f}/20"
     rsi_part = f" | RSI: {rsi_str}" if rsi_str else ""
-    # Volume spike flag
     vol     = fundamentals.get("volume") or 0
     avg_vol = fundamentals.get("average_volume") or 0
     vol_flag = " | 📈 Volume spike" if vol and avg_vol and vol > avg_vol * 1.5 else ""
@@ -489,8 +565,8 @@ def run_scan() -> None:
                     logging.info(f"  {symbol}: EVITAR — a saltar")
                     _alerted_today.add(alert_key); _save_alerts(_alerted_today)
                     continue
-                earnings_days            = get_earnings_days(symbol)
-                dip_score, rsi_str       = calculate_dip_score(fundamentals, symbol, earnings_days)
+                earnings_days      = get_earnings_days(symbol)
+                dip_score, rsi_str = calculate_dip_score(fundamentals, symbol, earnings_days)
                 if dip_score < MIN_DIP_SCORE:
                     logging.info(f"  {symbol}: score {dip_score} < {MIN_DIP_SCORE} — a saltar")
                     _alerted_today.add(alert_key); _save_alerts(_alerted_today)
@@ -504,7 +580,8 @@ def run_scan() -> None:
                 if send_telegram(message):
                     _alerted_today.add(alert_key)
                     _save_alerts(_alerted_today)
-                    logging.info(f"  ✅ Alerta: {symbol} ({verdict}, score {dip_score})")
+                    _log_alert(symbol, verdict, dip_score, stock["change_pct"], sector)
+                    logging.info(f"  ✅ Alerta: {symbol} ({verdict}, score {dip_score}/20)")
                 time.sleep(5)
             except Exception as e:
                 logging.error(f"Erro {symbol}: {e}")
@@ -553,9 +630,7 @@ def send_close_summary() -> None:
     def _timed_out():          return (time.time() - start_time) > WATCHDOG
     def _get_fund(sym, reg=""):
         if sym not in fund_cache:
-            if _timed_out():
-                logging.warning(f"Watchdog: a saltar {sym}")
-                return {"skip": True}
+            if _timed_out(): logging.warning(f"Watchdog: a saltar {sym}"); return {"skip": True}
             fund_cache[sym] = get_fundamentals(sym, reg, MIN_MARKET_CAP)
         return fund_cache[sym]
     def _get_score(sym, fund):
@@ -571,7 +646,7 @@ def send_close_summary() -> None:
         fund = _get_fund(sym, s.get("region", ""))
         if fund.get("skip"): continue
         score = _get_score(sym, fund)
-        if score >= 8:
+        if score >= 11:
             s["_score"] = score
             tier3.append(s)
     tier3.sort(key=lambda x: x.get("_score", 0), reverse=True)
@@ -607,7 +682,7 @@ def send_close_summary() -> None:
         lines += ["", "_→ Monitorizar apenas_", ""]
 
     if tier3:
-        lines.append("*🔵 TIER 3 — Gems Raras (-3/-8%, score ≥8):*")
+        lines.append("*🔵 TIER 3 — Gems Raras (-3/-8%, score ≥11):*")
         lines.append("")
         for s in tier3[:5]:
             sym          = s["symbol"]
@@ -619,14 +694,14 @@ def send_close_summary() -> None:
             earnings     = get_earnings_date(sym)
             catalyst     = get_catalyst(sym, fund.get("name", ""))
             _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change)
-            badge        = "🔥" if score >= 9 else "⭐"
+            badge        = "🔥" if score >= 16 else "⭐"
             in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
-            lines.append(f"  {badge} *{sym}*{in_portfolio} — Score {score:.0f} | ${price} | ${mc_b:.1f}B | {sector_label}")
+            lines.append(f"  {badge} *{sym}*{in_portfolio} — Score {score:.0f}/20 | ${price} | ${mc_b:.1f}B | {sector_label}")
             lines.append(f"     {strategy}")
             lines.append("")
-        rest_9plus = [s for s in tier3[5:] if s.get("_score", 0) >= 9]
-        if rest_9plus:
-            lines.append(f"  _Score 9+ adicionais: {', '.join(s['symbol'] for s in rest_9plus)}_")
+        rest_high = [s for s in tier3[5:] if s.get("_score", 0) >= 16]
+        if rest_high:
+            lines.append(f"  _Score 16+ adicionais: {', '.join(s['symbol'] for s in rest_high)}_")
             lines.append("")
 
     ranking_entries = []
@@ -636,7 +711,7 @@ def send_close_summary() -> None:
             fund = _get_fund(sym, s.get("region", ""))
             if fund.get("skip"): continue
             score = _get_score(sym, fund)
-            if score >= 7:
+            if score >= 11:
                 ranking_entries.append({
                     "symbol":        sym,
                     "dip_score":     score,
@@ -660,14 +735,14 @@ if __name__ == "__main__":
     logging.info("=" * 60)
     logging.info("DipRadar iniciado")
     logging.info(f"Threshold: {DROP_THRESHOLD}% | Min cap: ${MIN_MARKET_CAP/1e9:.0f}B")
-    logging.info(f"Scan a cada {SCAN_MINUTES} minutos | Min score: {MIN_DIP_SCORE}")
+    logging.info(f"Scan a cada {SCAN_MINUTES} minutos | Min score: {MIN_DIP_SCORE}/20")
     logging.info("=" * 60)
 
     send_telegram(
         f"🤖 *DipRadar iniciado*\n"
-        f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥8)\n"
-        f"Cap mínimo: ${MIN_MARKET_CAP/1e9:.0f}B | Score mínimo: {MIN_DIP_SCORE}/10\n"
-        f"Weekly scan: ✅ Segunda 8h45 (dips estruturais ≥25%)\n"
+        f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥11)\n"
+        f"Score: 0–20 | Min alerta: {MIN_DIP_SCORE}/20\n"
+        f"Weekly scan: ✅ Segunda 8h45 | Saturday report: ✅ Sábado 10h\n"
         f"Catalisadores Tavily: {'✅' if os.environ.get('TAVILY_API_KEY') else '⚠️ não configurado'}\n"
         f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
     )
@@ -675,6 +750,7 @@ if __name__ == "__main__":
     schedule.every(SCAN_MINUTES).minutes.do(run_scan)
     schedule.every().day.at("08:45").do(send_weekly_dip_scan)
     schedule.every().day.at("09:00").do(send_heartbeat)
+    schedule.every().day.at("10:00").do(send_saturday_report)
     schedule.every().day.at("15:30").do(send_open_summary)
     schedule.every().day.at("21:15").do(send_close_summary)
     schedule.every().day.at("00:01").do(
