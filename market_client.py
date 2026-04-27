@@ -4,6 +4,7 @@ DipRadar - Multi-region stock dip screener
 US + Europe + UK + Asia via Yahoo Finance (free & unlimited)
 Fundamentals via yfinance
 """
+logging.getLogger().setLevel(logging.DEBUG)
 
 import time
 import logging
