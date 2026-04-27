@@ -11,7 +11,7 @@ Ver README.md → "Portfolio Env Vars" para a lista completa.
 import os
 
 # ── Tickers ────────────────────────────────────────────────────────────
-DIRECT_TICKERS   = ["NVO", "ADBE", "UBER", "EUNL", "MSFT", "PINS", "ADP", "CRM", "VICI"]
+DIRECT_TICKERS   = ["NVO", "ADBE", "UBER", "EUNL.DE", "MSFT", "PINS", "ADP", "CRM", "VICI"]
 CASHBACK_TICKERS = ["CRWD", "PLTR", "NOW", "DUOL"]
 
 # ── Shares das posições directas (via env vars) ────────────────────────────
