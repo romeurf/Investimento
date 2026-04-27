@@ -2,6 +2,7 @@
 Trigger: Yahoo Finance day_losers (gratuito, sem API key)
 Fundamentais: yfinance — sem session customizada (deixar gerir crumb interno)
 """
+
 import time
 import logging
 import requests
@@ -30,9 +31,9 @@ def screen_big_drops(min_drop_pct: float = 10.0,
         r.raise_for_status()
         quotes = (
             r.json()
-             .get("finance", {})
-             .get("result", [{}])[0]
-             .get("quotes", [])
+            .get("finance", {})
+            .get("result", [{}])[0]
+            .get("quotes", [])
         )
     except Exception as e:
         logging.error(f"Yahoo losers: {e}")
@@ -40,10 +41,10 @@ def screen_big_drops(min_drop_pct: float = 10.0,
 
     results = []
     for q in quotes:
-        chg   = q.get("regularMarketChangePercent", 0) or 0
+        chg = q.get("regularMarketChangePercent", 0) or 0
         if chg > -min_drop_pct:
             continue
-        mc    = q.get("marketCap") or 0
+        mc = q.get("marketCap") or 0
         if mc and mc < min_market_cap:
             continue
         sym   = q.get("symbol", "")
@@ -71,7 +72,7 @@ def _yf_info(symbol: str) -> dict:
     NÃO injeta session customizada — deixa o yfinance gerir o crumb internamente.
     """
     for attempt in range(4):
-        wait = 10 + (20 * attempt)   # 10s, 30s, 50s, 70s
+        wait = 10 + (20 * attempt)  # 10s, 30s, 50s, 70s
         time.sleep(wait)
         try:
             inf = yf.Ticker(symbol).info
@@ -93,7 +94,7 @@ def _yf_info(symbol: str) -> dict:
 
 def get_fundamentals(symbol: str) -> dict:
     result = {"symbol": symbol}
-    inf    = _yf_info(symbol)
+    inf = _yf_info(symbol)
 
     if not inf:
         logging.error(f"  {symbol}: falhou após todas as tentativas")
@@ -105,21 +106,31 @@ def get_fundamentals(symbol: str) -> dict:
         logging.info(f"  {symbol}: micro-cap ${mc/1e6:.0f}M — a saltar")
         return result
 
+    price = inf.get("currentPrice") or inf.get("regularMarketPrice")
+
+    # Drawdown desde máximo de 52 semanas
+    week52_high = inf.get("fiftyTwoWeekHigh")
+    drawdown_from_high = None
+    if week52_high and price and week52_high > 0:
+        drawdown_from_high = round((price - week52_high) / week52_high * 100, 1)
+
     result.update({
-        "name":           inf.get("longName") or inf.get("shortName") or symbol,
-        "sector":         inf.get("sector", ""),
-        "industry":       inf.get("industry", ""),
-        "price":          inf.get("currentPrice") or inf.get("regularMarketPrice"),
-        "beta":           inf.get("beta"),
-        "market_cap":     mc,
-        "pe":             inf.get("trailingPE") or inf.get("forwardPE"),
-        "revenue_growth": inf.get("revenueGrowth"),
-        "gross_margin":   inf.get("grossMargins"),
-        "ev_ebitda":      inf.get("enterpriseToEbitda"),
-        "roe":            inf.get("returnOnEquity"),
-        "debt_equity":    inf.get("debtToEquity"),
-        "dividend_yield": inf.get("dividendYield"),
-        "payout_ratio":   inf.get("payoutRatio"),
+        "name":              inf.get("longName") or inf.get("shortName") or symbol,
+        "sector":            inf.get("sector", ""),
+        "industry":          inf.get("industry", ""),
+        "price":             price,
+        "beta":              inf.get("beta"),
+        "market_cap":        mc,
+        "pe":                inf.get("trailingPE") or inf.get("forwardPE"),
+        "revenue_growth":    inf.get("revenueGrowth"),
+        "gross_margin":      inf.get("grossMargins"),
+        "ev_ebitda":         inf.get("enterpriseToEbitda"),
+        "roe":               inf.get("returnOnEquity"),
+        "debt_equity":       inf.get("debtToEquity"),
+        "dividend_yield":    inf.get("dividendYield"),
+        "payout_ratio":      inf.get("payoutRatio"),
+        "week52_high":       week52_high,
+        "drawdown_from_high": drawdown_from_high,  # % desde o pico 52w (negativo = abaixo)
     })
 
     fcf    = inf.get("freeCashflow")
@@ -130,7 +141,6 @@ def get_fundamentals(symbol: str) -> dict:
         result["fcf_per_share"] = fcf / shares
 
     target = inf.get("targetMeanPrice")
-    price  = result.get("price")
     if target and price and price > 0:
         result["analyst_upside"] = (target - price) / price * 100
         result["analyst_target"] = target
@@ -138,11 +148,29 @@ def get_fundamentals(symbol: str) -> dict:
     return result
 
 
+def get_52w_drawdown(symbol: str) -> float | None:
+    """
+    Devolve a % de queda desde o máximo de 52 semanas.
+    Usado no resumo de fecho para Tier 1 (≤6 stocks — não sobrecarrega a API).
+    Exemplo: -23.5 significa que está 23.5% abaixo do máximo anual.
+    """
+    try:
+        time.sleep(3)
+        inf = yf.Ticker(symbol).info or {}
+        high  = inf.get("fiftyTwoWeekHigh")
+        price = inf.get("currentPrice") or inf.get("regularMarketPrice")
+        if high and price and high > 0:
+            return round((price - high) / high * 100, 1)
+    except Exception as e:
+        logging.warning(f"52w drawdown {symbol}: {e}")
+    return None
+
+
 def get_news(symbol: str, limit: int = 3) -> list[dict]:
     try:
         time.sleep(5)
         news = yf.Ticker(symbol).news or []
-        out  = []
+        out = []
         for item in news[:limit]:
             content = item.get("content") or {}
             out.append({
