@@ -15,6 +15,10 @@ Comandos disponíveis:
   /watchlist add TICK      → Adicionar ticker à watchlist
   /watchlist rm TICK       → Remover ticker da watchlist
   /watchlist clear         → Limpar toda a watchlist dinâmica
+  /flip                    → Ver log e P&L do Flip Fund
+  /flip add TICK ENTRY SHARES [NOTA]   → Registar entrada num trade
+  /flip close ID EXIT                  → Fechar trade pelo ID com preço de saída
+  /flip del ID                         → Apagar trade pelo ID
   /help                    → Lista de comandos
 
 Funções chamadas pelo scheduler (main.py):
@@ -37,28 +41,33 @@ from state import (
     remove_from_dynamic_watchlist,
     save_dynamic_watchlist,
     get_ticker_score_history,
+    # Flip Fund
+    load_flip_log,
+    add_flip_trade,
+    close_flip_trade,
+    delete_flip_trade,
+    get_flip_summary,
 )
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Dias de antecedência para o alerta automático de earnings
 _EARNINGS_ALERT_DAYS: int = int(os.environ.get("EARNINGS_ALERT_DAYS", 7))
 
 _last_update_id: int = 0
 _bot_start_time: datetime = datetime.now()
 
 # Callbacks injectados pelo main.py
-_cb_send_telegram    = None  # fn(msg) -> bool
-_cb_run_scan         = None  # fn() -> None
-_cb_get_snapshot     = None  # fn() -> dict
-_cb_backtest_summary = None  # fn() -> str
-_cb_rejected_log     = None  # fn() -> list
-_cb_is_market_open   = None  # fn() -> bool
-_cb_tier3_handler    = None  # fn() -> str
-_cb_analyze_ticker   = None  # fn(symbol) -> str
-_cb_get_fundamentals = None  # fn(symbol) -> dict  (para /comparar)
-_cb_earnings_days    = None  # fn(symbol) -> int|None
+_cb_send_telegram    = None
+_cb_run_scan         = None
+_cb_get_snapshot     = None
+_cb_backtest_summary = None
+_cb_rejected_log     = None
+_cb_is_market_open   = None
+_cb_tier3_handler    = None
+_cb_analyze_ticker   = None
+_cb_get_fundamentals = None
+_cb_earnings_days    = None
 
 
 def register_callbacks(
@@ -108,11 +117,6 @@ def _check_rate(cmd: str) -> bool:
 # ── /comparar ───────────────────────────────────────────────────────────────────
 
 def _handle_comparar(symbols: list[str]) -> None:
-    """
-    Compara scores de 2-5 tickers lado-a-lado usando os fundamentais
-    e o score_log em memória. Mostra tabela ASCII com os principais
-    indicadores para facilitar a decisão entre tickers concorrentes.
-    """
     if len(symbols) < 2:
         _reply(
             "⚠️ Usa: `/comparar <TICK1> <TICK2> [TICK3...]`\n"
@@ -160,7 +164,6 @@ def _handle_comparar(symbols: list[str]) -> None:
             _reply("_Nenhum dado obtido._")
             return
 
-        # Ordena por score desc
         rows.sort(key=lambda r: r.get("score", 0), reverse=True)
 
         lines = [f"*🔄 Comparação — {datetime.now().strftime('%d/%m %H:%M')}*", ""]
@@ -168,18 +171,10 @@ def _handle_comparar(symbols: list[str]) -> None:
             if r.get("error"):
                 lines.append(f"  ❌ *{r['sym']}* — _erro: {r['error']}_")
                 continue
-            lines.append(
-                f"  {r['badge']} *{r['sym']}* — score *{r['score']:.0f}/100*"
-            )
-            lines.append(
-                f"     RSI {r['rsi']} · FCF {r['fcf']} · Growth {r['growth']}"
-            )
-            lines.append(
-                f"     Margin {r['margin']} · Upside {r['upside']} · Drawdown {r['drawdown']}"
-            )
-            lines.append(
-                f"     Sector: _{r['sector']}_ · Earnings: {r['edays']}d"
-            )
+            lines.append(f"  {r['badge']} *{r['sym']}* — score *{r['score']:.0f}/100*")
+            lines.append(f"     RSI {r['rsi']} · FCF {r['fcf']} · Growth {r['growth']}")
+            lines.append(f"     Margin {r['margin']} · Upside {r['upside']} · Drawdown {r['drawdown']}")
+            lines.append(f"     Sector: _{r['sector']}_ · Earnings: {r['edays']}d")
             lines.append("")
 
         winner = rows[0]
@@ -194,11 +189,6 @@ def _handle_comparar(symbols: list[str]) -> None:
 # ── /historico ──────────────────────────────────────────────────────────────────
 
 def _handle_historico(symbol: str) -> None:
-    """
-    Mostra as últimas N entradas do score_log para o ticker:
-    data, score, verdict, change% e preço ao momento do alerta.
-    Inclui trend indicator (subida/descida de score entre entradas).
-    """
     history = get_ticker_score_history(symbol)
     if not history:
         _reply(
@@ -207,7 +197,6 @@ def _handle_historico(symbol: str) -> None:
         )
         return
 
-    # Mostra as últimas 10 entradas
     entries = history[-10:]
     lines   = [f"*📈 Histórico — {symbol} ({len(history)} entradas totais):*", ""]
 
@@ -220,7 +209,6 @@ def _handle_historico(symbol: str) -> None:
         date    = e.get("date", "")
         t       = e.get("time", "")
 
-        # Trend vs entrada anterior
         if prev_score is None:
             trend = ""
         elif score > prev_score:
@@ -247,23 +235,12 @@ def _handle_historico(symbol: str) -> None:
 # ── Earnings alerts (chamado pelo scheduler do main.py) ──────────────────────
 
 def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
-    """
-    Verifica a watchlist dinâmica (+ watchlist estática passada em watchlist=)
-    e envia um alerta Telegram para cada ticker com earnings nos próximos
-    _EARNINGS_ALERT_DAYS dias.
-
-    Deve ser chamado uma vez por dia pelo scheduler do main.py.
-    Evita duplicados via _alerted_today set (reset à meia-noite).
-
-    Devolve o número de alertas enviados.
-    """
     if not _cb_earnings_days or not _cb_send_telegram:
         return 0
 
-    # Une watchlist dinâmica com estática (sem duplicados)
-    dynamic  = load_dynamic_watchlist()
-    static   = list(watchlist) if watchlist else []
-    all_tickers = list(dict.fromkeys(dynamic + static))  # preserva ordem, remove dups
+    dynamic     = load_dynamic_watchlist()
+    static      = list(watchlist) if watchlist else []
+    all_tickers = list(dict.fromkeys(dynamic + static))
 
     if not all_tickers:
         return 0
@@ -277,7 +254,6 @@ def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
             if edays is None:
                 continue
             if 0 <= edays <= _EARNINGS_ALERT_DAYS:
-                # Deduplicação via score_log: verifica se já alertamos hoje
                 history = get_ticker_score_history(sym)
                 already = any(
                     e.get("date_iso") == today_str and e.get("verdict", "").startswith("earnings_alert")
@@ -286,7 +262,7 @@ def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
                 if already:
                     continue
 
-                urgency = "🚨 *HOJE*" if edays == 0 else (f"⏰ *{edays} dia(s)*" if edays <= 2 else f"📅 {edays} dia(s)")
+                urgency    = "🚨 *HOJE*" if edays == 0 else (f"⏰ *{edays} dia(s)*" if edays <= 2 else f"📅 {edays} dia(s)")
                 last_score = history[-1].get("score") if history else None
                 score_str  = f" — último score: *{last_score:.0f}/100*" if last_score is not None else ""
 
@@ -370,12 +346,181 @@ def _handle_watchlist(parts: list[str]) -> None:
         )
 
 
+# ── /flip handler ─────────────────────────────────────────────────────────────
+
+def _handle_flip(parts: list[str]) -> None:
+    """
+    Comandos do Flip Fund:
+
+      /flip                              → Resumo P&L + trades abertos
+      /flip list                         → Lista todos os trades (abertos + fechados)
+      /flip add TICK ENTRY SHARES [NOTA] → Registar nova entrada
+      /flip close ID EXIT                → Fechar trade com preço de saída
+      /flip del ID                       → Apagar trade
+    """
+    sub = parts[1].lower() if len(parts) > 1 else "summary"
+
+    # ── Resumo / lista de abertos ───────────────────────────────────────────
+    if sub in ("summary", "list", "ls", "ver", "show") or len(parts) == 1:
+        summary = get_flip_summary()
+        lines = [
+            f"*🎯 Flip Fund — {datetime.now().strftime('%d/%m/%Y')}*",
+            "",
+        ]
+
+        # P&L realizado
+        pnl      = summary["total_pnl"]
+        pnl_sign = "+" if pnl >= 0 else ""
+        pnl_em   = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+        lines.append(f"  {pnl_em} *P&L realizado:* ${pnl_sign}{pnl:.2f}")
+        lines.append(f"  📊 Trades fechados: *{summary['n_closed']}* | Win rate: *{summary['win_rate']:.0f}%*")
+
+        if summary["best_trade"]:
+            b = summary["best_trade"]
+            lines.append(f"  🏆 Melhor: *{b['symbol']}* ${b['pnl_eur']:+.2f} ({b['date_entry']} → {b['date_exit'] or '?'})")
+        if summary["worst_trade"] and summary["n_closed"] > 1:
+            w = summary["worst_trade"]
+            lines.append(f"  ⚠️ Pior: *{w['symbol']}* ${w['pnl_eur']:+.2f} ({w['date_entry']} → {w['date_exit'] or '?'})")
+
+        # Posições abertas
+        opened = summary["trades_open"]
+        if opened:
+            lines += ["", f"*📂 Posições abertas ({len(opened)}):*"]
+            for t in opened:
+                notes_str = f" — _{t['notes']}_" if t.get("notes") else ""
+                lines.append(
+                    f"  #{t['id']} *{t['symbol']}* x{t['shares']} @ ${t['price_entry']:.2f}"
+                    f" (desde {t['date_entry']}){notes_str}"
+                )
+        else:
+            lines += ["", "_Sem posições abertas._"]
+
+        # Se /flip list → mostra também fechados
+        if sub in ("list", "ls"):
+            closed = summary["trades_closed"]
+            if closed:
+                lines += ["", f"*✅ Trades fechados ({len(closed)}):*"]
+                for t in sorted(closed, key=lambda x: x["date_exit"] or "", reverse=True)[:10]:
+                    pnl_s = f"${t['pnl_eur']:+.2f}" if t["pnl_eur"] is not None else "N/D"
+                    em    = "🟢" if (t["pnl_eur"] or 0) > 0 else "🔴"
+                    lines.append(
+                        f"  {em} #{t['id']} *{t['symbol']}* x{t['shares']} "
+                        f"${t['price_entry']:.2f}→${t['price_exit']:.2f} | *{pnl_s}* "
+                        f"({t['date_entry']} → {t['date_exit']})"
+                    )
+                if len(closed) > 10:
+                    lines.append(f"  _... e mais {len(closed) - 10} trades anteriores._")
+
+        lines += [
+            "",
+            "_`/flip add TICK ENTRY SHARES` → Registar entrada_",
+            "_`/flip close ID EXIT` → Fechar trade_",
+        ]
+        _reply("\n".join(lines))
+        return
+
+    # ── /flip add TICK ENTRY SHARES [NOTA] ─────────────────────────────────
+    if sub in ("add", "entrada", "open"):
+        # Mínimo: /flip add TICK ENTRY SHARES
+        if len(parts) < 5:
+            _reply(
+                "⚠️ Uso: `/flip add <TICKER> <PREÇO_ENTRADA> <SHARES> [nota]`\n"
+                "_Exemplo: `/flip add NVDA 105.50 10`_\n"
+                "_Exemplo com nota: `/flip add NVDA 105.50 10 queda macro`_"
+            )
+            return
+        ticker = parts[2].upper().strip()
+        try:
+            entry  = float(parts[3])
+            shares = float(parts[4])
+        except ValueError:
+            _reply("⚠️ Preço e shares têm de ser números. Ex: `/flip add NVDA 105.50 10`")
+            return
+        if entry <= 0 or shares <= 0:
+            _reply("⚠️ Preço de entrada e shares têm de ser positivos.")
+            return
+        notes = " ".join(parts[5:]) if len(parts) > 5 else ""
+        trade = add_flip_trade(ticker, shares, entry, notes=notes)
+        cost  = round(entry * shares, 2)
+        _reply(
+            f"✅ *Flip trade registado!*\n"
+            f"  #{trade['id']} *{ticker}* — {shares} shares @ ${entry:.2f}\n"
+            f"  💰 Custo total: *${cost:.2f}*\n"
+            f"  📅 Data: {trade['date_entry']}\n"
+            f"  _Fecha com `/flip close {trade['id']} <PREÇO_SAÍDA>`_"
+            + (f"\n  📝 Nota: _{notes}_" if notes else "")
+        )
+        return
+
+    # ── /flip close ID EXIT ─────────────────────────────────────────────────
+    if sub in ("close", "fechar", "sell"):
+        if len(parts) < 4:
+            _reply(
+                "⚠️ Uso: `/flip close <ID> <PREÇO_SAÍDA>`\n"
+                "_Exemplo: `/flip close 3 121.80`_"
+            )
+            return
+        try:
+            trade_id = int(parts[2])
+            exit_px  = float(parts[3])
+        except ValueError:
+            _reply("⚠️ ID tem de ser inteiro e preço um número. Ex: `/flip close 3 121.80`")
+            return
+        if exit_px <= 0:
+            _reply("⚠️ Preço de saída tem de ser positivo.")
+            return
+        trade = close_flip_trade(trade_id, exit_px)
+        if trade is None:
+            _reply(f"⚠️ Trade `#{trade_id}` não encontrado ou já está fechado.")
+            return
+        pnl    = trade["pnl_eur"]
+        pct    = (exit_px - trade["price_entry"]) / trade["price_entry"] * 100
+        em     = "🟢" if pnl > 0 else "🔴"
+        result = "Lucro" if pnl > 0 else "Perda"
+        _reply(
+            f"{em} *Flip trade fechado!*\n"
+            f"  #{trade_id} *{trade['symbol']}* x{trade['shares']}\n"
+            f"  Entrada: ${trade['price_entry']:.2f} → Saída: ${exit_px:.2f}\n"
+            f"  *{result}: ${pnl:+.2f}* ({pct:+.1f}%)\n"
+            f"  _Período: {trade['date_entry']} → {trade['date_exit']}_"
+        )
+        return
+
+    # ── /flip del ID ────────────────────────────────────────────────────────
+    if sub in ("del", "delete", "rm", "apagar", "remover"):
+        if len(parts) < 3:
+            _reply("⚠️ Uso: `/flip del <ID>`\n_Exemplo: `/flip del 2`_")
+            return
+        try:
+            trade_id = int(parts[2])
+        except ValueError:
+            _reply("⚠️ ID tem de ser um número inteiro.")
+            return
+        removed = delete_flip_trade(trade_id)
+        if removed:
+            _reply(f"🗑️ Trade `#{trade_id}` removido.")
+        else:
+            _reply(f"⚠️ Trade `#{trade_id}` não encontrado.")
+        return
+
+    # Sub-comando desconhecido
+    _reply(
+        f"⚠️ Sub-comando desconhecido: `{sub}`\n\n"
+        "*Uso do /flip:*\n"
+        "`/flip`                           → Resumo P&L\n"
+        "`/flip list`                      → Todos os trades\n"
+        "`/flip add TICK ENTRY SHARES`     → Nova entrada\n"
+        "`/flip close ID EXIT`             → Fechar trade\n"
+        "`/flip del ID`                    → Apagar trade"
+    )
+
+
 # ── Command router ───────────────────────────────────────────────────────────
 
 def _handle_command(text: str) -> None:
     parts   = text.strip().split()
     cmd     = parts[0].lower() if parts else ""
-    cmd     = cmd.split("@")[0]  # remove bot mention
+    cmd     = cmd.split("@")[0]
     cmd_key = cmd.lstrip("/")
 
     if cmd in ("/help", "/start"):
@@ -394,6 +539,11 @@ def _handle_command(text: str) -> None:
             "`/watchlist add TICK`      → Adicionar ticker\n"
             "`/watchlist rm TICK`       → Remover ticker\n"
             "`/watchlist clear`         → Limpar watchlist\n"
+            "`/flip`                    → P&L e trades abertos do Flip Fund\n"
+            "`/flip list`               → Todos os trades (abertos + fechados)\n"
+            "`/flip add TICK ENTRY SHR` → Registar entrada\n"
+            "`/flip close ID EXIT`      → Fechar trade\n"
+            "`/flip del ID`             → Apagar trade\n"
             "`/help`                    → Esta mensagem"
         )
 
@@ -404,11 +554,13 @@ def _handle_command(text: str) -> None:
         mins       = rem // 60
         market     = "🟢 Aberto" if (_cb_is_market_open and _cb_is_market_open()) else "🔴 Fechado"
         wl         = load_dynamic_watchlist()
+        summary    = get_flip_summary()
+        flip_str   = f" | Flip: {summary['n_open']} abertos / P&L ${summary['total_pnl']:+.0f}"
         _reply(
             f"*🤖 DipRadar Status*\n"
             f"Uptime: *{hours}h {mins}m*\n"
             f"Mercado: *{market}*\n"
-            f"Watchlist dinâmica: *{len(wl)} tickers*\n"
+            f"Watchlist dinâmica: *{len(wl)} tickers*{flip_str}\n"
             f"_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
             f"_{rate_status()}_"
         )
@@ -534,6 +686,14 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"_Erro na watchlist: {e}_")
             logging.exception("[bot_commands] /watchlist error")
+
+    elif cmd == "/flip":
+        if not _check_rate(cmd_key): return
+        try:
+            _handle_flip(parts)
+        except Exception as e:
+            _reply(f"_Erro no flip: {e}_")
+            logging.exception("[bot_commands] /flip error")
 
     else:
         if text.startswith("/"):

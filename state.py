@@ -9,6 +9,7 @@ Estrutura de ficheiros:
   _dipr_recovery.json    → posições em aberto aguardando recovery alert
   _dipr_watchlist.json   → watchlist dinâmica (add/remove via Telegram)
   _dipr_score_log.json   → histórico de scores por ticker (para upgrades + /historico)
+  _dipr_flip_log.json    → log de trades do Flip Fund (/flip)
 """
 
 import json
@@ -26,6 +27,7 @@ _BACKTEST_FILE  = _DATA_DIR / "_dipr_backtest.json"
 _RECOVERY_FILE  = _DATA_DIR / "_dipr_recovery.json"
 _WATCHLIST_FILE = _DATA_DIR / "_dipr_watchlist.json"
 _SCORE_LOG_FILE = _DATA_DIR / "_dipr_score_log.json"
+_FLIP_LOG_FILE  = _DATA_DIR / "_dipr_flip_log.json"
 
 
 # ── helpers genéricos ────────────────────────────────────────────────────────
@@ -177,9 +179,9 @@ def add_recovery_position(
         "target_price": round(price_alert * (1 + target_pct / 100), 2),
         "verdict":      verdict,
         "date":         datetime.now().strftime("%d/%m/%Y"),
-        "date_iso":     datetime.now().date().isoformat(),  # necessário para stop temporal
+        "date_iso":     datetime.now().date().isoformat(),
         "alerted":      False,
-        "stale_alerted": False,  # True quando o aviso de 60d já foi enviado
+        "stale_alerted": False,
     })
     save_recovery_watch(positions)
 
@@ -206,20 +208,18 @@ def get_stale_recovery_positions(days: int = 60) -> list[dict]:
     """
     Devolve posições que estão no recovery_watch há mais de `days` dias
     sem terem atingido o target, e cujo aviso de stale ainda não foi enviado.
-
-    Retrocompatibilidade: posições sem 'date_iso' são ignoradas (não têm data de entrada).
     """
     positions = load_recovery_watch()
     stale     = []
     cutoff    = datetime.now() - timedelta(days=days)
     for p in positions:
-        if p.get("alerted"):       # já recuperou — ignorar
+        if p.get("alerted"):
             continue
-        if p.get("stale_alerted"): # aviso já enviado — ignorar
+        if p.get("stale_alerted"):
             continue
         date_iso = p.get("date_iso")
         if not date_iso:
-            continue  # posição antiga sem data — ignorar
+            continue
         try:
             entry_date = datetime.fromisoformat(date_iso)
         except ValueError:
@@ -232,10 +232,6 @@ def get_stale_recovery_positions(days: int = 60) -> list[dict]:
 # ── Watchlist dinâmica (gerida via /watchlist add|remove) ────────────────────
 
 def load_dynamic_watchlist() -> list[str]:
-    """
-    Devolve lista de tickers adicionados via /watchlist add.
-    Separado da WATCHLIST hardcoded em watchlist.py.
-    """
     return _read(_WATCHLIST_FILE).get("tickers", [])
 
 def save_dynamic_watchlist(tickers: list[str]) -> None:
@@ -265,9 +261,6 @@ def remove_from_dynamic_watchlist(ticker: str) -> bool:
 # ── Score log (histórico de scores para /historico e upgrades) ───────────────
 
 def load_score_log() -> dict:
-    """
-    Devolve dict: symbol → list of {score, verdict, date, date_iso, change, price}
-    """
     return _read(_SCORE_LOG_FILE).get("scores", {})
 
 def save_score_log(data: dict) -> None:
@@ -280,10 +273,6 @@ def append_score_log(
     change_pct: float = 0.0,
     price: float = 0.0,
 ) -> None:
-    """
-    Regista uma entrada de score para o ticker.
-    Mantém no máximo as últimas 30 entradas por ticker.
-    """
     data = load_score_log()
     entries = data.get(symbol, [])
     entries.append({
@@ -295,17 +284,122 @@ def append_score_log(
         "time":     datetime.now().strftime("%H:%M"),
         "date_iso": datetime.now().date().isoformat(),
     })
-    # Máx 30 entradas por ticker
     data[symbol] = entries[-30:]
     save_score_log(data)
 
 def get_ticker_score_history(symbol: str) -> list:
-    """Devolve o histórico de scores para o ticker ou lista vazia."""
     return load_score_log().get(symbol.upper(), [])
 
 def get_last_score(symbol: str) -> float | None:
-    """Devolve o último score registado para o ticker, ou None."""
     history = get_ticker_score_history(symbol)
     if history:
         return history[-1]["score"]
     return None
+
+
+# ── Flip Fund trade log ───────────────────────────────────────────────────────
+
+def load_flip_log() -> list:
+    """
+    Devolve lista de todos os trades do Flip Fund.
+    Cada entrada tem:
+      id, symbol, shares, price_entry, price_exit (None se aberto),
+      date_entry, date_exit (None se aberto), pnl_eur, status ('open'|'closed'),
+      notes
+    """
+    return _read(_FLIP_LOG_FILE).get("trades", [])
+
+def save_flip_log(trades: list) -> None:
+    _write(_FLIP_LOG_FILE, {"trades": trades})
+
+def add_flip_trade(
+    symbol: str,
+    shares: float,
+    price_entry: float,
+    date_entry: str | None = None,
+    notes: str = "",
+) -> dict:
+    """
+    Regista entrada num trade Flip Fund (posição aberta).
+    Devolve o dict do trade criado.
+    """
+    trades = load_flip_log()
+    trade_id = (max((t["id"] for t in trades), default=0) + 1)
+    trade = {
+        "id":          trade_id,
+        "symbol":      symbol.upper().strip(),
+        "shares":      round(shares, 6),
+        "price_entry": round(price_entry, 4),
+        "price_exit":  None,
+        "date_entry":  date_entry or datetime.now().strftime("%d/%m/%Y"),
+        "date_exit":   None,
+        "pnl_eur":     None,
+        "status":      "open",
+        "notes":       notes,
+    }
+    trades.append(trade)
+    save_flip_log(trades)
+    logging.info(f"[flip_log] Trade aberto: #{trade_id} {symbol} x{shares} @ ${price_entry}")
+    return trade
+
+def close_flip_trade(
+    trade_id: int,
+    price_exit: float,
+    date_exit: str | None = None,
+) -> dict | None:
+    """
+    Fecha um trade Flip Fund e calcula o P&L em EUR (usando preços USD; sem conversão automática).
+    Devolve o trade actualizado, ou None se o ID não for encontrado.
+    """
+    trades = load_flip_log()
+    for t in trades:
+        if t["id"] == trade_id and t["status"] == "open":
+            t["price_exit"] = round(price_exit, 4)
+            t["date_exit"]  = date_exit or datetime.now().strftime("%d/%m/%Y")
+            t["pnl_eur"]    = round((price_exit - t["price_entry"]) * t["shares"], 2)
+            t["status"]     = "closed"
+            save_flip_log(trades)
+            logging.info(
+                f"[flip_log] Trade fechado: #{trade_id} {t['symbol']} "
+                f"P&L ${t['pnl_eur']:+.2f}"
+            )
+            return t
+    return None
+
+def delete_flip_trade(trade_id: int) -> bool:
+    """Remove um trade pelo ID (para correcções). Devolve True se removido."""
+    trades = load_flip_log()
+    new    = [t for t in trades if t["id"] != trade_id]
+    if len(new) == len(trades):
+        return False
+    save_flip_log(new)
+    logging.info(f"[flip_log] Trade removido: #{trade_id}")
+    return True
+
+def get_flip_summary() -> dict:
+    """
+    Devolve resumo do Flip Fund:
+      - trades_open: list de trades abertos
+      - trades_closed: list de trades fechados
+      - total_pnl: P&L total realizado (só fechados)
+      - best_trade / worst_trade: dict dos melhores/piores trades fechados
+      - win_rate: % trades fechados com lucro
+    """
+    trades  = load_flip_log()
+    closed  = [t for t in trades if t["status"] == "closed"]
+    opened  = [t for t in trades if t["status"] == "open"]
+    pnl_sum = sum(t["pnl_eur"] or 0 for t in closed)
+    winners = [t for t in closed if (t["pnl_eur"] or 0) > 0]
+    win_rate = len(winners) / len(closed) * 100 if closed else 0
+    best  = max(closed, key=lambda x: x["pnl_eur"] or 0, default=None)
+    worst = min(closed, key=lambda x: x["pnl_eur"] or 0, default=None)
+    return {
+        "trades_open":   opened,
+        "trades_closed": closed,
+        "total_pnl":     round(pnl_sum, 2),
+        "best_trade":    best,
+        "worst_trade":   worst,
+        "win_rate":      round(win_rate, 1),
+        "n_open":        len(opened),
+        "n_closed":      len(closed),
+    }
