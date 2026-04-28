@@ -12,8 +12,11 @@ Lógica:
     com base nos winners históricos e sugere ajuste ao MIN_DIP_SCORE.
   - fill_db_outcomes() vive em alert_db.py (fonte da verdade única).
     Preenche MFE/MAE/return a 1m/3m/6m na alert_db.csv ao sábado.
-  - run_historical_backtest() (F2) irá simular dips históricos para
-    gerar dados de treino ML sem esperar 6 meses de dados live.
+  - run_historical_backtest() (F2) simula dips históricos retroactivos
+    para gerar dados de treino ML sem esperar 6 meses de dados live.
+    Lookback fixo: 5 anos (sweet spot: apanha 2022 bear + 2023 recovery
+    sem contaminar o modelo com fundamentais de empresas estruturalmente
+    diferentes há mais de 5 anos).
 
 Nenhuma API key necessária — usa yfinance.history().
 """
@@ -277,10 +280,130 @@ def build_backtest_summary(min_entries: int = 3) -> str:
 
 # ── Historical backtest (F2) ──────────────────────────────────────────────
 
+# Lookback fixo: 5 anos — sweet spot entre dados de crise suficientes
+# e estabilidade fundamental aceitável (2021-2026 apanha bear 2022 + recovery 2023).
+_LOOKBACK_YEARS = 5
+
+
+def _rsi_series(close_series, period: int = 14):
+    """
+    Calcula RSI rolling vectorizado sobre uma pandas Series de fechos.
+    Devolve pandas Series com os mesmos índices.
+    Usa Wilder smoothing (EWM com com=period-1, adjust=False) — idêntico
+    ao RSI standard do TradingView / yfinance.
+    """
+    delta  = close_series.diff()
+    gain   = delta.clip(lower=0)
+    loss   = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period, adjust=False).mean()
+    rs  = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def _drawdown_from_rolling_high(close_series, window: int = 252):
+    """
+    Drawdown percentual vs máximo rolling dos últimos `window` dias.
+    Devolve pandas Series com valores negativos ou zero.
+    window=252 ≈ 52 semanas de dias úteis (equivalent a drawdown 52w).
+    """
+    rolling_max = close_series.rolling(window=window, min_periods=1).max()
+    return (close_series - rolling_max) / rolling_max * 100
+
+
+def _build_hybrid_fund(info: dict, row) -> dict:
+    """
+    Constrói o dicionário `fund` híbrido:
+      - Técnicos: do dia histórico (sem data leakage).
+      - Fundamentais: snapshot estático de hoje (concessão necessária
+        documentada; válida para lookback <= 5 anos).
+
+    row: linha do DataFrame histórico com campos:
+         Close, rsi_14, drawdown_52w, Volume, avg_vol_20d, change_pct
+    info: yfinance .info do dia de hoje
+    """
+    price    = float(row["Close"])
+    mc_today = info.get("marketCap") or 0
+    fcf_raw  = info.get("freeCashflow")
+    fcf_yield = (fcf_raw / mc_today) if (fcf_raw and mc_today > 0) else None
+
+    return {
+        # ── Técnicos: passado real (Dia 0) ──
+        "price":            price,
+        "rsi":              float(row["rsi_14"]) if row["rsi_14"] == row["rsi_14"] else None,
+        "drawdown_from_high": float(row["drawdown_52w"]),
+        "volume":           float(row["Volume"]),
+        "average_volume":   float(row["avg_vol_20d"]) if row["avg_vol_20d"] == row["avg_vol_20d"] else 0,
+        # ── Fundamentais: snapshot de hoje (concessão consciente) ──
+        "market_cap":       mc_today,
+        "fcf_yield":        fcf_yield,
+        "gross_margin":     info.get("grossMargins") or 0,
+        "revenue_growth":   info.get("revenueGrowth") or 0,
+        "debt_equity":      info.get("debtToEquity"),
+        "dividend_yield":   info.get("dividendYield") or 0,
+        "beta":             info.get("beta"),
+        "analyst_upside":   _analyst_upside(info),
+        "pe":               info.get("trailingPE") or 0,
+        "sector":           info.get("sector") or "",
+        "name":             (info.get("longName") or info.get("shortName") or "")[:40],
+    }
+
+
+def _analyst_upside(info: dict) -> float:
+    """Calcula % upside até ao target médio dos analistas."""
+    target = info.get("targetMeanPrice")
+    price  = info.get("currentPrice") or info.get("regularMarketPrice")
+    if target and price and price > 0:
+        return round((target - price) / price * 100, 1)
+    return 0.0
+
+
+def _detect_dips(df) -> object:
+    """
+    Adiciona colunas de sinal ao DataFrame OHLCV e devolve apenas
+    as linhas onde is_dip == True.
+
+    Sinal de dip (ambas as condições obrigatórias):
+      - RSI < 35  (oversold técnico)
+      - Drawdown 52w < -15%  (queda estrutural do topo)
+
+    Anti-clustering: ignora dips consecutivos numa janela de 20 dias
+    para o mesmo ticker — evita registar 20 rows de dados quase idênticos
+    do mesmo evento de queda.
+    """
+    import pandas as pd
+
+    df = df.copy()
+    df["rsi_14"]       = _rsi_series(df["Close"])
+    df["drawdown_52w"] = _drawdown_from_rolling_high(df["Close"], window=252)
+    df["avg_vol_20d"]  = df["Volume"].rolling(window=20, min_periods=5).mean()
+    df["change_pct"]   = df["Close"].pct_change() * 100
+
+    # Sinal vectorizado: sem loop
+    df["is_dip"] = (
+        (df["rsi_14"] < 35) &
+        (df["drawdown_52w"] < -15.0)
+    )
+
+    # Anti-clustering: mantém apenas o primeiro dip de cada cluster de 20d
+    dip_dates = df.index[df["is_dip"]]
+    if len(dip_dates) == 0:
+        return df[df["is_dip"]]  # vazio
+
+    kept      = [dip_dates[0]]
+    cooldown  = pd.Timedelta(days=20)
+    for dt in dip_dates[1:]:
+        if dt - kept[-1] >= cooldown:
+            kept.append(dt)
+
+    return df.loc[kept]
+
+
 def run_historical_backtest(
     tickers: list[str],
     output_path: Path | None = None,
-    lookback_years: int = 2,
+    lookback_years: int = _LOOKBACK_YEARS,
     min_score: float = 45.0,
     rsi_threshold: float = 35.0,
     drawdown_threshold: float = -15.0,
@@ -289,30 +412,138 @@ def run_historical_backtest(
     """
     F2 — Simula dips históricos para gerar dados de treino ML retroactivos.
 
-    Percorre o histórico de preços de cada ticker e, para cada dia em que
-    se detecta um dip (RSI < rsi_threshold E drawdown < drawdown_threshold),
-    reconstrói as métricas fundamentais disponíveis nesse dia e calcula
-    o MFE/MAE olhando para a frente (sem data leakage).
+    Fase F2-A (esta implementação): detecção de dips + scoring.
+    Fase F2-B (próxima): cálculo de MFE/MAE por dip detectado.
+    Fase F2-C (seguinte): escrita do CSV com estrutura _FIELDS do alert_db.
 
-    O output é um CSV com a mesma estrutura do alert_db.csv (_FIELDS),
-    pronto para ser concatenado ao histórico live para treino ML.
+    Estratégia anti-data-leakage:
+      - RSI, drawdown e volume calculados apenas com dados até ao Dia 0.
+      - Fundamentais são snapshot de hoje (concessão necessária para
+        dados gratuitos; válida para lookback <= 5 anos).
+      - MFE/MAE calculados APENAS com dados após o Dia 0 (F2-B).
+
+    Lookback fixo: 5 anos — apanha bear 2022, recovery 2023, ciclo actual
+    sem contaminar o modelo com fundamentais de empresas estruturalmente
+    diferentes (regra: usar só tickers onde o modelo de negócio core é
+    essencialmente o mesmo que hoje).
 
     Argumentos:
       tickers            : lista de símbolos a processar
-      output_path        : caminho do CSV de saída (None = auto)
-      lookback_years     : anos de histórico a analisar (default: 2)
-      min_score          : score mínimo para registar o dip simulado
-      rsi_threshold      : RSI máximo para considerar oversold
-      drawdown_threshold : drawdown máximo (negativo) para considerar dip
-      dry_run            : se True, não grava nada
+      output_path        : caminho do CSV de saída (None = auto, usado em F2-C)
+      lookback_years     : anos de histórico (default fixo: 5)
+      min_score          : score mínimo para registar o dip simulado (default: 45)
+      rsi_threshold      : threshold do RSI (default: 35, usado em _detect_dips)
+      drawdown_threshold : drawdown mínimo em % negativo (default: -15)
+      dry_run            : se True, não grava nada (F2-C responsável pela escrita)
 
-    Retorna dict com stats: total_dips, written, skipped, errors.
-
-    NOTA: Implementação completa em F2-A/B/C.
-          Este stub garante que o módulo importa sem erros.
+    Retorna dict:
+      total_dips : int   — total de dips detectados antes do filtro de score
+      written    : int   — dips que passaram min_score (prontos para F2-B/C)
+      skipped    : int   — dips abaixo de min_score
+      errors     : int   — tickers com falha no download
+      dip_rows   : list  — lista de dicts com os dados de cada dip (para F2-B)
     """
+    from score import calculate_dip_score, classify_dip_category, is_bluechip
+
+    stats: dict = {"total_dips": 0, "written": 0, "skipped": 0, "errors": 0, "dip_rows": []}
+
+    for symbol in tickers:
+        logging.info(f"[hist_backtest] A processar {symbol}...")
+        try:
+            time.sleep(2)  # rate limit gentil
+            ticker_obj = yf.Ticker(symbol)
+            info       = ticker_obj.info or {}
+
+            # Descarregar histórico OHLCV (5 anos)
+            df = ticker_obj.history(period=f"{lookback_years}y", interval="1d")
+            if df is None or df.empty or len(df) < 30:
+                logging.warning(f"[hist_backtest] {symbol}: histórico insuficiente")
+                stats["errors"] += 1
+                continue
+
+            # Calcular sinais vectorizados e filtrar dips
+            dip_df = _detect_dips(df)
+            if dip_df.empty:
+                logging.info(f"[hist_backtest] {symbol}: nenhum dip detectado")
+                continue
+
+            logging.info(f"[hist_backtest] {symbol}: {len(dip_df)} dip(s) candidatos")
+            stats["total_dips"] += len(dip_df)
+
+            # Iterar APENAS sobre os dips detectados (n pequeno — sem crash)
+            for dip_date, row in dip_df.iterrows():
+                try:
+                    fund = _build_hybrid_fund(info, row)
+                    score, _rsi_str = calculate_dip_score(
+                        fundamentals=fund,
+                        symbol=symbol,
+                        sector_change=None,
+                        stock_change_pct=float(row["change_pct"]) if row["change_pct"] == row["change_pct"] else None,
+                    )
+
+                    if score < min_score:
+                        stats["skipped"] += 1
+                        logging.debug(
+                            f"[hist_backtest] {symbol} {dip_date.date()} — "
+                            f"score {score:.0f} abaixo de {min_score} — ignorado"
+                        )
+                        continue
+
+                    bc_flag  = is_bluechip(fund)
+                    category = classify_dip_category(fund, score, bc_flag)
+
+                    dip_record = {
+                        "symbol":       symbol,
+                        "date_iso":     dip_date.date().isoformat(),
+                        "price":        round(float(row["Close"]), 4),
+                        "score":        round(score, 1),
+                        "rsi":          round(float(row["rsi_14"]), 1) if row["rsi_14"] == row["rsi_14"] else "",
+                        "drawdown_52w": round(float(row["drawdown_52w"]), 2),
+                        "volume_ratio": round(float(row["Volume"]) / float(row["avg_vol_20d"]), 2)
+                                        if row["avg_vol_20d"] and row["avg_vol_20d"] > 0 else "",
+                        "category":     category,
+                        "sector":       fund.get("sector", ""),
+                        "name":         fund.get("name", ""),
+                        # Fundamentais estáticos de hoje (snapshot)
+                        "market_cap_b": round((fund.get("market_cap") or 0) / 1e9, 2),
+                        "fcf_yield":    round(fund["fcf_yield"], 4) if fund.get("fcf_yield") is not None else "",
+                        "gross_margin": round(fund.get("gross_margin") or 0, 4),
+                        "revenue_growth": round(fund.get("revenue_growth") or 0, 4),
+                        "debt_equity":  fund.get("debt_equity") or "",
+                        "dividend_yield": round(fund.get("dividend_yield") or 0, 4),
+                        "pe":           fund.get("pe") or "",
+                        "analyst_upside": fund.get("analyst_upside") or 0,
+                        # MFE/MAE e outcomes: a preencher em F2-B
+                        "price_1m": "", "price_3m": "", "price_6m": "",
+                        "return_1m": "", "return_3m": "", "return_6m": "",
+                        "mfe_3m": "", "mae_3m": "", "outcome_label": "",
+                        # Metadado para rastreabilidade
+                        "source":       "historical_backtest",
+                    }
+
+                    stats["dip_rows"].append(dip_record)
+                    stats["written"] += 1
+
+                    logging.info(
+                        f"[hist_backtest] DIP DETECTADO ✔ {symbol} | "
+                        f"{dip_date.date()} | Preço: {dip_record['price']} | "
+                        f"Score: {score:.0f} | RSI: {dip_record['rsi']} | "
+                        f"Drawdown: {dip_record['drawdown_52w']:.1f}% | Cat: {category}"
+                    )
+
+                except Exception as e:
+                    logging.warning(f"[hist_backtest] {symbol} {dip_date}: {e}")
+                    stats["errors"] += 1
+
+        except Exception as e:
+            logging.warning(f"[hist_backtest] Falha no ticker {symbol}: {e}")
+            stats["errors"] += 1
+
     logging.info(
-        f"[hist_backtest] stub chamado — {len(tickers)} tickers | "
-        f"lookback={lookback_years}y | dry_run={dry_run}"
+        f"[hist_backtest] Concluído — "
+        f"total_dips={stats['total_dips']} | "
+        f"escritos={stats['written']} | "
+        f"ignorados={stats['skipped']} | "
+        f"erros={stats['errors']}"
     )
-    return {"total_dips": 0, "written": 0, "skipped": 0, "errors": 0, "status": "stub"}
+    return stats
