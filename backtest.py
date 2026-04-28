@@ -10,13 +10,19 @@ Lógica:
   - O Saturday report chama build_backtest_summary() para mostrar o resumo.
   - Auto-calibração: suggest_min_score() calcula o score mínimo óptimo
     com base nos winners históricos e sugere ajuste ao MIN_DIP_SCORE.
+  - fill_db_outcomes() preenche MFE/MAE/return a 1m/3m/6m na alert_db.csv
+    (base de dados ML). Corre semanalmente ao sábado.
 
 Nenhuma API key necessária — usa yfinance.history().
 """
 
+import csv
 import time
 import logging
+import tempfile
+import shutil
 from datetime import datetime, timedelta
+from pathlib import Path
 import yfinance as yf
 from state import load_backtest_log, save_backtest_log
 
@@ -97,6 +103,268 @@ def backtest_runner() -> int:
 
     return updated
 
+
+# ── ML Database outcomes (Fase 2) ─────────────────────────────────────────
+
+_OUTCOME_WINDOWS = [
+    (30,  "price_1m", "return_1m"),
+    (91,  "price_3m", "return_3m"),
+    (182, "price_6m", "return_6m"),
+]
+
+
+def _calendar_days_since(date_iso: str) -> int:
+    """Dias de calendário desde date_iso até hoje."""
+    try:
+        start = datetime.fromisoformat(date_iso).date()
+        return (datetime.now().date() - start).days
+    except Exception:
+        return 0
+
+
+def _fetch_history_safe(symbol: str, period: str = "200d") -> object | None:
+    """
+    Descarrega histórico yfinance com retry (1 extra tentativa).
+    Devolve DataFrame de Close ou None se falhar.
+    """
+    for attempt in range(2):
+        try:
+            hist = yf.Ticker(symbol).history(period=period, interval="1d")["Close"].dropna()
+            if not hist.empty:
+                return hist
+        except Exception as e:
+            logging.warning(f"[fill_db] hist {symbol} tentativa {attempt+1}: {e}")
+        time.sleep(4)
+    return None
+
+
+def _price_at_offset(hist, alert_date_iso: str, offset_days: int) -> float | None:
+    """
+    Encontra o preço de fecho mais próximo de alert_date + offset_days.
+    Usa o próximo dia de mercado disponível se o offset cair num fim-de-semana
+    ou feriado (tolerance de +5 dias de calendário).
+    """
+    try:
+        target = datetime.fromisoformat(alert_date_iso).date() + timedelta(days=offset_days)
+        for delta in range(6):  # tolerance: até +5 dias
+            candidate = target + timedelta(days=delta)
+            # Localiza no índice (timezone-naive compare)
+            matches = [
+                i for i in hist.index
+                if hasattr(i, 'date') and i.date() == candidate
+            ]
+            if matches:
+                return round(float(hist[matches[0]]), 4)
+        return None
+    except Exception as e:
+        logging.debug(f"[fill_db] price_at_offset {alert_date_iso}+{offset_days}d: {e}")
+        return None
+
+
+def _compute_mfe_mae(hist, alert_date_iso: str, price_alert: float, window_days: int = 91) -> tuple[float | None, float | None]:
+    """
+    Maximum Favorable Excursion (MFE) e Maximum Adverse Excursion (MAE)
+    na janela de window_days dias de calendário após o alerta.
+
+    MFE = máximo ganho % atingível na janela (pico acima do preço de alerta)
+    MAE = máxima perda % na janela (vale abaixo do preço de alerta)
+
+    Retorna (mfe_pct, mae_pct) ambos em %, ou (None, None) se dados insuficientes.
+    """
+    try:
+        alert_date = datetime.fromisoformat(alert_date_iso).date()
+        end_date   = alert_date + timedelta(days=window_days)
+        # Filtrar apenas o período da janela
+        window = [
+            float(v) for i, v in hist.items()
+            if hasattr(i, 'date') and alert_date < i.date() <= end_date
+        ]
+        if not window or price_alert <= 0:
+            return None, None
+        mfe = round((max(window) - price_alert) / price_alert * 100, 2)
+        mae = round((min(window) - price_alert) / price_alert * 100, 2)
+        return mfe, mae
+    except Exception as e:
+        logging.debug(f"[fill_db] mfe_mae {alert_date_iso}: {e}")
+        return None, None
+
+
+def _assign_outcome_label(return_3m: float | None, mfe_3m: float | None, mae_3m: float | None) -> str:
+    """
+    Classifica o resultado do alerta numa label para treino ML.
+
+    Hierarquia (da melhor para a pior outcome):
+      WIN_40  — MFE em 3m atingiu +40% (oportunidade real de sair com +40%)
+      WIN_20  — MFE em 3m atingiu +20%
+      LOSS_15 — MAE em 3m atingiu -15% (stop-loss seria trigado)
+      NEUTRAL — tudo o resto
+
+    Nota: usa MFE/MAE em vez de return_3m porque o modelo quer aprender
+    se houve OPORTUNIDADE de ganhar/perder, não apenas onde ficou no dia exato.
+    """
+    if mfe_3m is not None and mfe_3m >= 40:
+        return "WIN_40"
+    if mfe_3m is not None and mfe_3m >= 20:
+        return "WIN_20"
+    if mae_3m is not None and mae_3m <= -15:
+        return "LOSS_15"
+    return "NEUTRAL"
+
+
+def fill_db_outcomes(db_path: Path | None = None, dry_run: bool = False) -> dict:
+    """
+    Preenche os campos de resultado futuro na alert_db.csv:
+      price_1m, price_3m, price_6m
+      return_1m, return_3m, return_6m
+      mfe_3m, mae_3m, outcome_label
+
+    Só actualiza linhas com outcome_label vazio E cujo alerta
+    tenha data suficientemente antiga para cada janela:
+      - 1m: >= 32 dias de calendário
+      - 3m: >= 95 dias
+      - 6m: >= 187 dias
+
+    Agrupa por symbol para minimizar chamadas à API (1 history por ticker).
+
+    Argumentos:
+      db_path  : Path para o CSV (None = auto-detect do alert_db.py)
+      dry_run  : se True, não grava nada (para testes)
+
+    Retorna dict com estatísticas da execução.
+    """
+    # Import lazy para evitar import circular
+    from alert_db import _DB_PATH as _DEFAULT_DB_PATH
+    path = db_path or _DEFAULT_DB_PATH
+
+    if not path.exists():
+        logging.info("[fill_db] alert_db.csv não existe ainda.")
+        return {"skipped": 0, "updated": 0, "errors": 0}
+
+    # ── Ler CSV completo ─────────────────────────────────────────────────
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader   = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows     = list(reader)
+
+    if not rows:
+        return {"skipped": 0, "updated": 0, "errors": 0}
+
+    # ── Identificar linhas que precisam de actualização ─────────────────
+    # Uma linha precisa se: outcome_label vazio E pelo menos 1 janela já é elegivel
+    _WINDOW_MIN_DAYS = {"price_1m": 32, "price_3m": 95, "price_6m": 187}
+
+    to_update = []
+    for idx, row in enumerate(rows):
+        if row.get("outcome_label"):   # já resolvido
+            continue
+        date_iso = row.get("date_iso", "")
+        if not date_iso:
+            continue
+        days_elapsed = _calendar_days_since(date_iso)
+        # Elegivel se pelo menos a janela de 1m passou
+        if days_elapsed >= _WINDOW_MIN_DAYS["price_1m"]:
+            to_update.append((idx, row, days_elapsed))
+
+    if not to_update:
+        logging.info("[fill_db] Nenhuma linha elegivel para actualização.")
+        return {"skipped": len(rows), "updated": 0, "errors": 0}
+
+    logging.info(f"[fill_db] {len(to_update)} linhas elegivéis de {len(rows)} total.")
+
+    # ── Agrupar por symbol para 1 history call por ticker ────────────────
+    by_symbol: dict[str, list] = {}
+    for idx, row, days_elapsed in to_update:
+        sym = row.get("symbol", "")
+        if sym:
+            by_symbol.setdefault(sym, []).append((idx, row, days_elapsed))
+
+    stats = {"skipped": len(rows) - len(to_update), "updated": 0, "errors": 0}
+
+    for symbol, entries in by_symbol.items():
+        logging.info(f"[fill_db] A processar {symbol} ({len(entries)} entrada(s))...")
+        hist = _fetch_history_safe(symbol, period="200d")
+        if hist is None:
+            logging.warning(f"[fill_db] Sem histórico para {symbol} — a saltar.")
+            stats["errors"] += len(entries)
+            continue
+
+        for idx, row, days_elapsed in entries:
+            try:
+                price_alert_str = row.get("price", "")
+                if not price_alert_str:
+                    stats["errors"] += 1
+                    continue
+                price_alert = float(price_alert_str)
+                date_iso    = row["date_iso"]
+                changed     = False
+
+                # ── Preços futuros e retornos ─────────────────────────
+                for offset_days, price_key, return_key in _OUTCOME_WINDOWS:
+                    min_days = _WINDOW_MIN_DAYS[price_key]
+                    if days_elapsed < min_days:
+                        continue
+                    if row.get(price_key):  # já preenchido
+                        continue
+                    p = _price_at_offset(hist, date_iso, offset_days)
+                    if p is not None:
+                        row[price_key]  = p
+                        row[return_key] = round((p - price_alert) / price_alert * 100, 2)
+                        changed         = True
+                        rows[idx]       = row
+
+                # ── MFE / MAE (janela 3m) ────────────────────────────
+                if days_elapsed >= _WINDOW_MIN_DAYS["price_3m"] and not row.get("mfe_3m"):
+                    mfe, mae = _compute_mfe_mae(hist, date_iso, price_alert, window_days=91)
+                    if mfe is not None:
+                        row["mfe_3m"] = mfe
+                        row["mae_3m"] = mae
+                        changed       = True
+                        rows[idx]     = row
+
+                # ── Outcome label ────────────────────────────────────
+                if not row.get("outcome_label") and row.get("mfe_3m") and row.get("mae_3m"):
+                    label = _assign_outcome_label(
+                        return_3m=float(row["return_3m"]) if row.get("return_3m") else None,
+                        mfe_3m=float(row["mfe_3m"]),
+                        mae_3m=float(row["mae_3m"]),
+                    )
+                    row["outcome_label"] = label
+                    changed              = True
+                    rows[idx]            = row
+
+                if changed:
+                    stats["updated"] += 1
+                    logging.info(
+                        f"[fill_db] {symbol} ({date_iso}): "
+                        f"label={row.get('outcome_label','')} | "
+                        f"ret_3m={row.get('return_3m','')} | "
+                        f"mfe={row.get('mfe_3m','')} | mae={row.get('mae_3m','')} "
+                    )
+
+            except Exception as e:
+                logging.warning(f"[fill_db] Erro em {symbol} ({row.get('date_iso','')}): {e}")
+                stats["errors"] += 1
+
+        time.sleep(5)  # rate limit gentil entre tickers
+
+    # ── Gravar CSV reescrito atomicamente ────────────────────────────────
+    if not dry_run and stats["updated"] > 0:
+        try:
+            tmp = path.with_suffix(".tmp")
+            with tmp.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            shutil.move(str(tmp), str(path))
+            logging.info(f"[fill_db] CSV gravado: {stats['updated']} linhas actualizadas.")
+        except Exception as e:
+            logging.error(f"[fill_db] Erro ao gravar CSV: {e}")
+            stats["errors"] += 1
+
+    return stats
+
+
+# ── Score calibration ─────────────────────────────────────────────────────
 
 def suggest_min_score(entries: list[dict] | None = None, horizon: str = "pnl_5d") -> dict:
     """
@@ -233,8 +501,8 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         avg_l = sum(e["score"] for e in losers)  / len(losers)
         lines += [
             "",
-            "  *\U0001f4d0 Calibra\u00e7\u00e3o do score:*",
-            f"    Score m\u00e9dio winners: *{avg_w:.1f}* | losers: *{avg_l:.1f}*",
+            "  *\U0001f4d0 Calibração do score:*",
+            f"    Score médio winners: *{avg_w:.1f}* | losers: *{avg_l:.1f}*",
         ]
         if avg_w > avg_l + 1:
             lines.append("    _Score discrimina bem winners/losers \u2705_")
@@ -247,11 +515,10 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         if cal.get("suggested_min") is not None:
             lines += [
                 "",
-                "  *\U0001f916 Auto-calibra\u00e7\u00e3o MIN\_DIP\_SCORE:*",
-                f"    Sugest\u00e3o baseada em hist\u00f3rico: *score \u2265{cal['suggested_min']}*",
+                "  *\U0001f916 Auto-calibração MIN\_DIP\_SCORE:*",
+                f"    Sugestão baseada em histórico: *score \u2265{cal['suggested_min']}*",
                 f"    _{cal['reason']}_",
             ]
-            # Tabela compacta de todos os thresholds
             valid_rows = [r for r in cal["all_thresholds"] if r["win_rate"] is not None]
             if valid_rows:
                 lines.append("    _Thresholds:_")
@@ -261,13 +528,12 @@ def build_backtest_summary(min_entries: int = 3) -> str:
                         f"      \u2265{r['threshold']}: win {r['win_rate']*100:.0f}% | "
                         f"avg {r['avg_pnl']:+.1f}% | n={r['n']}{marker}"
                     )
-            # CORRIGIDO: usar \u2192 em vez de _→, e MIN_DIP_SCORE sem escape problemático
             lines.append(
                 f"    _\u2192 Actualiza MIN_DIP_SCORE no Railway para {cal['suggested_min']} se concordas_"
             )
         else:
-            lines += ["", f"  _Auto-calibra\u00e7\u00e3o: {cal.get('reason', 'sem dados')}_"]
+            lines += ["", f"  _Auto-calibração: {cal.get('reason', 'sem dados')}_"]
     except Exception as e:
-        logging.warning(f"Auto-calibra\u00e7\u00e3o: {e}")
+        logging.warning(f"Auto-calibração: {e}")
 
     return "\n".join(lines)
