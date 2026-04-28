@@ -13,7 +13,7 @@ Estrutura de ficheiros:
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
@@ -177,7 +177,9 @@ def add_recovery_position(
         "target_price": round(price_alert * (1 + target_pct / 100), 2),
         "verdict":      verdict,
         "date":         datetime.now().strftime("%d/%m/%Y"),
+        "date_iso":     datetime.now().date().isoformat(),  # necessário para stop temporal
         "alerted":      False,
+        "stale_alerted": False,  # True quando o aviso de 60d já foi enviado
     })
     save_recovery_watch(positions)
 
@@ -188,9 +190,43 @@ def mark_recovery_alerted(symbol: str) -> None:
             p["alerted"] = True
     save_recovery_watch(positions)
 
+def mark_stale_alerted(symbol: str) -> None:
+    """Marca a posição como já tendo recebido o aviso de stop temporal."""
+    positions = load_recovery_watch()
+    for p in positions:
+        if p["symbol"] == symbol:
+            p["stale_alerted"] = True
+    save_recovery_watch(positions)
+
 def remove_recovery_position(symbol: str) -> None:
     positions = [p for p in load_recovery_watch() if p["symbol"] != symbol]
     save_recovery_watch(positions)
+
+def get_stale_recovery_positions(days: int = 60) -> list[dict]:
+    """
+    Devolve posições que estão no recovery_watch há mais de `days` dias
+    sem terem atingido o target, e cujo aviso de stale ainda não foi enviado.
+
+    Retrocompatibilidade: posições sem 'date_iso' são ignoradas (não têm data de entrada).
+    """
+    positions = load_recovery_watch()
+    stale     = []
+    cutoff    = datetime.now() - timedelta(days=days)
+    for p in positions:
+        if p.get("alerted"):       # já recuperou — ignorar
+            continue
+        if p.get("stale_alerted"): # aviso já enviado — ignorar
+            continue
+        date_iso = p.get("date_iso")
+        if not date_iso:
+            continue  # posição antiga sem data — ignorar
+        try:
+            entry_date = datetime.fromisoformat(date_iso)
+        except ValueError:
+            continue
+        if entry_date <= cutoff:
+            stale.append(p)
+    return stale
 
 
 # ── Watchlist dinâmica (gerida via /watchlist add|remove) ────────────────────
