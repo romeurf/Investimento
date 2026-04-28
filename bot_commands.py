@@ -2,14 +2,18 @@
 bot_commands.py — Comandos Telegram para o DipRadar.
 
 Comandos disponíveis:
-  /status           → Estado do bot (uptime, próximo scan, mercado aberto/fechado)
-  /carteira         → Snapshot instantâneo da carteira
-  /scan             → Força scan imediato (só horas de mercado)
-  /analisar <TICK>  → Análise completa de qualquer ticker a pedido
-  /backtest         → Resumo do backtest de alertas
-  /rejeitados       → Log de rejeitados de hoje
-  /tier3            → Gems Raras do último resumo de fecho (score ≥80)
-  /help             → Lista de comandos
+  /status              → Estado do bot (uptime, próximo scan, mercado aberto/fechado)
+  /carteira            → Snapshot instantâneo da carteira
+  /scan                → Força scan imediato (só horas de mercado)
+  /analisar <TICK>     → Análise completa de qualquer ticker a pedido
+  /backtest            → Resumo do backtest de alertas
+  /rejeitados          → Log de rejeitados de hoje
+  /tier3               → Gems Raras do último resumo de fecho (score ≥80)
+  /watchlist           → Ver watchlist dinâmica actual
+  /watchlist add TICK  → Adicionar ticker à watchlist
+  /watchlist rm TICK   → Remover ticker da watchlist
+  /watchlist clear     → Limpar toda a watchlist dinâmica
+  /help                → Lista de comandos
 
 Uso em main.py:
   Corre start_bot_listener() numa thread separada no arranque.
@@ -22,6 +26,12 @@ import threading
 import requests
 from datetime import datetime
 from rate_limiter import is_allowed, rate_status
+from state import (
+    load_dynamic_watchlist,
+    add_to_dynamic_watchlist,
+    remove_from_dynamic_watchlist,
+    save_dynamic_watchlist,
+)
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -83,6 +93,98 @@ def _check_rate(cmd: str) -> bool:
     return allowed
 
 
+# ── /watchlist handler ────────────────────────────────────────────────────────
+
+def _handle_watchlist(parts: list[str]) -> None:
+    """
+    /watchlist               → lista tickers actuais
+    /watchlist add <TICKER>  → adiciona ticker
+    /watchlist rm <TICKER>   → remove ticker  (aceita também: remove, del, delete)
+    /watchlist clear         → limpa toda a lista
+    """
+    sub = parts[1].lower() if len(parts) > 1 else "list"
+
+    # ── LIST ──────────────────────────────────────────────────────────────────
+    if sub in ("list", "ls", "show", "ver"):
+        tickers = load_dynamic_watchlist()
+        if not tickers:
+            _reply(
+                "*👀 Watchlist dinâmica*\n"
+                "_Está vazia. Usa `/watchlist add TICKER` para adicionar._"
+            )
+            return
+        lines = [f"*👀 Watchlist dinâmica ({len(tickers)} tickers):*", ""]
+        for i, t in enumerate(tickers, 1):
+            lines.append(f"  {i}. `{t}`")
+        lines.append("")
+        lines.append("_Remove com `/watchlist rm TICKER` · Limpa com `/watchlist clear`_")
+        _reply("\n".join(lines))
+
+    # ── ADD ───────────────────────────────────────────────────────────────────
+    elif sub in ("add", "adicionar", "+"):
+        if len(parts) < 3:
+            _reply("⚠️ Uso: `/watchlist add <TICKER>`\n_Exemplo: `/watchlist add NVDA`_")
+            return
+        ticker = parts[2].upper().strip().split(".")[0]  # normaliza ex: NVDA.US → NVDA
+        if len(ticker) > 10 or not ticker.isalpha():
+            _reply(f"⚠️ Ticker inválido: `{ticker}` — usa letras apenas (ex: AAPL, NVDA).")
+            return
+        added = add_to_dynamic_watchlist(ticker)
+        if added:
+            total = len(load_dynamic_watchlist())
+            _reply(
+                f"✅ *`{ticker}`* adicionado à watchlist.\n"
+                f"_Total: {total} tickers na watchlist dinâmica._"
+            )
+            logging.info(f"[watchlist] adicionado: {ticker}")
+        else:
+            _reply(f"_`{ticker}` já está na watchlist._")
+
+    # ── REMOVE ────────────────────────────────────────────────────────────────
+    elif sub in ("rm", "remove", "remover", "del", "delete", "-"):
+        if len(parts) < 3:
+            _reply("⚠️ Uso: `/watchlist rm <TICKER>`\n_Exemplo: `/watchlist rm NVDA`_")
+            return
+        ticker = parts[2].upper().strip()
+        removed = remove_from_dynamic_watchlist(ticker)
+        if removed:
+            total = len(load_dynamic_watchlist())
+            _reply(
+                f"🗑️ *`{ticker}`* removido da watchlist.\n"
+                f"_Restam {total} tickers._"
+            )
+            logging.info(f"[watchlist] removido: {ticker}")
+        else:
+            _reply(f"⚠️ `{ticker}` não está na watchlist.")
+
+    # ── CLEAR ─────────────────────────────────────────────────────────────────
+    elif sub in ("clear", "limpar", "reset"):
+        tickers = load_dynamic_watchlist()
+        count   = len(tickers)
+        if count == 0:
+            _reply("_A watchlist já está vazia._")
+            return
+        save_dynamic_watchlist([])
+        _reply(
+            f"🧹 Watchlist limpa. _{count} ticker(s) removido(s)._\n"
+            "_Usa `/watchlist add TICKER` para recomeçar._"
+        )
+        logging.info(f"[watchlist] clear: {count} tickers removidos")
+
+    # ── UNKNOWN SUB-COMMAND ───────────────────────────────────────────────────
+    else:
+        _reply(
+            f"⚠️ Sub-comando desconhecido: `{sub}`\n\n"
+            "*Uso:*\n"
+            "`/watchlist`          → Ver lista\n"
+            "`/watchlist add TICK` → Adicionar\n"
+            "`/watchlist rm TICK`  → Remover\n"
+            "`/watchlist clear`    → Limpar tudo"
+        )
+
+
+# ── Command router ────────────────────────────────────────────────────────────
+
 def _handle_command(text: str) -> None:
     parts = text.strip().split()
     cmd   = parts[0].lower() if parts else ""
@@ -93,14 +195,18 @@ def _handle_command(text: str) -> None:
     if cmd in ("/help", "/start"):
         _reply(
             "*🤖 DipRadar — Comandos disponíveis:*\n\n"
-            "`/status`           → Estado do bot\n"
-            "`/carteira`         → Snapshot da carteira agora\n"
-            "`/scan`             → Forçar scan imediato\n"
-            "`/analisar <TICK>`  → Análise completa de qualquer ticker\n"
-            "`/backtest`         → Resumo backtesting\n"
-            "`/rejeitados`       → Rejeitados de hoje\n"
-            "`/tier3`            → Gems Raras do último fecho (score ≥80)\n"
-            "`/help`             → Esta mensagem"
+            "`/status`              → Estado do bot\n"
+            "`/carteira`            → Snapshot da carteira agora\n"
+            "`/scan`                → Forçar scan imediato\n"
+            "`/analisar <TICK>`     → Análise completa de qualquer ticker\n"
+            "`/backtest`            → Resumo backtesting\n"
+            "`/rejeitados`          → Rejeitados de hoje\n"
+            "`/tier3`               → Gems Raras do último fecho (score ≥80)\n"
+            "`/watchlist`           → Ver watchlist dinâmica\n"
+            "`/watchlist add TICK`  → Adicionar ticker\n"
+            "`/watchlist rm TICK`   → Remover ticker\n"
+            "`/watchlist clear`     → Limpar watchlist\n"
+            "`/help`                → Esta mensagem"
         )
 
     elif cmd == "/status":
@@ -109,10 +215,12 @@ def _handle_command(text: str) -> None:
         hours, rem = divmod(int(uptime.total_seconds()), 3600)
         mins = rem // 60
         market = "🟢 Aberto" if (_cb_is_market_open and _cb_is_market_open()) else "🔴 Fechado"
+        wl = load_dynamic_watchlist()
         _reply(
             f"*🤖 DipRadar Status*\n"
             f"Uptime: *{hours}h {mins}m*\n"
             f"Mercado: *{market}*\n"
+            f"Watchlist dinâmica: *{len(wl)} tickers*\n"
             f"_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
             f"_{rate_status()}_"
         )
@@ -217,6 +325,14 @@ def _handle_command(text: str) -> None:
                 _reply("🔵 *Tier 3* — _Handler não registado._")
         except Exception as e:
             _reply(f"_Erro ao obter Tier 3: {e}_")
+
+    elif cmd == "/watchlist":
+        if not _check_rate(cmd_key): return
+        try:
+            _handle_watchlist(parts)
+        except Exception as e:
+            _reply(f"_Erro na watchlist: {e}_")
+            logging.exception("[bot_commands] /watchlist error")
 
     else:
         if text.startswith("/"):
