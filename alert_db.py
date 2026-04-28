@@ -265,9 +265,10 @@ def fill_db_outcomes() -> dict:
         def _get_price_at(target_date):
             """
             Preço de fecho mais próximo de target_date.
-            Tenta de -3 a +5 dias úteis para cobrir feriados e fins-de-semana.
+            Testa delta=0 PRIMEIRO (dia exacto), depois adjacentes por prioridade.
+            Evita gravar preços de dias anteriores quando o dia alvo tem mercado aberto.
             """
-            for delta in range(-3, 6):
+            for delta in [0, 1, -1, 2, -2, 3, -3, 4, 5]:
                 check = target_date + timedelta(days=delta)
                 matches = hist_after[hist_after.index.date == check]
                 if not matches.empty:
@@ -313,7 +314,6 @@ def fill_db_outcomes() -> dict:
 
         # ── outcome_label ─────────────────────────────────────────────────
         if changed and row.get("outcome_label") == "":
-            # Usar o retorno mais longo disponível
             ref_return = None
             for field in ("return_6m", "return_3m", "return_1m"):
                 val = row.get(field)

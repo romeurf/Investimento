@@ -78,6 +78,23 @@ _MARGIN_THRESHOLD = {
     "Basic Materials":        0.25,
 }
 
+# Thresholds de dividend_yield mínimo por sector para categoria Apartamento.
+# Sectores de crescimento (Tech, Comm) exigem yield mais alto porque
+# o dividendo não é o driver principal — tem de ser realmente excepcional.
+_APARTAMENTO_YIELD_THRESHOLD = {
+    "Technology":             0.025,  # 2.5% — raro em tech, mas válido (ex: MSFT, INTC)
+    "Communication Services": 0.030,  # 3.0%
+    "Healthcare":             0.020,  # 2.0% — pharma com pipeline + yield é Apartamento clássico
+    "Consumer Defensive":     0.025,  # 2.5%
+    "Consumer Cyclical":      0.025,  # 2.5%
+    "Industrials":            0.020,  # 2.0%
+    "Financial Services":     0.030,  # 3.0% — bancos e seguradoras têm yields altos por padrão
+    "Energy":                 0.035,  # 3.5% — energia paga bem, exige mais para diferenciar
+    "Utilities":              0.030,  # 3.0% — utilities são quasi-obrigações, yield alto é normal
+    "Real Estate":            0.035,  # 3.5% — REITs: yield abaixo de 3.5% não justifica o risco
+    "Basic Materials":        0.025,  # 2.5%
+}
+
 
 def _get_insider_bought(symbol: str) -> bool:
     """True se houve compras de insiders nos últimos 90 dias."""
@@ -125,18 +142,26 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
     Classifica o dip em uma de 3 categorias estratégicas:
 
     🏛️ Hold Forever — Blue chip de qualidade máxima. Compounder inabalável.
-        Critérios: is_bluechip=True AND score >= 70
+        Critérios DRACIONANOS (todos obrigatórios):
+          - is_bluechip=True AND score >= 70
+          - gross_margin acima do threshold do sector
+          - FCF não profundamente negativo (fcf_yield > -0.01)
+          - D/E < 150 (balanço controlado)
         Estratégia: nunca vender, acumular em dips.
         Exemplo: MSFT, AAPL, GOOGL
 
-    🏠 Apartamento — Ativo com drawdown estrutural + dividendo que paga
-        para esperar a reprecificação. "Cobras a renda enquanto o imóvel valoriza."
-        Critérios: dividend_yield >= 2% AND drawdown_52w <= -20% AND FCF não profundamente negativo
+    🏠 Apartamento — Drawdown estrutural + dividendo sectorial acima do threshold.
+        "Cobras a renda enquanto o imóvel valoriza."
+        Critérios:
+          - dividend_yield >= threshold do sector (ver _APARTAMENTO_YIELD_THRESHOLD)
+          - drawdown_52w <= -20% (queda estrutural — há reprecificação a fazer)
+          - FCF não profundamente negativo (fcf_yield > -0.03)
+          - score >= 45 (empresa não pode ser uma value trap pura)
         Estratégia: YIELD + REPRECIFICAÇÃO — entrada faseada, stop em corte de dividendo.
         Exemplo: NVO em queda acentuada, pharma com pipeline strong + yield
 
     🔄 Rotação — Oportunidade táctica. Ineficiência de curto/médio prazo.
-        Tudo o resto. Flip clássico com target e stop definidos.
+        Fallback: tudo o que não é Hold Forever nem Apartamento.
         Estratégia: FLIP — entrada, target +X%, stop -15%.
         Exemplo: PINS, stock de crescimento em correção sem dividendo.
 
@@ -144,18 +169,32 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
     """
     dividend_yield = fundamentals.get("dividend_yield") or 0
     drawdown       = fundamentals.get("drawdown_from_high") or 0
-    fcf_yield      = fundamentals.get("fcf_yield")  # pode ser None
+    fcf_yield      = fundamentals.get("fcf_yield")   # pode ser None
+    gross_margin   = fundamentals.get("gross_margin") or 0
+    debt_equity    = fundamentals.get("debt_equity")  # pode ser None
+    sector         = fundamentals.get("sector", "")
+    margin_threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
 
-    # Hold Forever: blue chip confirmado com score alto
-    if is_bluechip_flag and dip_score >= 70:
+    # ── Hold Forever: critérios draconianos ───────────────────────────────
+    # Não basta ser bluechip — tem de ter qualidade de balanço e margens.
+    hf_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.01)
+    hf_margin_ok = gross_margin >= margin_threshold
+    hf_de_ok     = (debt_equity is None) or (debt_equity < 150)
+    if is_bluechip_flag and dip_score >= 70 and hf_fcf_ok and hf_margin_ok and hf_de_ok:
         return "🏛️ Hold Forever"
 
-    # Apartamento: dividendo decente + queda estrutural + FCF não catastrófico
-    fcf_ok = (fcf_yield is None) or (fcf_yield > -0.02)  # FCF ligeiramente negativo ainda ok
-    if dividend_yield >= 0.02 and drawdown <= -20 and fcf_ok:
+    # ── Apartamento: yield sectorial + queda estrutural + FCF aceitável ───
+    apt_yield_min = _APARTAMENTO_YIELD_THRESHOLD.get(sector, 0.020)
+    apt_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.03)
+    if (
+        dividend_yield >= apt_yield_min
+        and drawdown <= -20
+        and apt_fcf_ok
+        and dip_score >= 45
+    ):
         return "🏠 Apartamento"
 
-    # Rotação: tudo o resto
+    # ── Rotação: fallback táctico ─────────────────────────────────────────
     return "🔄 Rotação"
 
 
