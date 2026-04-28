@@ -291,6 +291,36 @@ def send_heartbeat() -> None:
     if FLIP_FUND_EUR:
         lines.append(f"  🎯 *Flip Fund:* €{FLIP_FUND_EUR:,.2f} disponíveis")
 
+    # ── Alertas de concentração ──────────────────────────────────────────────
+    if total > 0:
+        concentration_warnings = []
+        for pos in snapshot["positions"]:
+            weight = pos["value_eur"] / total * 100
+            sym = pos["symbol"]
+            if sym == "NVO" and weight >= 28:
+                concentration_warnings.append(
+                    f"  ⚠️ *NVO*: {weight:.1f}% do portfólio — limite é 30%"
+                )
+            elif sym == "ADBE" and weight >= 11:
+                concentration_warnings.append(
+                    f"  ⚠️ *ADBE*: {weight:.1f}% — limite é 10–12%, não reforçar"
+                )
+            elif weight >= 20 and sym not in ("NVO",):
+                concentration_warnings.append(
+                    f"  ⚠️ *{sym}*: {weight:.1f}% — posição pesada, monitorizar"
+                )
+
+        # Core check: EUNL + PPR >= 35%
+        eunl_val = next((p["value_eur"] for p in snapshot["positions"] if "EUNL" in p["symbol"]), 0)
+        core_pct = (eunl_val + snapshot["ppr_value"]) / total * 100
+        if core_pct < 35:
+            concentration_warnings.append(
+                f"  ⚠️ *Core (EUNL+PPR)*: {core_pct:.1f}% — abaixo do mínimo de 35%"
+            )
+
+        if concentration_warnings:
+            lines += ["", "*🚨 Alertas de concentração:*"] + concentration_warnings
+
     lines += [
         "",
         "_Mercado abre às 14h30 Lisboa_",
