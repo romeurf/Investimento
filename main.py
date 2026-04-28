@@ -49,6 +49,7 @@ from state import (
     append_backtest_entry,
     load_recovery_watch, add_recovery_position,
     mark_recovery_alerted, remove_recovery_position,
+    get_stale_recovery_positions, mark_stale_alerted,
 )
 from backtest import backtest_runner, build_backtest_summary
 from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
@@ -420,6 +421,29 @@ def check_recovery_alerts() -> None:
     positions = load_recovery_watch()
     if not positions:
         return
+
+    # ── Stop temporal: aviso para posições sem recovery há >60 dias ─────
+    try:
+        stale = get_stale_recovery_positions(days=60)
+        for p in stale:
+            sym          = p["symbol"]
+            in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
+            days_held    = (datetime.now() - datetime.fromisoformat(p["date_iso"])).days
+            send_telegram(
+                f"⏹️ *Recovery Watch — Stop Temporal: {sym}*{in_portfolio}\n"
+                f"*{days_held} dias* sem atingir o target de recuperação.\n"
+                f"Entrada: {p['date']} @ *${p['price_alert']:.2f}*\n"
+                f"Target: *+{p['target_pct']}%* (${p['target_price']:.2f})\n"
+                f"Score original: {p.get('score', 'N/A')}/100\n"
+                f"_Considera fechar a posição ou manter manualmente._\n"
+                f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+            )
+            mark_stale_alerted(sym)
+            logging.info(f"[recovery] Stop temporal enviado: {sym} ({days_held}d)")
+    except Exception as e:
+        logging.warning(f"[recovery] Stale check: {e}")
+
+    # ── Check de recovery normal (target atingido) ───────────────────────
     for pos in positions:
         if pos.get("alerted"):
             continue
@@ -1275,6 +1299,7 @@ if __name__ == "__main__":
         f"Badges: 🔥≥80 · ⭐55–79 · 📊<55\n"
         f"Portfolio stress: >{STRESS_PCT:.0f}% posição | >3% total\n"
         f"Recovery alert: +{RECOVERY_PCT:.0f}% do preço de alerta\n"
+        f"Stop temporal recovery: 60 dias sem recuperação\n"
         f"Backtesting: ✅ automático às 21h30\n"
         f"Watchlist pessoal: {'✅ ' + str(len(WATCHLIST)) + ' stocks' if WATCHLIST_ENABLED else '⚠️ inactiva'}\n"
         f"Comandos: /help /status /carteira /scan /analisar /backtest /rejeitados /tier3\n"
