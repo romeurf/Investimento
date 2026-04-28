@@ -2,11 +2,13 @@
 state.py — Persistência de estado entre restarts do Railway.
 
 Estrutura de ficheiros:
-  _dipr_alerts.json    → cache de alertas do dia
-  _dipr_weekly.json    → log semanal de alertas
-  _dipr_rejected.json  → log diário de rejeitados
-  _dipr_backtest.json  → histórico de alertas para backtesting
-  _dipr_recovery.json  → posições em aberto aguardando recovery alert
+  _dipr_alerts.json      → cache de alertas do dia
+  _dipr_weekly.json      → log semanal de alertas
+  _dipr_rejected.json    → log diário de rejeitados
+  _dipr_backtest.json    → histórico de alertas para backtesting
+  _dipr_recovery.json    → posições em aberto aguardando recovery alert
+  _dipr_watchlist.json   → watchlist dinâmica (add/remove via Telegram)
+  _dipr_score_log.json   → histórico de scores por ticker (para upgrades + /historico)
 """
 
 import json
@@ -22,6 +24,8 @@ _WEEKLY_FILE    = _DATA_DIR / "_dipr_weekly.json"
 _REJECTED_FILE  = _DATA_DIR / "_dipr_rejected.json"
 _BACKTEST_FILE  = _DATA_DIR / "_dipr_backtest.json"
 _RECOVERY_FILE  = _DATA_DIR / "_dipr_recovery.json"
+_WATCHLIST_FILE = _DATA_DIR / "_dipr_watchlist.json"
+_SCORE_LOG_FILE = _DATA_DIR / "_dipr_score_log.json"
 
 
 # ── helpers genéricos ────────────────────────────────────────────────────────
@@ -126,11 +130,6 @@ def append_backtest_entry(
     price_alert: float,
     sector: str = "",
 ) -> None:
-    """
-    Regista um alerta para futura avaliação de resultado.
-    Os campos price_5d, price_10d, price_20d e pnl_* são preenchidos
-    pelo backtest_runner quando os dados estiverem disponíveis.
-    """
     entries = load_backtest_log()
     entries.append({
         "symbol":      symbol,
@@ -167,24 +166,18 @@ def add_recovery_position(
     target_pct: float,
     verdict: str,
 ) -> None:
-    """
-    Adiciona posição ao watch de recovery.
-    target_pct: % de recuperação a partir do preço de alerta (ex: 15.0)
-    Dispara alerta quando preço >= price_alert * (1 + target_pct/100).
-    """
     positions = load_recovery_watch()
-    # Evita duplicados
     if any(p["symbol"] == symbol for p in positions):
         return
     positions.append({
-        "symbol":      symbol,
-        "price_alert": price_alert,
-        "score":       score,
-        "target_pct":  target_pct,
+        "symbol":       symbol,
+        "price_alert":  price_alert,
+        "score":        score,
+        "target_pct":   target_pct,
         "target_price": round(price_alert * (1 + target_pct / 100), 2),
-        "verdict":     verdict,
-        "date":        datetime.now().strftime("%d/%m/%Y"),
-        "alerted":     False,
+        "verdict":      verdict,
+        "date":         datetime.now().strftime("%d/%m/%Y"),
+        "alerted":      False,
     })
     save_recovery_watch(positions)
 
@@ -198,3 +191,85 @@ def mark_recovery_alerted(symbol: str) -> None:
 def remove_recovery_position(symbol: str) -> None:
     positions = [p for p in load_recovery_watch() if p["symbol"] != symbol]
     save_recovery_watch(positions)
+
+
+# ── Watchlist dinâmica (gerida via /watchlist add|remove) ────────────────────
+
+def load_dynamic_watchlist() -> list[str]:
+    """
+    Devolve lista de tickers adicionados via /watchlist add.
+    Separado da WATCHLIST hardcoded em watchlist.py.
+    """
+    return _read(_WATCHLIST_FILE).get("tickers", [])
+
+def save_dynamic_watchlist(tickers: list[str]) -> None:
+    _write(_WATCHLIST_FILE, {"tickers": list(dict.fromkeys(t.upper() for t in tickers))})
+
+def add_to_dynamic_watchlist(ticker: str) -> bool:
+    """Adiciona ticker. Devolve True se foi adicionado, False se já existia."""
+    tickers = load_dynamic_watchlist()
+    t = ticker.upper().strip()
+    if t in tickers:
+        return False
+    tickers.append(t)
+    save_dynamic_watchlist(tickers)
+    return True
+
+def remove_from_dynamic_watchlist(ticker: str) -> bool:
+    """Remove ticker. Devolve True se existia e foi removido, False caso contrário."""
+    tickers = load_dynamic_watchlist()
+    t = ticker.upper().strip()
+    if t not in tickers:
+        return False
+    tickers = [x for x in tickers if x != t]
+    save_dynamic_watchlist(tickers)
+    return True
+
+
+# ── Score log (histórico de scores para /historico e upgrades) ───────────────
+
+def load_score_log() -> dict:
+    """
+    Devolve dict: symbol → list of {score, verdict, date, date_iso, change, price}
+    """
+    return _read(_SCORE_LOG_FILE).get("scores", {})
+
+def save_score_log(data: dict) -> None:
+    _write(_SCORE_LOG_FILE, {"scores": data})
+
+def append_score_log(
+    symbol: str,
+    score: float,
+    verdict: str,
+    change_pct: float = 0.0,
+    price: float = 0.0,
+) -> None:
+    """
+    Regista uma entrada de score para o ticker.
+    Mantém no máximo as últimas 30 entradas por ticker.
+    """
+    data = load_score_log()
+    entries = data.get(symbol, [])
+    entries.append({
+        "score":    round(score, 1),
+        "verdict":  verdict,
+        "change":   round(change_pct, 2),
+        "price":    round(price, 4) if price else None,
+        "date":     datetime.now().strftime("%d/%m/%Y"),
+        "time":     datetime.now().strftime("%H:%M"),
+        "date_iso": datetime.now().date().isoformat(),
+    })
+    # Máx 30 entradas por ticker
+    data[symbol] = entries[-30:]
+    save_score_log(data)
+
+def get_ticker_score_history(symbol: str) -> list:
+    """Devolve o histórico de scores para o ticker ou lista vazia."""
+    return load_score_log().get(symbol.upper(), [])
+
+def get_last_score(symbol: str) -> float | None:
+    """Devolve o último score registado para o ticker, ou None."""
+    history = get_ticker_score_history(symbol)
+    if history:
+        return history[-1]["score"]
+    return None
