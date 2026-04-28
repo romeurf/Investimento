@@ -148,7 +148,7 @@ def suggest_min_score(entries: list[dict] | None = None, horizon: str = "pnl_5d"
     if viable:
         best = min(viable, key=lambda x: x["threshold"])
         reason = (
-            f"Score ≥{best['threshold']} tem win rate {best['win_rate']*100:.0f}% "
+            f"Score \u2265{best['threshold']} tem win rate {best['win_rate']*100:.0f}% "
             f"({best['n']} alertas, avg P&L {best['avg_pnl']:+.1f}%)"
         )
     else:
@@ -159,7 +159,7 @@ def suggest_min_score(entries: list[dict] | None = None, horizon: str = "pnl_5d"
         best   = max(valid, key=lambda x: x["win_rate"])
         reason = (
             f"Nenhum threshold atinge 55% win rate. "
-            f"Melhor disponível: ≥{best['threshold']} com {best['win_rate']*100:.0f}% "
+            f"Melhor dispon\u00edvel: \u2265{best['threshold']} com {best['win_rate']*100:.0f}% "
             f"({best['n']} alertas)"
         )
 
@@ -208,7 +208,7 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         return lines
 
     lines = [
-        "*🔬 Backtest de Alertas:*",
+        "*\U0001f52c Backtest de Alertas:*",
         f"_Total avaliados: {len(resolved)} | COMPRAR: {len(comprar)} | MONITORIZAR: {len(monitor)}_",
         "",
     ]
@@ -219,12 +219,12 @@ def build_backtest_summary(min_entries: int = 3) -> str:
 
     all_with_5d = sorted(resolved, key=lambda x: x["pnl_5d"], reverse=True)
     if all_with_5d:
-        lines += ["", "  *🏆 Melhores (5d):*"]
+        lines += ["", "  *\U0001f3c6 Melhores (5d):*"]
         for e in all_with_5d[:3]:
-            lines.append(f"    ✅ *{e['symbol']}* {e['pnl_5d']:+.1f}% | score {e['score']:.0f} | {e['date']}")
-        lines += ["", "  *💀 Piores (5d):*"]
+            lines.append(f"    \u2705 *{e['symbol']}* {e['pnl_5d']:+.1f}% | score {e['score']:.0f} | {e['date']}")
+        lines += ["", "  *\U0001f480 Piores (5d):*"]
         for e in all_with_5d[-3:][::-1]:
-            lines.append(f"    ❌ *{e['symbol']}* {e['pnl_5d']:+.1f}% | score {e['score']:.0f} | {e['date']}")
+            lines.append(f"    \u274c *{e['symbol']}* {e['pnl_5d']:+.1f}% | score {e['score']:.0f} | {e['date']}")
 
     winners = [e for e in resolved if e.get("pnl_5d", 0) > 0]
     losers  = [e for e in resolved if e.get("pnl_5d", 0) <= 0]
@@ -233,13 +233,13 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         avg_l = sum(e["score"] for e in losers)  / len(losers)
         lines += [
             "",
-            "  *📐 Calibração do score:*",
-            f"    Score médio winners: *{avg_w:.1f}* | losers: *{avg_l:.1f}*",
+            "  *\U0001f4d0 Calibra\u00e7\u00e3o do score:*",
+            f"    Score m\u00e9dio winners: *{avg_w:.1f}* | losers: *{avg_l:.1f}*",
         ]
         if avg_w > avg_l + 1:
-            lines.append("    _Score discrimina bem winners/losers ✅_")
+            lines.append("    _Score discrimina bem winners/losers \u2705_")
         else:
-            lines.append("    _Score tem pouco poder discriminativo — considera ajustar thresholds ⚠️_")
+            lines.append("    _Score tem pouco poder discriminativo \u2014 considera ajustar thresholds \u26a0\ufe0f_")
 
     # ── Auto-calibração: sugestão de MIN_DIP_SCORE ────────────────────
     try:
@@ -247,8 +247,8 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         if cal.get("suggested_min") is not None:
             lines += [
                 "",
-                "  *🤖 Auto-calibração MIN_DIP_SCORE:*",
-                f"    Sugestão baseada em histórico: *score ≥{cal['suggested_min']}*",
+                "  *\U0001f916 Auto-calibra\u00e7\u00e3o MIN\_DIP\_SCORE:*",
+                f"    Sugest\u00e3o baseada em hist\u00f3rico: *score \u2265{cal['suggested_min']}*",
                 f"    _{cal['reason']}_",
             ]
             # Tabela compacta de todos os thresholds
@@ -256,17 +256,18 @@ def build_backtest_summary(min_entries: int = 3) -> str:
             if valid_rows:
                 lines.append("    _Thresholds:_")
                 for r in valid_rows:
-                    marker = " ←" if r["threshold"] == cal["suggested_min"] else ""
+                    marker = " \u2190" if r["threshold"] == cal["suggested_min"] else ""
                     lines.append(
-                        f"      ≥{r['threshold']}: win {r['win_rate']*100:.0f}% | "
+                        f"      \u2265{r['threshold']}: win {r['win_rate']*100:.0f}% | "
                         f"avg {r['avg_pnl']:+.1f}% | n={r['n']}{marker}"
                     )
+            # CORRIGIDO: usar \u2192 em vez de _→, e MIN_DIP_SCORE sem escape problemático
             lines.append(
-                f"    _→ Actualiza MIN\_DIP\_SCORE no Railway para {cal['suggested_min']} se concordas_"
+                f"    _\u2192 Actualiza MIN_DIP_SCORE no Railway para {cal['suggested_min']} se concordas_"
             )
         else:
-            lines += ["", f"  _Auto-calibração: {cal.get('reason', 'sem dados')}_"]
+            lines += ["", f"  _Auto-calibra\u00e7\u00e3o: {cal.get('reason', 'sem dados')}_"]
     except Exception as e:
-        logging.warning(f"Auto-calibração: {e}")
+        logging.warning(f"Auto-calibra\u00e7\u00e3o: {e}")
 
     return "\n".join(lines)

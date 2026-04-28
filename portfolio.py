@@ -26,7 +26,8 @@ import os
 
 # ── Tickers ────────────────────────────────────────────────────────────────────
 # EUNL.DE  = iShares Core MSCI World (Xetra)
-# IS3N.AS  = iShares Core MSCI EM IMI (Euronext Amsterdam)
+# IS3N.DE  = iShares Core MSCI EM IMI (Xetra) — ticker correcto no yfinance
+#            (IS3N.AS falhou 404; o mesmo ETF existe em Xetra como IS3N.DE)
 DIRECT_TICKERS   = ["NVO", "ADBE", "UBER", "EUNL.DE", "MSFT", "PINS", "ADP", "CRM", "VICI"]
 CASHBACK_TICKERS = ["CRWD", "PLTR", "NOW", "DUOL"]
 
@@ -65,7 +66,7 @@ USD_TICKERS = {
     "NVO", "ADBE", "UBER", "MSFT", "PINS", "ADP", "CRM", "VICI",
     "CRWD", "PLTR", "NOW", "DUOL", "ACWI",
 }
-EUR_TICKERS = {"EUNL.DE", "IS3N.AS", "ALV.DE"}
+EUR_TICKERS = {"EUNL.DE", "IS3N.DE", "ALV.DE"}
 
 # ── Flip Fund (capital separado para flips táticos) ──────────────────────────
 # Actualiza FLIP_FUND_EUR no Railway após cada depósito ou execução de flip.
@@ -100,7 +101,7 @@ def suggest_position_size(
         (amount_eur, explanation_str)
     """
     if not FLIP_FUND_EUR or FLIP_FUND_EUR <= 0:
-        return 0.0, "⚠️ FLIP_FUND_EUR não configurado"
+        return 0.0, "\u26a0\ufe0f FLIP_FUND_EUR não configurado"
 
     raw = FLIP_FUND_EUR * (score / 100.0)
 
@@ -114,17 +115,17 @@ def suggest_position_size(
     earn_note = ""
     if earnings_days is not None and 0 <= earnings_days <= 7:
         earn_mult = 0.50
-        earn_note = f" ✂️×0.5 (earnings em {earnings_days}d)"
+        earn_note = f" \u2702\ufe0f\u00d70.5 (earnings em {earnings_days}d)"
     elif earnings_days is not None and earnings_days <= 14:
         earn_mult = 0.75
-        earn_note = f" ✂️×0.75 (earnings em {earnings_days}d)"
+        earn_note = f" \u2702\ufe0f\u00d70.75 (earnings em {earnings_days}d)"
 
     # Macro context
     macro_mult = 1.0
     macro_note = ""
     if spy_change is not None and spy_change <= -2.0:
         macro_mult = 0.75
-        macro_note = " 🌍×0.75 (SPY stress)"
+        macro_note = " \U0001f30d\u00d70.75 (SPY stress)"
 
     amount = raw * beta_mult * earn_mult * macro_mult
 
@@ -135,7 +136,7 @@ def suggest_position_size(
 
     pct_of_fund = amount / FLIP_FUND_EUR * 100
     explanation = (
-        f"€{amount:.0f} ({pct_of_fund:.0f}% do Flip Fund)"
-        f" | β={beta_val:.1f}{earn_note}{macro_note}"
+        f"\u20ac{amount:.0f} ({pct_of_fund:.0f}% do Flip Fund)"
+        f" | \u03b2={beta_val:.1f}{earn_note}{macro_note}"
     )
     return amount, explanation
