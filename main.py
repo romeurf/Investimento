@@ -20,10 +20,12 @@ Variáveis opcionais:
 """
 
 import os
+import json
 import time
 import logging
 import schedule
 import requests
+from pathlib import Path
 from datetime import datetime, timedelta
 from market_client import (
     screen_global_dips, screen_structural_dips, screen_period_dips,
@@ -31,6 +33,7 @@ from market_client import (
     get_52w_drawdown, get_earnings_date, get_earnings_days,
     get_catalyst, get_spy_change, is_market_open,
     get_usdeur, get_portfolio_snapshot,
+    get_macro_context,
 )
 from portfolio import HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, DIRECT_TICKERS, FLIP_FUND_EUR
 from sectors import get_sector_config, score_fundamentals
@@ -320,6 +323,24 @@ def send_heartbeat() -> None:
 
         if concentration_warnings:
             lines += ["", "*🚨 Alertas de concentração:*"] + concentration_warnings
+
+    # ── Earnings próximos das posições actuais ───────────────────────────────
+    earnings_alerts = []
+    for sym, shares, _ in HOLDINGS:
+        if not shares:
+            continue
+        clean_sym = sym.split(".")[0]  # EUNL.DE → EUNL
+        try:
+            days = get_earnings_days(clean_sym)
+            if days is not None:
+                dt_str = (datetime.now() + timedelta(days=days)).strftime("%d/%m")
+                urgency = "🔴" if days <= 7 else "🟡" if days <= 21 else "📅"
+                earnings_alerts.append(f"  {urgency} *{clean_sym}*: earnings em {days}d ({dt_str})")
+        except Exception:
+            pass
+
+    if earnings_alerts:
+        lines += ["", "*📅 Earnings próximos (carteira):*"] + sorted(earnings_alerts)
 
     lines += [
         "",
@@ -941,21 +962,97 @@ def run_scan() -> None:
 
 def send_open_summary() -> None:
     tier1 = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
+
+    macro = get_macro_context()
+    spy_str = ""
+    if spy_change := get_spy_change():
+        sign = "+" if spy_change >= 0 else ""
+        spy_str = f"SPY: {sign}{spy_change:.1f}%"
+
+    vix_str = f"VIX: {macro['vix']:.0f}" if macro["vix"] else ""
+    ma_str = ""
+    if macro["spy_vs_20d"] is not None:
+        arrow = "↑" if macro["spy_vs_20d"] >= 0 else "↓"
+        ma_str = f"SPY vs MA20: {arrow}{abs(macro['spy_vs_20d']):.1f}%"
+
+    macro_line = " | ".join(filter(None, [spy_str, vix_str, ma_str]))
+    macro_warn = ""
+    if macro["vix"] and macro["vix"] > 25:
+        macro_warn = "\n_⚠️ VIX elevado — mercado em stress, dips podem continuar_"
+    elif macro["spy_vs_20d"] and macro["spy_vs_20d"] < -3:
+        macro_warn = "\n_⚠️ SPY abaixo da MA20 — contexto de correcção_"
+
     if not tier1:
+        if macro_line:
+            send_telegram(f"*⚡ Abertura +1h — {datetime.now().strftime('%d/%m %H:%M')}*\n_{macro_line}_\n_Sem quedas ≥{DROP_THRESHOLD:.0f}% hoje_")
         return
-    spy_change = get_spy_change()
-    spy_str    = f" | SPY: {'+' if (spy_change or 0) >= 0 else ''}{spy_change:.1f}%" if spy_change is not None else ""
+
     lines = [
         f"*⚡ Abertura +1h — {datetime.now().strftime('%d/%m %H:%M')}*",
-        f"_{len(tier1)} candidato(s) com queda ≥{DROP_THRESHOLD:.0f}%{spy_str}_",
+        f"_{macro_line}{macro_warn}_" if macro_line else "",
+        f"_{len(tier1)} candidato(s) com queda ≥{DROP_THRESHOLD:.0f}%_",
         "",
     ]
     for s in tier1[:8]:
-        mc_b         = (s.get("market_cap") or 0) / 1e9
-        in_portfolio = " 📦" if s["symbol"] in DIRECT_TICKERS else ""
-        lines.append(f"  📉 *{s['symbol']}*{in_portfolio}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
+        mc_b = (s.get("market_cap") or 0) / 1e9
+        lines.append(f"  📉 *{s['symbol']}*: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
     lines += ["", "_Resumo completo às 21h15_"]
-    send_telegram("\n".join(lines))
+    send_telegram("\n".join(filter(None, lines)))
+
+
+# ── Dip log helpers (Feature 8) ───────────────────────────────────────────
+
+_DIP_LOG_FILE = Path("/tmp/dipr_score_log.json")
+
+def _load_dip_log() -> dict:
+    try:
+        if _DIP_LOG_FILE.exists():
+            return json.loads(_DIP_LOG_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_dip_log(log: dict) -> None:
+    try:
+        cutoff = (datetime.now() - timedelta(days=14)).date().isoformat()
+        pruned = {k: v for k, v in log.items() if k.split("_")[-1] >= cutoff}
+        _DIP_LOG_FILE.write_text(json.dumps(pruned))
+    except Exception as e:
+        logging.warning(f"Dip log save: {e}")
+
+def _get_dip_context(symbol: str, score_today: float, log: dict) -> str:
+    """
+    Devolve string com contexto temporal: há quantos dias está em dip e
+    se o score está a melhorar ou piorar.
+    """
+    entries = {k: v for k, v in log.items() if k.startswith(f"{symbol}_")}
+    if not entries:
+        return "1º dia detectado"
+
+    dates = sorted(entries.keys())
+    scores = [entries[d] for d in dates]
+
+    today = datetime.now().date()
+    consecutive = 1
+    for i in range(1, min(len(dates), 14)):
+        check_date = (today - timedelta(days=i)).isoformat()
+        if any(d.endswith(check_date) for d in dates):
+            consecutive += 1
+        else:
+            break
+
+    trend = ""
+    if len(scores) >= 2:
+        prev = scores[-1]
+        if score_today > prev:
+            trend = f" | score ↑ ({prev:.0f}→{score_today:.0f})"
+        elif score_today < prev:
+            trend = f" | score ↓ ({prev:.0f}→{score_today:.0f})"
+        else:
+            trend = f" | score estável ({score_today:.0f})"
+
+    day_label = f"{consecutive}º dia consecutivo"
+    return f"{day_label}{trend}"
 
 
 # ── Resumo fecho (21h15) ──────────────────────────────────────────────────
@@ -968,6 +1065,9 @@ def send_close_summary() -> None:
     all_losers = screen_global_dips(min_drop_pct=3.0, min_market_cap=MIN_MARKET_CAP)
     if not all_losers:
         return
+
+    dip_log    = _load_dip_log()
+    today_iso  = datetime.now().date().isoformat()
 
     tier1            = [s for s in all_losers if s["change_pct"] <= -DROP_THRESHOLD]
     tier2            = [s for s in all_losers if -DROP_THRESHOLD < s["change_pct"] <= -7.0]
@@ -1048,7 +1148,12 @@ def send_close_summary() -> None:
             catalyst     = get_catalyst(sym, fund.get("name", ""))
             _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change)
             in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
+            # Regista no log e obtém contexto temporal
+            log_key = f"{sym}_{today_iso}"
+            dip_log[log_key] = score
+            context_str = _get_dip_context(sym, score, dip_log)
             lines.append(f"  🔥 *{sym}*{in_portfolio} — Score {score:.0f}/100 | ${price} | ${mc_b:.1f}B | {sector_label}")
+            lines.append(f"  _{context_str}_")
             lines.append(f"     {strategy}")
             lines.append("")
         rest_high = [s for s in tier3[5:] if s.get("_score", 0) >= 80]
@@ -1075,6 +1180,8 @@ def send_close_summary() -> None:
 
     ranking_block = build_flip_ranking(ranking_entries, spy_change, exclude_syms=tier1_syms)
     if ranking_block: lines.append(ranking_block)
+
+    _save_dip_log(dip_log)
 
     elapsed = int(time.time() - start_time)
     lines.append(f"_⏱ Resumo gerado em {elapsed}s_")
