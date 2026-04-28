@@ -21,6 +21,7 @@ import logging
 import threading
 import requests
 from datetime import datetime
+from rate_limiter import is_allowed, rate_status
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -67,9 +68,27 @@ def _reply(text: str) -> None:
         _cb_send_telegram(text)
 
 
+def _check_rate(cmd: str) -> bool:
+    """
+    Verifica rate limit para o comando.
+    Envia mensagem de aviso e devolve False se bloqueado.
+    """
+    allowed, wait = is_allowed(cmd)
+    if not allowed:
+        _reply(
+            f"⏳ *Rate limit* — `/{cmd}` muito frequente.\n"
+            f"_Tenta novamente em *{wait}s*._"
+        )
+        logging.info(f"[bot_commands] rate limit: /{cmd} bloqueado ({wait}s)")
+    return allowed
+
+
 def _handle_command(text: str) -> None:
     parts = text.strip().split()
     cmd   = parts[0].lower() if parts else ""
+    # Remove bot mention (ex: /analisar@DipRadarBot)
+    cmd   = cmd.split("@")[0]
+    cmd_key = cmd.lstrip("/")
 
     if cmd in ("/help", "/start"):
         _reply(
@@ -85,6 +104,7 @@ def _handle_command(text: str) -> None:
         )
 
     elif cmd == "/status":
+        if not _check_rate(cmd_key): return
         uptime = datetime.now() - _bot_start_time
         hours, rem = divmod(int(uptime.total_seconds()), 3600)
         mins = rem // 60
@@ -93,10 +113,12 @@ def _handle_command(text: str) -> None:
             f"*🤖 DipRadar Status*\n"
             f"Uptime: *{hours}h {mins}m*\n"
             f"Mercado: *{market}*\n"
-            f"_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_"
+            f"_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
+            f"_{rate_status()}_"
         )
 
     elif cmd == "/carteira":
+        if not _check_rate(cmd_key): return
         if not _cb_get_snapshot:
             _reply("_Snapshot não disponível._")
             return
@@ -121,6 +143,7 @@ def _handle_command(text: str) -> None:
             _reply(f"_Erro ao calcular carteira: {e}_")
 
     elif cmd == "/scan":
+        if not _check_rate(cmd_key): return
         if _cb_is_market_open and not _cb_is_market_open():
             _reply("⚠️ Mercado fechado — scan não disponível fora do horário.")
             return
@@ -132,6 +155,7 @@ def _handle_command(text: str) -> None:
             _reply(f"_Erro no scan: {e}_")
 
     elif cmd == "/analisar":
+        if not _check_rate(cmd_key): return
         if len(parts) < 2:
             _reply(
                 "⚠️ Usa: `/analisar <TICKER>`\n"
@@ -152,6 +176,7 @@ def _handle_command(text: str) -> None:
             _reply(f"_Erro ao analisar {symbol}: {e}_")
 
     elif cmd == "/backtest":
+        if not _check_rate(cmd_key): return
         if not _cb_backtest_summary:
             _reply("_Backtest não disponível._")
             return
@@ -162,6 +187,7 @@ def _handle_command(text: str) -> None:
             _reply(f"_Erro no backtest: {e}_")
 
     elif cmd == "/rejeitados":
+        if not _check_rate(cmd_key): return
         if not _cb_rejected_log:
             _reply("_Log não disponível._")
             return
@@ -183,6 +209,7 @@ def _handle_command(text: str) -> None:
             _reply(f"_Erro: {e}_")
 
     elif cmd == "/tier3":
+        if not _check_rate(cmd_key): return
         try:
             if _cb_tier3_handler:
                 _reply(_cb_tier3_handler())
