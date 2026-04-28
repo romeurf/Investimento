@@ -843,18 +843,8 @@ def build_alert(
         spy_change=spy_change,
     )
 
-    return (
-        f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
-        f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
-        f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
-        f"{earn_warn}"
-        f"{valuation_block}"
-        f"\n*Categoria:* {category}\n"
-        f"{score_line}\n"
-        f"{score_breakdown}\n"
-        f"\n*Estratégia:* {strategy}"
-        f"{macro_ctx}"
-        f"\n💶 *Sizing:* {sizing_str}" if sizing_str else
+    # ── FIX: construir a mensagem de forma explícita, sem ternário partido ──
+    body = (
         f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
         f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
         f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
@@ -866,6 +856,9 @@ def build_alert(
         f"\n*Estratégia:* {strategy}"
         f"{macro_ctx}"
     )
+    if sizing_str:
+        body += f"\n💶 *Sizing:* {sizing_str}"
+    return body
 
 
 # ── Scan principal ─────────────────────────────────────────────────────────────────
