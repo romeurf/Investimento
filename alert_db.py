@@ -37,7 +37,7 @@ _FIELDS = [
     "change_day_pct", # queda do dia que gerou o alerta
     # Técnicos
     "rsi",
-    "volume_ratio",   # volume / average_volume
+    "volume_ratio",   # volume / average_volume (vazio se dados insuficientes)
     # Fundamentais
     "pe",
     "pe_historical",  # P/E histórico de 5 anos
@@ -78,6 +78,19 @@ def _ensure_header() -> None:
             logging.warning(f"[alert_db] Erro ao criar header: {e}")
 
 
+def _safe_volume_ratio(vol: float | None, avg_vol: float | None) -> float | str:
+    """
+    Calcula volume / average_volume de forma segura para ML.
+    Retorna string vazia se qualquer valor for None, zero ou negativo
+    — um ratio inventado (ex: vol/1) seria ruído para o modelo.
+    Threshold mínimo de avg_vol: 1000 acções (exclui ETFs ilíquidos com
+    average_volume = 0 reportado pelo Yahoo Finance).
+    """
+    if not vol or not avg_vol or avg_vol < 1000:
+        return ""
+    return round(vol / avg_vol, 2)
+
+
 def log_alert_snapshot(
     symbol: str,
     fundamentals: dict,
@@ -98,11 +111,12 @@ def log_alert_snapshot(
     _ensure_header()
     try:
         from sectors import get_sector_config
-        sector     = fundamentals.get("sector", "")
-        pe_fair    = get_sector_config(sector).get("pe_fair", 22)
-        vol        = fundamentals.get("volume") or 0
-        avg_vol    = fundamentals.get("average_volume") or 1
-        vol_ratio  = round(vol / avg_vol, 2) if avg_vol else None
+        sector    = fundamentals.get("sector", "")
+        pe_fair   = get_sector_config(sector).get("pe_fair", 22)
+        vol_ratio = _safe_volume_ratio(
+            fundamentals.get("volume"),
+            fundamentals.get("average_volume"),
+        )
 
         row = {
             "date_iso":         datetime.now().date().isoformat(),
@@ -118,7 +132,7 @@ def log_alert_snapshot(
             "drawdown_52w":     fundamentals.get("drawdown_from_high") or "",
             "change_day_pct":   round(change_day_pct, 2),
             "rsi":              round(rsi_val, 1) if rsi_val is not None else "",
-            "volume_ratio":     vol_ratio or "",
+            "volume_ratio":     vol_ratio,
             "pe":               fundamentals.get("pe") or "",
             "pe_historical":    round(historical_pe, 1) if historical_pe is not None else "",
             "pe_fair":          pe_fair,
