@@ -201,18 +201,21 @@ def _handle_comparar(symbols: list[str]) -> None:
     _reply(f"_🔄 A comparar {' vs '.join(symbols)}... (pode demorar até 30s)_")
 
     def _run():
-        from score import calculate_dip_score
+        from score import calculate_dip_score, classify_dip_category, is_bluechip
         rows = []
         for sym in symbols:
             try:
                 fund  = get_fundamentals(sym)
                 edays = get_earnings_days(sym) if get_earnings_days else None
                 score, rsi_str = calculate_dip_score(fund, sym, edays)
-                badge = "🔥" if score >= 80 else ("⭐" if score >= 55 else "📊")
+                badge    = "🔥" if score >= 80 else ("⭐" if score >= 55 else "📊")
+                bc_flag  = is_bluechip(fund)
+                category = classify_dip_category(fund, score, bc_flag)
                 rows.append({
                     "sym":      sym,
                     "score":    score,
                     "badge":    badge,
+                    "category": category,
                     "rsi":      rsi_str or "N/D",
                     "fcf":      f"{fund.get('fcf_yield',0)*100:.1f}%" if fund.get('fcf_yield') is not None else "N/D",
                     "growth":   f"{fund.get('revenue_growth',0)*100:.1f}%" if fund.get('revenue_growth') is not None else "N/D",
@@ -236,7 +239,7 @@ def _handle_comparar(symbols: list[str]) -> None:
             if r.get("error"):
                 lines.append(f"  ❌ *{r['sym']}* — _erro: {r['error']}_")
                 continue
-            lines.append(f"  {r['badge']} *{r['sym']}* — score *{r['score']:.0f}/100*")
+            lines.append(f"  {r['badge']} *{r['sym']}* — score *{r['score']:.0f}/100* | {r['category']}")
             lines.append(f"     RSI {r['rsi']} · FCF {r['fcf']} · Growth {r['growth']}")
             lines.append(f"     Margin {r['margin']} · Upside {r['upside']} · Drawdown {r['drawdown']}")
             lines.append(f"     Sector: _{r['sector']}_ · Earnings: {r['edays']}d")
