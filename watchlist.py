@@ -8,6 +8,9 @@ Cada entrada define:
   - symbol        : ticker Yahoo Finance correcto (com sufixo se necessário)
   - name          : nome legível
   - slot          : P1/P2/P3 — prioridade de alocação
+  - category      : intenção estratégica (CATEGORY_* de score.py) — opcional
+                    Se definida, é comparada com a categoria dinâmica do score.py.
+                    Divergência → aviso no alerta ("Intenção vs Realidade").
   - criteria      : lista de condições que devem ser verificadas (qualquer uma basta)
   - notes         : contexto / tese de investimento
   - alert_once    : se True, só alerta uma vez por dia por condição satisfeita
@@ -27,6 +30,7 @@ from datetime import datetime
 from typing import Any
 import yfinance as yf
 from state import load_alerts, save_alerts
+from score import CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -37,20 +41,22 @@ WATCHLIST: list[dict[str, Any]] = [
 
     # ── CORE EUROPEU ────────────────────────────────────────────────────
     {
-        "symbol":  "IS3N.AS",
-        "name":    "iShares Core MSCI EM IMI",
-        "slot":    "P1",
+        "symbol":   "IS3N.AS",
+        "name":     "iShares Core MSCI EM IMI",
+        "slot":     "P1",
+        "category": CATEGORY_ROTACAO,  # ETF — entrada tática em correção
         "criteria": [
-            {"type": "drawdown_52w_pct", "value": 12.0},  # qualquer correção relevante
+            {"type": "drawdown_52w_pct", "value": 12.0},
         ],
         "notes": "Entrada imediata com excesso do fundo de emergência. Diversificação Emerging Markets.",
     },
 
     # ── DIVIDENDO / REIT ────────────────────────────────────────────────
     {
-        "symbol":  "O",
-        "name":    "Realty Income",
-        "slot":    "P2",
+        "symbol":   "O",
+        "name":     "Realty Income",
+        "slot":     "P2",
+        "category": CATEGORY_APARTAMENTO,  # REIT de dividendo mensal — paga para esperar
         "criteria": [
             {"type": "dividend_yield", "value": 5.5},
             {"type": "price_below",    "value": 50.0},
@@ -58,9 +64,10 @@ WATCHLIST: list[dict[str, Any]] = [
         "notes": "Dividendo mensal. Entrar quando yield >5.5% ou preço <50. Esperar Fed a cortar.",
     },
     {
-        "symbol":  "MDT",
-        "name":    "Medtronic",
-        "slot":    "P2",
+        "symbol":   "MDT",
+        "name":     "Medtronic",
+        "slot":     "P2",
+        "category": CATEGORY_APARTAMENTO,  # Healthcare dividendo — yield paga a espera pela reprecificação
         "criteria": [
             {"type": "dividend_yield", "value": 4.0},
             {"type": "price_below",    "value": 80.0},
@@ -68,9 +75,10 @@ WATCHLIST: list[dict[str, Any]] = [
         "notes": "Healthtech de dividendo. Entrar com yield >4% ou preço <80. Aguarda espaço libertado por NVO.",
     },
     {
-        "symbol":  "ABBV",
-        "name":    "AbbVie",
-        "slot":    "P2",
+        "symbol":   "ABBV",
+        "name":     "AbbVie",
+        "slot":     "P2",
+        "category": CATEGORY_APARTAMENTO,  # Pharma dividendo — pipeline Skyrizi/Rinvoq suporta tese longa
         "criteria": [
             {"type": "dividend_yield",  "value": 4.0},
             {"type": "change_day_pct",  "value": 15.0},
@@ -78,49 +86,54 @@ WATCHLIST: list[dict[str, Any]] = [
         "notes": "Pharma dividendo. Entrar com yield >4% ou dip >15% com pipeline intacto (Skyrizi/Rinvoq).",
     },
     {
-        "symbol":  "LMT",
-        "name":    "Lockheed Martin",
-        "slot":    "P3",
+        "symbol":   "LMT",
+        "name":     "Lockheed Martin",
+        "slot":     "P3",
+        "category": CATEGORY_ROTACAO,  # Defesa — entrada tática em dip; sem yield suficiente para Apartamento
         "criteria": [
-            {"type": "change_day_pct",  "value": 10.0},
-            {"type": "drawdown_52w_pct","value": 20.0},
+            {"type": "change_day_pct",   "value": 10.0},
+            {"type": "drawdown_52w_pct", "value": 20.0},
         ],
         "notes": "Defesa. Dip adicional >10% no dia ou >20% do topo.",
     },
     {
-        "symbol":  "RTX",
-        "name":    "RTX (Raytheon)",
-        "slot":    "P3",
+        "symbol":   "RTX",
+        "name":     "RTX (Raytheon)",
+        "slot":     "P3",
+        "category": CATEGORY_ROTACAO,  # Defesa — mesma lógica que LMT
         "criteria": [
-            {"type": "change_day_pct",  "value": 10.0},
-            {"type": "drawdown_52w_pct","value": 20.0},
+            {"type": "change_day_pct",   "value": 10.0},
+            {"type": "drawdown_52w_pct", "value": 20.0},
         ],
         "notes": "Defesa. Dip adicional >10% no dia ou >20% do topo.",
     },
 
     # ── TECH GROWTH ─────────────────────────────────────────────────────
     {
-        "symbol":  "CRWD",
-        "name":    "CrowdStrike",
-        "slot":    "P3",
+        "symbol":   "CRWD",
+        "name":     "CrowdStrike",
+        "slot":     "P3",
+        "category": CATEGORY_ROTACAO,  # Cybersecurity growth — sem dividendo, entrada tática
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 20.0},
         ],
         "notes": "Cybersecurity líder. Entrar só com correção >20% com tese intacta.",
     },
     {
-        "symbol":  "PANW",
-        "name":    "Palo Alto Networks",
-        "slot":    "P3",
+        "symbol":   "PANW",
+        "name":     "Palo Alto Networks",
+        "slot":     "P3",
+        "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 20.0},
         ],
         "notes": "Cybersecurity. Correção >20% com tese intacta.",
     },
     {
-        "symbol":  "TSM",
-        "name":    "Taiwan Semiconductor",
-        "slot":    "P2",
+        "symbol":   "TSM",
+        "name":     "Taiwan Semiconductor",
+        "slot":     "P2",
+        "category": CATEGORY_ROTACAO,  # Semi — risco geopolítico exclui Hold Forever
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 15.0},
             {"type": "change_day_pct",   "value": 12.0},
@@ -128,9 +141,10 @@ WATCHLIST: list[dict[str, Any]] = [
         "notes": "Semicondutores. Correção 15-20% com tese intacta (risco geopolítico controlado).",
     },
     {
-        "symbol":  "AVGO",
-        "name":    "Broadcom",
-        "slot":    "P3",
+        "symbol":   "AVGO",
+        "name":     "Broadcom",
+        "slot":     "P3",
+        "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 30.0},
         ],
@@ -139,9 +153,10 @@ WATCHLIST: list[dict[str, Any]] = [
 
     # ── EUROPA ──────────────────────────────────────────────────────────
     {
-        "symbol":  "ALV.DE",
-        "name":    "Allianz",
-        "slot":    "P3",
+        "symbol":   "ALV.DE",
+        "name":     "Allianz",
+        "slot":     "P3",
+        "category": CATEGORY_APARTAMENTO,  # Seguradora europeia — yield sólido + correção = Apartamento
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 15.0},
         ],
@@ -215,15 +230,61 @@ def _check_criteria(data: dict, criteria: list[dict]) -> list[str]:
     return triggered
 
 
+def _check_category_divergence(
+    intention: str | None,
+    symbol: str,
+    data: dict,
+) -> str | None:
+    """
+    Compara a categoria de intenção da watchlist com a categoria dinâmica
+    calculada pelo score.py em tempo real.
+
+    Devolve uma linha de aviso se divergirem, None se estiverem alinhadas
+    ou se não houver intenção definida.
+
+    Filosofia:
+      - watchlist.category = INTENÇÃO (tu decides a gaveta estratégica)
+      - score.classify_dip_category() = REALIDADE (os fundamentos de hoje)
+      Divergência não bloqueia o alerta — apenas avisa.
+    """
+    if not intention:
+        return None
+    try:
+        from score import classify_dip_category, is_bluechip
+        import yfinance as yf as _yf
+        info = _yf.Ticker(symbol).info
+        fundamentals = {
+            "dividend_yield":    (info.get("dividendYield") or 0),
+            "drawdown_from_high": -data["drawdown"],  # score.py usa negativo
+            "fcf_yield":         info.get("freeCashflow") and info.get("marketCap") and
+                                 info["freeCashflow"] / info["marketCap"] or None,
+            "gross_margin":      info.get("grossMargins") or 0,
+            "debt_equity":       info.get("debtToEquity") or None,
+            "market_cap":        info.get("marketCap") or 0,
+            "revenue_growth":    info.get("revenueGrowth") or 0,
+            "sector":            data.get("sector", ""),
+        }
+        bc_flag  = is_bluechip(fundamentals)
+        # Usa score mínimo neutro (50) — o objectivo é só detectar divergência de categoria
+        reality  = classify_dip_category(fundamentals, dip_score=50, is_bluechip_flag=bc_flag)
+        if intention != reality:
+            return f"⚠️ *ALERTA DE TESE:* Intenção ({intention}) → Modelo ({reality})"
+    except Exception as e:
+        logging.debug(f"[watchlist] divergence check {symbol}: {e}")
+    return None
+
+
 def _build_watchlist_alert(
     entry: dict,
     data: dict,
     triggered: list[str],
     in_portfolio: bool,
+    divergence: str | None = None,
 ) -> str:
     symbol    = entry["symbol"]
     slot      = entry["slot"]
     notes     = entry["notes"]
+    intention = entry.get("category")
     slot_e    = _SLOT_EMOJI.get(slot, "⚪")
     port_tag  = " 📦 *Já em carteira*" if in_portfolio else ""
     mc_str    = f"${data['mc_b']:.1f}B" if data["mc_b"] else "N/D"
@@ -231,6 +292,12 @@ def _build_watchlist_alert(
         f"🎯 *Watchlist Hit: {symbol} — {data['name']}*{port_tag}",
         f"{slot_e} Slot *{slot}* | 💰 ${data['price']:.2f} | 🏦 {mc_str}",
         f"📉 52w drawdown: *{data['drawdown']:.1f}%* | Yield: *{data['div_yield']:.2f}%*",
+    ]
+    if intention:
+        lines.append(f"🗂️ Intenção: *{intention}*")
+    if divergence:
+        lines.append(divergence)
+    lines += [
         "",
         "*✅ Critérios satisfeitos:*",
     ]
@@ -276,17 +343,20 @@ def run_watchlist_scan(
         if not triggered:
             continue
 
+        divergence = _check_category_divergence(entry.get("category"), symbol, data)
+
         msg = _build_watchlist_alert(
             entry,
             data,
             triggered,
             in_portfolio=(symbol in in_port),
+            divergence=divergence,
         )
         if send_telegram(msg):
             alerted.add(alert_key)
             save_alerts(alerted)
             sent += 1
-            logging.info(f"[watchlist] ✅ Alerta: {symbol} ({', '.join(entry['slot'] for _ in [1])})")
+            logging.info(f"[watchlist] ✅ Alerta: {symbol} ({entry['slot']})")
 
     return sent
 
@@ -299,18 +369,20 @@ def build_watchlist_morning_summary(direct_tickers: set | list) -> str:
     in_port = set(direct_tickers)
     lines   = ["*👀 Watchlist — Estado actual:*", ""]
     for entry in WATCHLIST:
-        symbol = entry["symbol"]
-        slot   = entry["slot"]
-        slot_e = _SLOT_EMOJI.get(slot, "⚪")
-        data   = _get_ticker_data(symbol)
+        symbol    = entry["symbol"]
+        slot      = entry["slot"]
+        intention = entry.get("category", "")
+        slot_e    = _SLOT_EMOJI.get(slot, "⚪")
+        data      = _get_ticker_data(symbol)
         if not data:
             lines.append(f"  {slot_e} *{symbol}* — _erro ao obter dados_")
             continue
-        triggered = _check_criteria(data, entry["criteria"])
-        port_tag  = " 📦" if symbol in in_port else ""
-        hit_tag   = " 🎯 *CRITÉRIO ATINGIDO*" if triggered else ""
+        triggered  = _check_criteria(data, entry["criteria"])
+        port_tag   = " 📦" if symbol in in_port else ""
+        hit_tag    = " 🎯 *CRITÉRIO ATINGIDO*" if triggered else ""
+        cat_tag    = f" | {intention}" if intention else ""
         lines.append(
-            f"  {slot_e} *{symbol}*{port_tag}{hit_tag} — "
+            f"  {slot_e} *{symbol}*{port_tag}{hit_tag}{cat_tag} — "
             f"${data['price']:.2f} | 52w ↓{data['drawdown']:.0f}% | "
             f"Yield {data['div_yield']:.1f}%"
         )
