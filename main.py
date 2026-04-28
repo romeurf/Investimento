@@ -41,7 +41,7 @@ from portfolio import (
 )
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
-from score import calculate_dip_score, build_score_breakdown
+from score import calculate_dip_score, build_score_breakdown, classify_dip_category
 from state import (
     load_alerts, save_alerts, clear_alerts,
     load_weekly_log, save_weekly_log, append_weekly_log,
@@ -53,6 +53,7 @@ from state import (
 )
 from backtest import backtest_runner, build_backtest_summary
 from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
+from alert_db import log_alert_snapshot, get_db_stats
 import bot_commands
 
 logging.basicConfig(
@@ -488,6 +489,8 @@ def send_weekly_dip_scan() -> None:
             sector_chg     = get_sector_change(fund.get("sector", ""))
             score, rsi_str = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg)
             if score >= 70:
+                bc_flag  = is_bluechip(fund)
+                category = classify_dip_category(fund, score, bc_flag)
                 scored.append({
                     "symbol":         sym,
                     "score":          score,
@@ -496,7 +499,8 @@ def send_weekly_dip_scan() -> None:
                     "mc_b":           (fund.get("market_cap") or 0) / 1e9,
                     "sector":         get_sector_config(fund.get("sector", "")).get("label", "") or fund.get("sector", ""),
                     "rsi":            rsi_str,
-                    "bluechip":       is_bluechip(fund),
+                    "bluechip":       bc_flag,
+                    "category":       category,
                     "earnings_days":  earnings_days,
                     "analyst_upside": fund.get("analyst_upside") or 0,
                 })
@@ -521,7 +525,7 @@ def send_weekly_dip_scan() -> None:
             f"{badge} *{s['symbol']}*{bc_tag} — Score {s['score']:.0f}/100 | "
             f"${s['price']:.2f} | ${s['mc_b']:.1f}B | {s['drawdown']:.0f}% do topo"
         )
-        lines.append(f"   _{s['sector']}{rsi_tag}{earn_tag}{upside_tag}_")
+        lines.append(f"   _{s['category']} | {s['sector']}{rsi_tag}{earn_tag}{upside_tag}_")
         lines.append("")
     send_telegram("\n".join(lines))
     logging.info(f"Weekly scan enviado: {len(scored)} candidatos")
@@ -669,12 +673,16 @@ def calculate_flip_target(
     earnings_date: str | None = None,
     catalyst: dict | None = None,
     spy_change: float | None = None,
+    category: str | None = None,
 ) -> tuple[str, str]:
     price = fundamentals.get("price") or 0
     if not price or price <= 0:
         return "N/D", "SEM DADOS"
-    if is_bluechip(fundamentals) and dip_score >= 60:
-        return "HOLD ETERNO", "💎 Blue chip — Adicionar em dips, nunca vender"
+
+    # Hold Forever — nunca vender
+    if category == "🏛️ Hold Forever" or (is_bluechip(fundamentals) and dip_score >= 60):
+        return "HOLD ETERNO", "💎 Hold Forever — Acumular em dips, nunca vender"
+
     sector         = fundamentals.get("sector", "")
     sector_cfg     = get_sector_config(sector)
     pe_current     = fundamentals.get("pe") or 0
@@ -707,7 +715,15 @@ def calculate_flip_target(
         cat_flag = " | 📡 Analistas veem upside forte"
     else:
         cat_flag = " | ⚠️ Sem catalisador identificado"
-    strategy = f"🎯 Flip: ${final_target:.1f} (+{final_upside*100:.0f}%){cat_flag}{macro_flag}"
+
+    # Adaptar prefixo da estratégia conforme categoria
+    if category == "🏠 Apartamento":
+        dividend_yield = fundamentals.get("dividend_yield") or 0
+        dy_str = f" | 💰 Yield {dividend_yield*100:.1f}%/ano" if dividend_yield > 0 else ""
+        strategy = f"🏠 Apartamento: ${final_target:.1f} (+{final_upside*100:.0f}%){dy_str}{cat_flag}{macro_flag}"
+    else:
+        strategy = f"🔄 Flip: ${final_target:.1f} (+{final_upside*100:.0f}%){cat_flag}{macro_flag}"
+
     return f"${final_target:.1f} (+{final_upside*100:.0f}%)", strategy
 
 
@@ -733,11 +749,12 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
         earnings      = entry.get("earnings_date")
         earnings_days = entry.get("earnings_days")
         catalyst      = entry.get("catalyst")
+        category      = entry.get("category", "🔄 Rotação")
         price         = f.get("price", 0)
         mc_b          = (f.get("market_cap") or 0) / 1e9
         beta          = f.get("beta")
         in_portfolio  = " 📦" if sym in DIRECT_TICKERS else ""
-        _, strategy   = calculate_flip_target(f, s, earnings, catalyst, spy_change)
+        _, strategy   = calculate_flip_target(f, s, earnings, catalyst, spy_change, category=category)
         badge         = score_badge(s)
         tier_badge    = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
 
@@ -749,7 +766,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
             spy_change=spy_change,
         )
 
-        lines.append(f"*{i}. {sym}*{in_portfolio} {tier_badge} | Score {s:.0f}/100 {badge}")
+        lines.append(f"*{i}. {sym}*{in_portfolio} {tier_badge} | Score {s:.0f}/100 {badge} | {category}")
         lines.append(f"   💰 ${price} | 🏦 ${mc_b:.1f}B")
         lines.append(f"   {strategy}")
         if sizing_str:
@@ -763,6 +780,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
 def build_alert(
     stock, fundamentals, historical_pe, news,
     verdict, emoji, reasons, dip_score, rsi_str,
+    category: str = "🔄 Rotação",
 ) -> str:
     sector       = fundamentals.get("sector", "")
     sector_cfg   = get_sector_config(sector)
@@ -796,6 +814,7 @@ def build_alert(
         f"💰 Preço: ${price} | 🏦 Cap: ${mc_b:.1f}B",
         f"🏢 Sector: {sector_cfg.get('label', sector) or sector}",
         f"{score_line}{rsi_part}{vol_flag}{insider_flag}{short_flag}{sector_warn}",
+        f"📂 *Categoria: {category}*",
         "",
         f"*{emoji} Veredito: {verdict}*",
     ]
@@ -846,7 +865,9 @@ def handle_analyze_ticker(symbol: str) -> str:
         historical_pe  = get_historical_pe(symbol)
         news           = get_news(symbol)
         catalyst       = get_catalyst(symbol, fund.get("name", ""))
-        _, strategy    = calculate_flip_target(fund, dip_score, earnings_date, catalyst, spy_change)
+        bc_flag        = is_bluechip(fund)
+        category       = classify_dip_category(fund, dip_score, bc_flag)
+        _, strategy    = calculate_flip_target(fund, dip_score, earnings_date, catalyst, spy_change, category=category)
 
         name         = fund.get("name", symbol)
         price        = fund.get("price") or 0
@@ -854,7 +875,7 @@ def handle_analyze_ticker(symbol: str) -> str:
         drawdown     = fund.get("drawdown_from_high")
         drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
         in_portfolio = " 📦 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
-        bc_tag       = " 💎 Blue chip" if is_bluechip(fund) else ""
+        bc_tag       = " 💎 Blue chip" if bc_flag else ""
 
         badge_str  = score_badge(dip_score)
         score_line = f"{badge_str} Score: {dip_score:.0f}/100"
@@ -874,6 +895,7 @@ def handle_analyze_ticker(symbol: str) -> str:
             f"💰 Preço: *${price}*{drawdown_str}{spy_str}",
             f"🏦 Market cap: ${mc_b:.1f}B | 🏢 {sector_cfg.get('label', sector) or sector}",
             f"{score_line}{rsi_part}{earn_tag}{vol_flag}{insider_flag}{short_flag}{sector_warn}",
+            f"📂 *Categoria: {category}*",
             "",
             f"*{emoji} Veredito: {verdict}*",
         ]
@@ -918,11 +940,95 @@ def handle_analyze_ticker(symbol: str) -> str:
                 lines.append(f"  [{title}]({url}){' _' + source + '_' if source else ''}")
 
         lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')} — via /analisar_")
+
+        # ── Log para base de dados ML ────────────────────────────────────
+        try:
+            rsi_float = float(rsi_str) if rsi_str else None
+            log_alert_snapshot(
+                symbol=symbol,
+                fundamentals=fund,
+                score=dip_score,
+                verdict=verdict,
+                category=category,
+                change_day_pct=0.0,
+                rsi_val=rsi_float,
+                historical_pe=historical_pe,
+                spy_change=spy_change,
+                sector_etf_change=sector_chg,
+            )
+        except Exception as db_err:
+            logging.debug(f"[/analisar] alert_db {symbol}: {db_err}")
+
         return "\n".join(lines)
 
     except Exception as e:
         logging.error(f"[/analisar] {symbol}: {e}")
         return f"❌ Erro ao analisar *{symbol}*: `{e}`"
+
+
+# ── Handler /mldata ───────────────────────────────────────────────────────
+
+def handle_mldata_command() -> str:
+    """Devolve estatísticas da base de dados ML para o Telegram."""
+    try:
+        stats = get_db_stats()
+        total = stats.get("total", 0)
+        if total == 0:
+            return (
+                "🤖 *Base de dados ML — DipRadar*\n"
+                "_Ainda sem registos. Cada alerta gerado (scan + /analisar) é fotografado automaticamente._\n\n"
+                f"_Ficheiro: {stats.get('db_path', 'N/D')}_"
+            )
+
+        by_cat = stats.get("by_category", {})
+        by_vrd = stats.get("by_verdict", {})
+        last5  = stats.get("last_5", [])
+
+        lines = [
+            "🤖 *Base de dados ML — DipRadar*",
+            f"_Fotografias de alertas para treino futuro de modelos_",
+            "",
+            f"*📸 Total de registos: {total}*",
+            "",
+            "*Por categoria:*",
+        ]
+        for cat, n in sorted(by_cat.items(), key=lambda x: -x[1]):
+            pct = n / total * 100
+            lines.append(f"  {cat}: *{n}* ({pct:.0f}%)")
+
+        lines += ["", "*Por veredito:*"]
+        for vrd, n in sorted(by_vrd.items(), key=lambda x: -x[1]):
+            pct = n / total * 100
+            lines.append(f"  {vrd}: *{n}* ({pct:.0f}%)")
+
+        if last5:
+            lines += ["", "*Últimos 5 alertas registados:*"]
+            for r in last5:
+                lines.append(
+                    f"  • *{r.get('symbol','')}* | {r.get('date_iso','')} | "
+                    f"Score {r.get('score','')} | {r.get('category','')} | {r.get('verdict','')}"
+                )
+
+        needed = max(0, 200 - total)
+        if needed > 0:
+            lines += [
+                "",
+                f"_Progresso para treino ML: {total}/200 ({total/200*100:.0f}%)_",
+                f"_Faltam ~{needed} alertas para ter dados suficientes_",
+            ]
+        else:
+            lines += [
+                "",
+                "✅ *Base de dados suficiente para treino ML!*",
+                "_Podes usar scikit-learn ou XGBoost com alert_db.csv_",
+            ]
+
+        lines.append(f"\n_Ficheiro: {stats.get('db_path', 'N/D')}_")
+        return "\n".join(lines)
+
+    except Exception as e:
+        logging.error(f"[/mldata] {e}")
+        return f"❌ Erro ao ler base de dados ML: `{e}`"
 
 
 # ── Scan contínuo ─────────────────────────────────────────────────────────
@@ -960,6 +1066,8 @@ def run_scan() -> None:
         dyn_sleep = max(2, min(8, 60 // max(n, 1)))
         logging.info(f"  {n} candidatos, sleep dinâmico: {dyn_sleep}s/stock")
 
+        spy_change = get_spy_change()
+
         for stock in losers:
             symbol    = stock.get("symbol")
             alert_key = f"{symbol}_{today}"
@@ -988,11 +1096,16 @@ def run_scan() -> None:
                                         score=dip_score, verdict=verdict, sector=sector)
                     _alerted_today.add(alert_key); save_alerts(_alerted_today)
                     continue
+
+                bc_flag  = is_bluechip(fundamentals)
+                category = classify_dip_category(fundamentals, dip_score, bc_flag)
+
                 historical_pe = get_historical_pe(symbol)
                 news          = get_news(symbol)
                 message       = build_alert(
                     stock, fundamentals, historical_pe,
                     news, verdict, emoji, reasons, dip_score, rsi_str,
+                    category=category,
                 )
                 if send_telegram(message):
                     _alerted_today.add(alert_key)
@@ -1001,10 +1114,29 @@ def run_scan() -> None:
                     price_now = fundamentals.get("price") or 0
                     if price_now:
                         append_backtest_entry(symbol, verdict, dip_score, stock["change_pct"], price_now, sector)
-                    _, strategy = calculate_flip_target(fundamentals, dip_score)
+                    _, strategy = calculate_flip_target(fundamentals, dip_score, category=category)
                     if price_now and "HOLD" not in strategy:
                         add_recovery_position(symbol, price_now, dip_score, RECOVERY_PCT, verdict)
-                    logging.info(f"  ✅ Alerta: {symbol} ({verdict}, score {dip_score}/100)")
+
+                    # ── Log para base de dados ML ────────────────────────
+                    try:
+                        rsi_float = float(rsi_str) if rsi_str else None
+                        log_alert_snapshot(
+                            symbol=symbol,
+                            fundamentals=fundamentals,
+                            score=dip_score,
+                            verdict=verdict,
+                            category=category,
+                            change_day_pct=stock["change_pct"],
+                            rsi_val=rsi_float,
+                            historical_pe=historical_pe,
+                            spy_change=spy_change,
+                            sector_etf_change=sector_chg,
+                        )
+                    except Exception as db_err:
+                        logging.debug(f"alert_db {symbol}: {db_err}")
+
+                    logging.info(f"  ✅ Alerta: {symbol} ({verdict}, score {dip_score}/100, {category})")
                 time.sleep(dyn_sleep)
             except Exception as e:
                 logging.error(f"Erro {symbol}: {e}")
@@ -1151,7 +1283,8 @@ def send_close_summary() -> None:
         if fund.get("skip"): continue
         score = _get_score(sym, fund)
         if score >= 80:
-            s["_score"] = score
+            s["_score"]    = score
+            s["_category"] = classify_dip_category(fund, score, is_bluechip(fund))
             tier3.append(s)
     tier3.sort(key=lambda x: x.get("_score", 0), reverse=True)
     _last_tier3 = tier3
@@ -1194,20 +1327,20 @@ def send_close_summary() -> None:
         for s in tier3[:5]:
             sym          = s["symbol"]
             score        = s.get("_score", 0)
+            category     = s.get("_category", "🔄 Rotação")
             fund         = fund_cache.get(sym, {})
             mc_b         = (fund.get("market_cap") or 0) / 1e9
             sector_label = get_sector_config(fund.get("sector", "")).get("label", "") or fund.get("sector", "")
             price        = fund.get("price", 0)
             earnings     = get_earnings_date(sym)
             catalyst     = get_catalyst(sym, fund.get("name", ""))
-            _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change)
+            _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change, category=category)
             in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
-            # Regista no log e obtém contexto temporal
-            log_key = f"{sym}_{today_iso}"
+            log_key      = f"{sym}_{today_iso}"
             dip_log[log_key] = score
-            context_str = _get_dip_context(sym, score, dip_log)
+            context_str  = _get_dip_context(sym, score, dip_log)
             lines.append(f"  🔥 *{sym}*{in_portfolio} — Score {score:.0f}/100 | ${price} | ${mc_b:.1f}B | {sector_label}")
-            lines.append(f"  _{context_str}_")
+            lines.append(f"  _{category} | {context_str}_")
             lines.append(f"     {strategy}")
             lines.append("")
         rest_high = [s for s in tier3[5:] if s.get("_score", 0) >= 80]
@@ -1228,6 +1361,7 @@ def send_close_summary() -> None:
                     "dip_score":     score,
                     "fundamentals":  fund,
                     "tier":          tier_num,
+                    "category":      classify_dip_category(fund, score, is_bluechip(fund)),
                     "earnings_date": get_earnings_date(sym),
                     "earnings_days": get_earnings_days(sym),
                     "catalyst":      get_catalyst(sym, fund.get("name", "")),
@@ -1254,12 +1388,13 @@ def handle_tier3_command() -> str:
         "",
     ]
     for s in _last_tier3:
-        sym   = s["symbol"]
-        score = s.get("_score", 0)
-        chg   = s.get("change_pct", 0)
-        mc_b  = (s.get("market_cap") or 0) / 1e9
+        sym      = s["symbol"]
+        score    = s.get("_score", 0)
+        category = s.get("_category", "🔄 Rotação")
+        chg      = s.get("change_pct", 0)
+        mc_b     = (s.get("market_cap") or 0) / 1e9
         in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
-        lines.append(f"  🔥 *{sym}*{in_portfolio} — Score {score:.0f}/100 | {chg:.1f}% | ${mc_b:.1f}B")
+        lines.append(f"  🔥 *{sym}*{in_portfolio} — Score {score:.0f}/100 | {chg:.1f}% | ${mc_b:.1f}B | {category}")
     lines.append(f"\n_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)
 
@@ -1285,11 +1420,20 @@ if __name__ == "__main__":
         is_market_open=is_market_open,
         tier3_handler=handle_tier3_command,
         analyze_ticker=handle_analyze_ticker,
+        mldata_handler=handle_mldata_command,
     )
     bot_commands.start_bot_listener()
 
     has_volume = pathlib.Path("/data").exists()
     tavily_ok  = bool(os.environ.get("TAVILY_API_KEY"))
+
+    # Stats da DB ML no boot
+    try:
+        db_stats   = get_db_stats()
+        db_total   = db_stats.get("total", 0)
+        db_str     = f"✅ {db_total} registos" if db_total > 0 else "🆕 vazia (a começar)"
+    except Exception:
+        db_str = "⚠️ erro ao ler"
 
     send_telegram(
         f"🤖 *DipRadar iniciado* ⚠️\n"
@@ -1297,12 +1441,14 @@ if __name__ == "__main__":
         f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥80 🔥)\n"
         f"Score: 0–100 | Min alerta: {MIN_DIP_SCORE}/100\n"
         f"Badges: 🔥≥80 · ⭐55–79 · 📊<55\n"
+        f"Categorias: 🏛️ Hold Forever · 🏠 Apartamento · 🔄 Rotação\n"
         f"Portfolio stress: >{STRESS_PCT:.0f}% posição | >3% total\n"
         f"Recovery alert: +{RECOVERY_PCT:.0f}% do preço de alerta\n"
         f"Stop temporal recovery: 60 dias sem recuperação\n"
         f"Backtesting: ✅ automático às 21h30\n"
+        f"Base de dados ML: {db_str}\n"
         f"Watchlist pessoal: {'✅ ' + str(len(WATCHLIST)) + ' stocks' if WATCHLIST_ENABLED else '⚠️ inactiva'}\n"
-        f"Comandos: /help /status /carteira /scan /analisar /backtest /rejeitados /tier3\n"
+        f"Comandos: /help /status /carteira /scan /analisar /backtest /rejeitados /tier3 /mldata\n"
         f"Persistência: {('✅ /data/') if has_volume else '⚠️ /tmp/ — configura Railway Volume'}\n"
         f"Tavily: {('✅') if tavily_ok else '⚠️ não configurado'}\n"
         f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
@@ -1319,11 +1465,11 @@ if __name__ == "__main__":
         lambda: (
             _alerted_today.clear(), save_alerts(_alerted_today),
             _stress_alerted.clear(),
+            logging.info("Alertas do dia limpos.")
         )
     )
 
-    run_scan()
-
+    logging.info("Scheduler configurado. A entrar no loop principal...")
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        time.sleep(30)
