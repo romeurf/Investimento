@@ -167,20 +167,22 @@ def add_recovery_position(
     score: float,
     target_pct: float,
     verdict: str,
+    category: str = "",
 ) -> None:
     positions = load_recovery_watch()
     if any(p["symbol"] == symbol for p in positions):
         return
     positions.append({
-        "symbol":       symbol,
-        "price_alert":  price_alert,
-        "score":        score,
-        "target_pct":   target_pct,
-        "target_price": round(price_alert * (1 + target_pct / 100), 2),
-        "verdict":      verdict,
-        "date":         datetime.now().strftime("%d/%m/%Y"),
-        "date_iso":     datetime.now().date().isoformat(),
-        "alerted":      False,
+        "symbol":        symbol,
+        "price_alert":   price_alert,
+        "score":         score,
+        "target_pct":    target_pct,
+        "target_price":  round(price_alert * (1 + target_pct / 100), 2),
+        "verdict":       verdict,
+        "category":      category,
+        "date":          datetime.now().strftime("%d/%m/%Y"),
+        "date_iso":      datetime.now().date().isoformat(),
+        "alerted":       False,
         "stale_alerted": False,
     })
     save_recovery_watch(positions)
