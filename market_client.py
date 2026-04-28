@@ -45,7 +45,7 @@ _CATALYST_KEYWORDS = {
     "partnership": "🤝 Parceria estratégica",
 }
 
-# ── Feriados NYSE hardcoded (anos 2025-2027) ────────────────────────────────
+# ── Feriados NYSE hardcoded (anos 2025-2027) ───────────────────────────────────
 _NYSE_HOLIDAYS = {
     date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17),
     date(2025, 4, 18), date(2025, 5, 26), date(2025, 6, 19),
@@ -61,7 +61,7 @@ _NYSE_HOLIDAYS = {
     date(2027, 12, 24),
 }
 
-# ── Horas de mercado NYSE/NASDAQ ─────────────────────────────────────────
+# ── Horas de mercado NYSE/NASDAQ ───────────────────────────────────────
 _MARKET_OPEN_UTC  = 13
 _MARKET_OPEN_MIN  = 30
 _MARKET_CLOSE_UTC = 20
@@ -77,6 +77,28 @@ def is_market_open() -> bool:
     open_dt  = now.replace(hour=_MARKET_OPEN_UTC,  minute=_MARKET_OPEN_MIN,  second=0, microsecond=0)
     close_dt = now.replace(hour=_MARKET_CLOSE_UTC, minute=_MARKET_CLOSE_MIN, second=0, microsecond=0)
     return open_dt <= now <= close_dt
+
+
+def get_macro_context() -> dict:
+    """VIX actual + SPY vs média móvel 20 dias."""
+    result = {"vix": None, "spy_vs_20d": None, "spy_price": None}
+    try:
+        time.sleep(2)
+        vix = yf.Ticker("^VIX").info or {}
+        result["vix"] = round(float(vix.get("regularMarketPrice", 0)), 1) or None
+    except Exception as e:
+        logging.warning(f"VIX: {e}")
+    try:
+        time.sleep(2)
+        hist = yf.Ticker("SPY").history(period="30d", interval="1d")["Close"].dropna()
+        if len(hist) >= 20:
+            price_now = float(hist.iloc[-1])
+            ma20 = float(hist.iloc[-20:].mean())
+            result["spy_price"] = round(price_now, 2)
+            result["spy_vs_20d"] = round((price_now - ma20) / ma20 * 100, 2)
+    except Exception as e:
+        logging.warning(f"SPY MA20: {e}")
+    return result
 
 
 def screen_global_dips(
@@ -589,7 +611,7 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
         })
         total_eur += value_eur
 
-    # ── CashBack Pie ─────────────────────────────────────────────────
+    # ── CashBack Pie ────────────────────────────────────────────────────────
     cashback_total = sum(cashback_eur.values())
     total_eur     += cashback_total
     pie_pnl_day    = 0.0
@@ -598,7 +620,7 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
         if p and p.get("yesterday") and p["yesterday"] > 0:
             pie_pnl_day += val_eur * (p["now"] - p["yesterday"]) / p["yesterday"]
 
-    # ── PPR (ISIN PTARMJHM0003, proxy ACWI) ─────────────────────────────
+    # ── PPR (ISIN PTARMJHM0003, proxy ACWI) ────────────────────────────────────
     # Valor real = shares * preço_actual_ACWI * usd_eur
     # Custo histórico = shares * avg_cost (em EUR, já convertido na compra)
     ppr_cost      = ppr_shares * ppr_avg_cost   # custo total histórico em EUR
@@ -630,7 +652,7 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
     total_eur  += ppr_value_eur
     total_cost += ppr_cost
 
-    # ── Agregação P&L ─────────────────────────────────────────────────
+    # ── Agregação P&L ─────────────────────────────────────────────────────
     agg_day   = sum(p["pnl_day"]   for p in positions if p["pnl_day"]   is not None) + pie_pnl_day
     agg_week  = sum(p["pnl_week"]  for p in positions if p["pnl_week"]  is not None)
     agg_month = sum(p["pnl_month"] for p in positions if p["pnl_month"] is not None)
