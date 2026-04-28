@@ -35,7 +35,10 @@ from market_client import (
     get_usdeur, get_portfolio_snapshot,
     get_macro_context,
 )
-from portfolio import HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, DIRECT_TICKERS, FLIP_FUND_EUR
+from portfolio import (
+    HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST,
+    DIRECT_TICKERS, FLIP_FUND_EUR, suggest_position_size,
+)
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
 from score import calculate_dip_score, build_score_breakdown
@@ -699,21 +702,34 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
     lines.append("")
     top = sorted(entries, key=lambda x: x["dip_score"], reverse=True)[:8]
     for i, entry in enumerate(top, 1):
-        sym      = entry["symbol"]
-        s        = entry["dip_score"]
-        tier     = entry["tier"]
-        f        = entry["fundamentals"]
-        earnings = entry.get("earnings_date")
-        catalyst = entry.get("catalyst")
-        price    = f.get("price", 0)
-        mc_b     = (f.get("market_cap") or 0) / 1e9
-        in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
-        _, strategy  = calculate_flip_target(f, s, earnings, catalyst, spy_change)
-        badge        = score_badge(s)
-        tier_badge   = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
+        sym           = entry["symbol"]
+        s             = entry["dip_score"]
+        tier          = entry["tier"]
+        f             = entry["fundamentals"]
+        earnings      = entry.get("earnings_date")
+        earnings_days = entry.get("earnings_days")
+        catalyst      = entry.get("catalyst")
+        price         = f.get("price", 0)
+        mc_b          = (f.get("market_cap") or 0) / 1e9
+        beta          = f.get("beta")
+        in_portfolio  = " 📦" if sym in DIRECT_TICKERS else ""
+        _, strategy   = calculate_flip_target(f, s, earnings, catalyst, spy_change)
+        badge         = score_badge(s)
+        tier_badge    = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
+
+        # ── Position sizing ───────────────────────────────────────────────
+        _, sizing_str = suggest_position_size(
+            score=s,
+            beta=beta,
+            earnings_days=earnings_days,
+            spy_change=spy_change,
+        )
+
         lines.append(f"*{i}. {sym}*{in_portfolio} {tier_badge} | Score {s:.0f}/100 {badge}")
         lines.append(f"   💰 ${price} | 🏦 ${mc_b:.1f}B")
         lines.append(f"   {strategy}")
+        if sizing_str:
+            lines.append(f"   💶 *Sizing:* {sizing_str}")
         lines.append("")
     return "\n".join(lines)
 
@@ -841,6 +857,20 @@ def handle_analyze_ticker(symbol: str) -> str:
             lines.append(f"  _{reason}_")
 
         lines += ["", f"*🎯 Target de venda:*", f"  {strategy}", ""]
+
+        # ── Position Sizing ──────────────────────────────────────────────
+        try:
+            beta = fund.get("beta")
+            _, sizing_str = suggest_position_size(
+                score=dip_score,
+                beta=beta,
+                earnings_days=earnings_days,
+                spy_change=spy_change,
+            )
+            if sizing_str:
+                lines += [f"*💶 Sizing sugerido:* {sizing_str}", ""]
+        except Exception as sz_err:
+            logging.debug(f"[/analisar] sizing {symbol}: {sz_err}")
 
         # ── Score Breakdown ──────────────────────────────────────────────
         try:
@@ -1175,6 +1205,7 @@ def send_close_summary() -> None:
                     "fundamentals":  fund,
                     "tier":          tier_num,
                     "earnings_date": get_earnings_date(sym),
+                    "earnings_days": get_earnings_days(sym),
                     "catalyst":      get_catalyst(sym, fund.get("name", "")),
                 })
 
