@@ -20,9 +20,16 @@ Critérios e pesos:
   Técnico:
     +10  RSI < 30  |  +5 se < 40
 
-  Catalisador:
-    +15  Earnings ≤30 dias
-    + 5  Earnings ≤60 dias
+  *** Earnings: REMOVIDO do score ***
+  Earnings NÃO pontuam — entrar antes de earnings é risco puro para flip.
+  Os alertas de earnings continuam a ser mostrados como aviso separado.
+
+  Relative Strength vs sector:
+    +10  Stock caiu ≤50% do que o sector (correcção idiossincrática ou sobre-reacção)
+    - 5  Stock caiu >3x o sector (fuga de capital estrutural)
+
+  Dip within uptrend (SMA50):
+    +10  Preço actual > SMA50 (dip dentro de tendência ascendente)
 
   Capitulação:
     +10  Volume spike > 1.5x média
@@ -51,6 +58,8 @@ Equivalências antigas (escala 20):
   10/20  →  ~50/100  (MIN_DIP_SCORE default → 50)
 """
 
+import time
+import logging
 from datetime import datetime, timedelta
 from market_client import get_rsi
 from sectors import get_sector_config
@@ -87,16 +96,42 @@ def _get_insider_bought(symbol: str) -> bool:
         return False
 
 
+def get_sma50(symbol: str) -> float | None:
+    """Devolve SMA50 diária. None se não houver dados suficientes."""
+    try:
+        import yfinance as yf
+        time.sleep(2)
+        hist = yf.Ticker(symbol).history(period="80d", interval="1d")["Close"].dropna()
+        if len(hist) >= 50:
+            return float(hist.iloc[-50:].mean())
+    except Exception as e:
+        logging.debug(f"SMA50 {symbol}: {e}")
+    return None
+
+
+def get_relative_strength(symbol: str, sector_change: float | None) -> float | None:
+    """
+    Devolve a variação do stock no dia (%).
+    A comparação com sector_change é feita externamente no calculate_dip_score.
+    Retorna None se não disponível.
+    """
+    # O change_pct do stock vem dos fundamentals — não precisamos de nova chamada.
+    # Esta função fica disponível para uso futuro.
+    return None
+
+
 def calculate_dip_score(
     fundamentals: dict,
     symbol: str,
-    earnings_days: int | None = None,
+    earnings_days: int | None = None,  # mantido na assinatura para retrocompatibilidade, mas NÃO pontua
     sector_change: float | None = None,
+    stock_change_pct: float | None = None,  # variação % do stock no dia
 ) -> tuple[float, str | None]:
     """
     Devolve (score, rsi_str). Escala 0-100.
-    earnings_days  : dias até próximos earnings (None = desconhecido).
-    sector_change  : variação % do ETF sectorial (passar de get_sector_change() em main.py).
+    earnings_days    : mantido para compatibilidade — NÃO afecta o score.
+    sector_change    : variação % do ETF sectorial (para relative strength e penalização).
+    stock_change_pct : variação % do stock no dia (para relative strength).
     """
     score = 0
 
@@ -105,6 +140,7 @@ def calculate_dip_score(
     rev_growth = fundamentals.get("revenue_growth") or 0
     sector     = fundamentals.get("sector", "")
 
+    # FCF
     if fcf_yield is not None:
         if fcf_yield > 0.05:
             score += 20
@@ -118,57 +154,80 @@ def calculate_dip_score(
             else:
                 score -= 10
 
+    # Revenue growth
     if rev_growth > 0.10:
         score += 15
     elif rev_growth > 0.05:
         score += 5
 
+    # Gross margin
     gross_margin     = fundamentals.get("gross_margin") or 0
     margin_threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
     if gross_margin > margin_threshold:
         score += 10
 
+    # RSI
     if rsi_val is not None:
         if rsi_val < 30:
             score += 10
         elif rsi_val < 40:
             score += 5
 
-    if earnings_days is not None and earnings_days >= 0:
-        if earnings_days <= 30:
-            score += 15
-        elif earnings_days <= 60:
-            score += 5
+    # ── Earnings: REMOVIDO do score ──────────────────────────────────────
+    # earnings_days não pontua — é mostrado como aviso independente no output.
 
+    # Relative Strength vs sector
+    if stock_change_pct is not None and sector_change is not None and sector_change != 0:
+        ratio = stock_change_pct / sector_change  # ambos negativos → ratio positivo se semelhantes
+        if ratio >= 0.5:  # stock caiu ≤50% do que o sector → sobre-reacção relativa
+            score += 10
+        elif ratio > 3.0:  # stock caiu >3x o sector → fuga estrutural
+            score -= 5
+
+    # Dip within uptrend — SMA50
+    price = fundamentals.get("price") or 0
+    if price > 0:
+        sma50 = get_sma50(symbol)
+        if sma50 is not None and price > sma50:
+            score += 10
+
+    # Volume spike (capitulação)
     volume         = fundamentals.get("volume") or 0
     average_volume = fundamentals.get("average_volume") or 0
     if volume and average_volume and average_volume > 0 and volume > average_volume * 1.5:
         score += 10
 
+    # Analyst upside
     analyst_upside = fundamentals.get("analyst_upside") or 0
     if analyst_upside > 25:
         score += 10
 
+    # Insider buying
     if _get_insider_bought(symbol):
         score += 8
 
+    # Drawdown 52w
     drawdown = fundamentals.get("drawdown_from_high") or 0
     if drawdown < -20:
         score += 10
 
+    # Market cap
     mc = fundamentals.get("market_cap") or 0
     if mc >= 10_000_000_000:
         score += 5
 
+    # D/E
     debt_equity = fundamentals.get("debt_equity", 999)
     if debt_equity is not None and debt_equity < 100:
         score += 5
 
+    # PE vs fair
     pe      = fundamentals.get("pe") or 0
     pe_fair = get_sector_config(sector).get("pe_fair", 22)
     if pe and pe > 0 and pe_fair and pe < pe_fair * 0.75:
         score += 5
 
+    # Sector rotation penalty
     if sector_change is not None and sector_change <= -2.0:
         score -= 10
 
@@ -182,11 +241,11 @@ def build_score_breakdown(
     symbol: str,
     earnings_days: int | None = None,
     sector_change: float | None = None,
+    stock_change_pct: float | None = None,
 ) -> list[str]:
     """
     Devolve lista de linhas descritivas para cada critério do score.
     Cada linha começa com ✅ (positivo), ❌ (negativo) ou ⬜ (neutro/não aplicável).
-    Uso: append ao output do /analisar para transparência total.
     """
     lines: list[str] = []
 
@@ -238,16 +297,42 @@ def build_score_breakdown(
     else:
         lines.append("⬜ RSI — sem dados")
 
-    # Earnings
+    # Earnings — aviso informativo apenas (não pontua)
     if earnings_days is not None and earnings_days >= 0:
-        if earnings_days <= 30:
-            lines.append(f"✅ Earnings em {earnings_days}d — catalisador próximo (+15)")
-        elif earnings_days <= 60:
-            lines.append(f"✅ Earnings em {earnings_days}d — catalisador médio (+5)")
+        if earnings_days <= 7:
+            lines.append(f"🔴 Earnings em {earnings_days}d — RISCO ALTO (não pontua, cuidado em flip)")
+        elif earnings_days <= 21:
+            lines.append(f"🟡 Earnings em {earnings_days}d — atenção (não pontua)")
         else:
-            lines.append(f"⬜ Earnings em {earnings_days}d (sem pts)")
+            lines.append(f"📅 Earnings em {earnings_days}d (informativo)")
     else:
         lines.append("⬜ Earnings — data desconhecida")
+
+    # Relative Strength
+    if stock_change_pct is not None and sector_change is not None and sector_change != 0:
+        ratio = stock_change_pct / sector_change
+        if ratio >= 0.5:
+            lines.append(f"✅ Relative strength: stock {stock_change_pct:.1f}% vs sector {sector_change:.1f}% — sobre-reacção (+10)")
+        elif ratio > 3.0:
+            lines.append(f"❌ Relative strength: stock {stock_change_pct:.1f}% vs sector {sector_change:.1f}% — fuga estrutural (-5)")
+        else:
+            lines.append(f"⬜ Relative strength: {ratio:.1f}x sector (sem pts)")
+    else:
+        lines.append("⬜ Relative strength — sector change indisponível")
+
+    # SMA50 — dip within uptrend
+    price = fundamentals.get("price") or 0
+    if price > 0:
+        sma50 = get_sma50(symbol)
+        if sma50 is not None:
+            if price > sma50:
+                lines.append(f"✅ Preço ${price:.2f} > SMA50 ${sma50:.2f} — dip em tendência (+10)")
+            else:
+                lines.append(f"⬜ Preço ${price:.2f} < SMA50 ${sma50:.2f} — tendência quebrada (sem pts)")
+        else:
+            lines.append("⬜ SMA50 — sem dados suficientes")
+    else:
+        lines.append("⬜ SMA50 — preço indisponível")
 
     # Volume spike
     volume         = fundamentals.get("volume") or 0
