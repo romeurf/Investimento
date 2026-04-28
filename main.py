@@ -402,7 +402,7 @@ def send_weekly_dip_scan() -> None:
             earnings_days  = get_earnings_days(sym)
             sector_chg     = get_sector_change(fund.get("sector", ""))
             score, rsi_str = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg)
-            if score >= 70:  # equiv. a 14/20 na escala antiga
+            if score >= 70:
                 scored.append({
                     "symbol":         sym,
                     "score":          score,
@@ -557,7 +557,7 @@ def send_saturday_report() -> None:
         lines.append(f"  _Erro: {e}_")
 
     save_weekly_log([])
-    lines += ["", "_⏰ Próximo report: sábado às 10h_")
+    lines += ["", "_⏰ Próximo report: sábado às 10h_"]
     send_telegram("\n".join(lines))
     logging.info("Saturday report enviado.")
 
@@ -588,7 +588,7 @@ def calculate_flip_target(
     price = fundamentals.get("price") or 0
     if not price or price <= 0:
         return "N/D", "SEM DADOS"
-    if is_bluechip(fundamentals) and dip_score >= 60:  # equiv. 12/20
+    if is_bluechip(fundamentals) and dip_score >= 60:
         return "HOLD ETERNO", "💎 Blue chip — Adicionar em dips, nunca vender"
     sector         = fundamentals.get("sector", "")
     sector_cfg     = get_sector_config(sector)
@@ -608,8 +608,8 @@ def calculate_flip_target(
     weighted_price  = sum(weights[n] * t for n, t in anchors) / total_w
     weighted_upside = (weighted_price / price) - 1
     sector_cap      = _SECTOR_FLIP_CAP.get(sector, 0.30)
-    if dip_score >= 90:   sector_cap *= 1.20  # equiv. 18/20
-    elif dip_score >= 75: sector_cap *= 1.10  # equiv. 15/20
+    if dip_score >= 90:   sector_cap *= 1.20
+    elif dip_score >= 75: sector_cap *= 1.10
     final_upside = min(weighted_upside, sector_cap)
     final_target = price * (1 + final_upside)
     macro_flag   = f" | 🌍 Queda macro SPY {spy_change:.1f}% — timeline incerta" if spy_change and spy_change <= -2.0 else ""
@@ -678,8 +678,8 @@ def build_alert(
     region_part  = f" ({stock['region']})" if stock.get("region") else ""
     in_portfolio = " 📦 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
 
-    badge_str    = score_badge(dip_score)
-    score_line   = f"{badge_str} Score: {dip_score:.0f}/100"
+    badge_str  = score_badge(dip_score)
+    score_line = f"{badge_str} Score: {dip_score:.0f}/100"
 
     vol          = fundamentals.get("volume") or 0
     avg_vol      = fundamentals.get("average_volume") or 0
@@ -687,8 +687,8 @@ def build_alert(
     insider_flag = get_insider_buy_flag(symbol)
     short_flag   = get_short_interest_flag(fundamentals)
 
-    sector_chg   = get_sector_change(sector)
-    sector_warn  = f" | 🟠 Sector {sector_chg:+.1f}% (rotation?)" if sector_chg is not None and sector_chg <= -2.0 else ""
+    sector_chg  = get_sector_change(sector)
+    sector_warn = f" | 🟠 Sector {sector_chg:+.1f}% (rotation?)" if sector_chg is not None and sector_chg <= -2.0 else ""
 
     rsi_part = f" | RSI: {rsi_str}" if rsi_str else ""
 
@@ -714,6 +714,91 @@ def build_alert(
             lines.append(f"  [{title}]({url}){' _' + source + '_' if source else ''}")
     lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)
+
+
+# ── Análise on-demand (/analisar) ────────────────────────────────────────────
+
+def handle_analyze_ticker(symbol: str) -> str:
+    """
+    Análise completa de qualquer ticker a pedido do utilizador.
+    Devolve uma string formatada para envio via Telegram.
+    Sem filtro de score mínimo — mostra sempre o resultado.
+    """
+    symbol = symbol.upper().strip()
+    logging.info(f"[/analisar] A analisar {symbol}...")
+    try:
+        fund = get_fundamentals(symbol, "", min_market_cap=0)  # sem filtro de cap
+        if not fund or fund.get("skip"):
+            return (
+                f"⚠️ *{symbol}* não encontrado ou dados insuficientes.\n"
+                f"_Verifica se o ticker está correcto (ex: AAPL, NVDA, MSFT)_"
+            )
+
+        sector         = fund.get("sector", "")
+        sector_cfg     = get_sector_config(sector)
+        verdict, emoji, reasons = score_fundamentals(fund, sector)
+        earnings_days  = get_earnings_days(symbol)
+        earnings_date  = get_earnings_date(symbol)
+        sector_chg     = get_sector_change(sector)
+        spy_change     = get_spy_change()
+        dip_score, rsi_str = calculate_dip_score(
+            fund, symbol, earnings_days, sector_change=sector_chg
+        )
+        historical_pe  = get_historical_pe(symbol)
+        news           = get_news(symbol)
+        catalyst       = get_catalyst(symbol, fund.get("name", ""))
+        _, strategy    = calculate_flip_target(fund, dip_score, earnings_date, catalyst, spy_change)
+
+        name         = fund.get("name", symbol)
+        price        = fund.get("price") or 0
+        mc_b         = (fund.get("market_cap") or 0) / 1e9
+        drawdown     = fund.get("drawdown_from_high")
+        drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
+        in_portfolio = " 📦 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
+        bc_tag       = " 💎 Blue chip" if is_bluechip(fund) else ""
+
+        badge_str  = score_badge(dip_score)
+        score_line = f"{badge_str} Score: {dip_score:.0f}/100"
+
+        vol      = fund.get("volume") or 0
+        avg_vol  = fund.get("average_volume") or 0
+        vol_flag     = " | 📈 Volume spike" if vol and avg_vol and vol > avg_vol * 1.5 else ""
+        insider_flag = get_insider_buy_flag(symbol)
+        short_flag   = get_short_interest_flag(fund)
+        sector_warn  = f" | 🟠 Sector {sector_chg:+.1f}% hoje" if sector_chg is not None and sector_chg <= -2.0 else ""
+        rsi_part     = f" | RSI: {rsi_str}" if rsi_str else ""
+        earn_tag     = f" | 📅 Earnings em {earnings_days}d" if earnings_days is not None else ""
+        spy_str      = f" | SPY: {spy_change:+.1f}%" if spy_change is not None else ""
+
+        lines = [
+            f"🔍 *Análise: {symbol} — {name}*{in_portfolio}{bc_tag}",
+            f"💰 Preço: *${price}*{drawdown_str}{spy_str}",
+            f"🏦 Market cap: ${mc_b:.1f}B | 🏢 {sector_cfg.get('label', sector) or sector}",
+            f"{score_line}{rsi_part}{earn_tag}{vol_flag}{insider_flag}{short_flag}{sector_warn}",
+            "",
+            f"*{emoji} Veredito: {verdict}*",
+        ]
+        for reason in reasons:
+            lines.append(f"  _{reason}_")
+
+        lines += ["", f"*🎯 Target de venda:*", f"  {strategy}", ""]
+        lines += ["", "*📊 Fundamentos:*"]
+        lines.append(format_valuation_block(fund, historical_pe, sector))
+
+        if news:
+            lines += ["", "*📰 Notícias:*"]
+            for item in news[:3]:
+                title  = item["title"][:70]
+                url    = item["url"]
+                source = item.get("source", "")
+                lines.append(f"  [{title}]({url}){' _' + source + '_' if source else ''}")
+
+        lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')} — via /analisar_")
+        return "\n".join(lines)
+
+    except Exception as e:
+        logging.error(f"[/analisar] {symbol}: {e}")
+        return f"❌ Erro ao analisar *{symbol}*: `{e}`"
 
 
 # ── Scan contínuo ─────────────────────────────────────────────────────────
@@ -862,7 +947,7 @@ def send_close_summary() -> None:
         fund = _get_fund(sym, s.get("region", ""))
         if fund.get("skip"): continue
         score = _get_score(sym, fund)
-        if score >= 80:  # equiv. 16/20 — Rare Gem
+        if score >= 80:
             s["_score"] = score
             tier3.append(s)
     tier3.sort(key=lambda x: x.get("_score", 0), reverse=True)
@@ -929,7 +1014,7 @@ def send_close_summary() -> None:
             fund = _get_fund(sym, s.get("region", ""))
             if fund.get("skip"): continue
             score = _get_score(sym, fund)
-            if score >= 55:  # equiv. 11/20
+            if score >= 55:
                 ranking_entries.append({
                     "symbol":        sym,
                     "dip_score":     score,
@@ -988,6 +1073,7 @@ if __name__ == "__main__":
         rejected_log=load_rejected_log,
         is_market_open=is_market_open,
         tier3_handler=handle_tier3_command,
+        analyze_ticker=handle_analyze_ticker,
     )
     bot_commands.start_bot_listener()
 
@@ -1004,7 +1090,7 @@ if __name__ == "__main__":
         f"Recovery alert: +{RECOVERY_PCT:.0f}% do preço de alerta\n"
         f"Backtesting: ✅ automático às 21h30\n"
         f"Watchlist pessoal: {'✅ ' + str(len(WATCHLIST)) + ' stocks' if WATCHLIST_ENABLED else '⚠️ inactiva'}\n"
-        f"Comandos: /help /status /carteira /scan /backtest /rejeitados /tier3\n"
+        f"Comandos: /help /status /carteira /scan /analisar /backtest /rejeitados /tier3\n"
         f"Persistência: {('✅ /data/') if has_volume else '⚠️ /tmp/ — configura Railway Volume'}\n"
         f"Tavily: {('✅') if tavily_ok else '⚠️ não configurado'}\n"
         f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
