@@ -44,7 +44,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "IS3N.AS",
         "name":     "iShares Core MSCI EM IMI",
         "slot":     "P1",
-        "category": CATEGORY_ROTACAO,  # ETF — entrada tática em correção
+        "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 12.0},
         ],
@@ -56,7 +56,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "O",
         "name":     "Realty Income",
         "slot":     "P2",
-        "category": CATEGORY_APARTAMENTO,  # REIT de dividendo mensal — paga para esperar
+        "category": CATEGORY_APARTAMENTO,
         "criteria": [
             {"type": "dividend_yield", "value": 5.5},
             {"type": "price_below",    "value": 50.0},
@@ -67,7 +67,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "MDT",
         "name":     "Medtronic",
         "slot":     "P2",
-        "category": CATEGORY_APARTAMENTO,  # Healthcare dividendo — yield paga a espera pela reprecificação
+        "category": CATEGORY_APARTAMENTO,
         "criteria": [
             {"type": "dividend_yield", "value": 4.0},
             {"type": "price_below",    "value": 80.0},
@@ -78,7 +78,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "ABBV",
         "name":     "AbbVie",
         "slot":     "P2",
-        "category": CATEGORY_APARTAMENTO,  # Pharma dividendo — pipeline Skyrizi/Rinvoq suporta tese longa
+        "category": CATEGORY_APARTAMENTO,
         "criteria": [
             {"type": "dividend_yield",  "value": 4.0},
             {"type": "change_day_pct",  "value": 15.0},
@@ -89,7 +89,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "LMT",
         "name":     "Lockheed Martin",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,  # Defesa — entrada tática em dip; sem yield suficiente para Apartamento
+        "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "change_day_pct",   "value": 10.0},
             {"type": "drawdown_52w_pct", "value": 20.0},
@@ -100,7 +100,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "RTX",
         "name":     "RTX (Raytheon)",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,  # Defesa — mesma lógica que LMT
+        "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "change_day_pct",   "value": 10.0},
             {"type": "drawdown_52w_pct", "value": 20.0},
@@ -113,7 +113,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "CRWD",
         "name":     "CrowdStrike",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,  # Cybersecurity growth — sem dividendo, entrada tática
+        "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 20.0},
         ],
@@ -133,7 +133,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "TSM",
         "name":     "Taiwan Semiconductor",
         "slot":     "P2",
-        "category": CATEGORY_ROTACAO,  # Semi — risco geopolítico exclui Hold Forever
+        "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 15.0},
             {"type": "change_day_pct",   "value": 12.0},
@@ -156,7 +156,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "ALV.DE",
         "name":     "Allianz",
         "slot":     "P3",
-        "category": CATEGORY_APARTAMENTO,  # Seguradora europeia — yield sólido + correção = Apartamento
+        "category": CATEGORY_APARTAMENTO,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 15.0},
         ],
@@ -184,7 +184,7 @@ def _get_ticker_data(symbol: str) -> dict | None:
 
         price      = info.get("regularMarketPrice") or info.get("currentPrice") or 0
         high_52w   = info.get("fiftyTwoWeekHigh") or 0
-        div_yield  = (info.get("dividendYield") or 0) * 100  # converter para %
+        div_yield  = (info.get("dividendYield") or 0) * 100
         prev_close = info.get("regularMarketPreviousClose") or price
         change_day = abs((price - prev_close) / prev_close * 100) if prev_close else 0
         drawdown   = (high_52w - price) / high_52w * 100 if high_52w else 0
@@ -201,6 +201,13 @@ def _get_ticker_data(symbol: str) -> dict | None:
             "name":        name,
             "mc_b":        mc / 1e9,
             "sector":      sector,
+            # Campos extra para _check_category_divergence
+            "market_cap":      mc,
+            "free_cashflow":   info.get("freeCashflow"),
+            "gross_margins":   info.get("grossMargins") or 0,
+            "debt_to_equity":  info.get("debtToEquity"),
+            "revenue_growth":  info.get("revenueGrowth") or 0,
+            "dividend_yield_raw": info.get("dividendYield") or 0,
         }
     except Exception as e:
         logging.warning(f"[watchlist] {symbol}: {e}")
@@ -242,8 +249,10 @@ def _check_category_divergence(
     Devolve uma linha de aviso se divergirem, None se estiverem alinhadas
     ou se não houver intenção definida.
 
+    Usa os dados já recolhidos por _get_ticker_data() — sem chamadas extra ao yfinance.
+
     Filosofia:
-      - watchlist.category = INTENÇÃO (tu decides a gaveta estratégica)
+      - watchlist.category = INTENÇÃO (a gaveta estratégica que definiste)
       - score.classify_dip_category() = REALIDADE (os fundamentos de hoje)
       Divergência não bloqueia o alerta — apenas avisa.
     """
@@ -251,22 +260,22 @@ def _check_category_divergence(
         return None
     try:
         from score import classify_dip_category, is_bluechip
-        import yfinance as yf as _yf
-        info = _yf.Ticker(symbol).info
+
+        mc  = data.get("market_cap", 0) or 0
+        fcf = data.get("free_cashflow")
         fundamentals = {
-            "dividend_yield":    (info.get("dividendYield") or 0),
-            "drawdown_from_high": -data["drawdown"],  # score.py usa negativo
-            "fcf_yield":         info.get("freeCashflow") and info.get("marketCap") and
-                                 info["freeCashflow"] / info["marketCap"] or None,
-            "gross_margin":      info.get("grossMargins") or 0,
-            "debt_equity":       info.get("debtToEquity") or None,
-            "market_cap":        info.get("marketCap") or 0,
-            "revenue_growth":    info.get("revenueGrowth") or 0,
+            "dividend_yield":    data.get("dividend_yield_raw", 0),
+            "drawdown_from_high": -data["drawdown"],   # score.py usa negativo
+            "fcf_yield":         (fcf / mc) if (fcf and mc > 0) else None,
+            "gross_margin":      data.get("gross_margins", 0),
+            "debt_equity":       data.get("debt_to_equity"),
+            "market_cap":        mc,
+            "revenue_growth":    data.get("revenue_growth", 0),
             "sector":            data.get("sector", ""),
         }
-        bc_flag  = is_bluechip(fundamentals)
-        # Usa score mínimo neutro (50) — o objectivo é só detectar divergência de categoria
-        reality  = classify_dip_category(fundamentals, dip_score=50, is_bluechip_flag=bc_flag)
+        bc_flag = is_bluechip(fundamentals)
+        # Score neutro (50) — o objectivo é só detectar divergência de categoria
+        reality = classify_dip_category(fundamentals, dip_score=50, is_bluechip_flag=bc_flag)
         if intention != reality:
             return f"⚠️ *ALERTA DE TESE:* Intenção ({intention}) → Modelo ({reality})"
     except Exception as e:
