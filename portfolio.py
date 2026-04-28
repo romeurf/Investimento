@@ -71,3 +71,71 @@ EUR_TICKERS = {"EUNL.DE", "IS3N.AS", "ALV.DE"}
 # Actualiza FLIP_FUND_EUR no Railway após cada depósito ou execução de flip.
 # Não entra no total da carteira — é capital separado para operações rápidas.
 FLIP_FUND_EUR = _float_env("FLIP_FUND_EUR")
+
+
+# ── Position Sizing para Flip Fund ───────────────────────────────────────────
+def suggest_position_size(
+    score: float,
+    beta: float | None = None,
+    earnings_days: int | None = None,
+    spy_change: float | None = None,
+) -> tuple[float, str]:
+    """
+    Sugere o montante em EUR a investir do Flip Fund com base no score,
+    beta, proximidade de earnings e contexto macro.
+
+    Fórmula base:
+        raw = FLIP_FUND_EUR × (score / 100)
+
+    Multiplicadores:
+        beta_mult   = 1 - clamp(beta, 0, 3) × 0.15   → stocks voláteis recebem menos
+        earn_mult   = 0.5 se earnings ≤ 7d            → risco binário reduz tamanho
+        macro_mult  = 0.75 se SPY ≤ -2%               → mercado em stress
+
+    Limites:
+        mínimo  = €20  (abaixo disso não vale os custos de transacção)
+        máximo  = 40% do FLIP_FUND_EUR (max concentration por posição)
+
+    Returns:
+        (amount_eur, explanation_str)
+    """
+    if not FLIP_FUND_EUR or FLIP_FUND_EUR <= 0:
+        return 0.0, "⚠️ FLIP_FUND_EUR não configurado"
+
+    raw = FLIP_FUND_EUR * (score / 100.0)
+
+    # Beta adjustment
+    beta_val  = max(0.0, min(float(beta or 1.0), 3.0))
+    beta_mult = 1.0 - beta_val * 0.15
+    beta_mult = max(0.40, beta_mult)  # floor em 40% para não esmagar demais
+
+    # Earnings proximity — risco binário
+    earn_mult = 1.0
+    earn_note = ""
+    if earnings_days is not None and 0 <= earnings_days <= 7:
+        earn_mult = 0.50
+        earn_note = f" ✂️×0.5 (earnings em {earnings_days}d)"
+    elif earnings_days is not None and earnings_days <= 14:
+        earn_mult = 0.75
+        earn_note = f" ✂️×0.75 (earnings em {earnings_days}d)"
+
+    # Macro context
+    macro_mult = 1.0
+    macro_note = ""
+    if spy_change is not None and spy_change <= -2.0:
+        macro_mult = 0.75
+        macro_note = " 🌍×0.75 (SPY stress)"
+
+    amount = raw * beta_mult * earn_mult * macro_mult
+
+    # Hard limits
+    max_size = FLIP_FUND_EUR * 0.40
+    amount   = max(20.0, min(amount, max_size))
+    amount   = round(amount, 0)
+
+    pct_of_fund = amount / FLIP_FUND_EUR * 100
+    explanation = (
+        f"€{amount:.0f} ({pct_of_fund:.0f}% do Flip Fund)"
+        f" | β={beta_val:.1f}{earn_note}{macro_note}"
+    )
+    return amount, explanation
