@@ -53,7 +53,7 @@ from state import (
 )
 from backtest import backtest_runner, build_backtest_summary
 from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
-from alert_db import log_alert_snapshot, get_db_stats
+from alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
 
 logging.basicConfig(
@@ -77,7 +77,7 @@ _stress_alerted: set  = set()
 _last_tier3:     list = []  # cache para comando /tier3
 
 
-# ── Sector ETF map (para sector rotation signal) ───────────────────────────
+# ── Sector ETF map (para sector rotation signal) ──────────────────────────────────────
 
 _SECTOR_ETF = {
     "Technology":             "XLK",
@@ -116,7 +116,7 @@ def get_sector_change(sector: str) -> float | None:
     return None
 
 
-# ── Helpers de badge (escala 0-100) ─────────────────────────────────────
+# ── Helpers de badge (escala 0-100) ───────────────────────────────────
 
 def score_badge(score: float) -> str:
     if score >= 80:  return "🔥"
@@ -124,7 +124,7 @@ def score_badge(score: float) -> str:
     return "📊"
 
 
-# ── Blue chip detection ───────────────────────────────────────────────────
+# ── Blue chip detection ──────────────────────────────────────────────────
 
 _BLUECHIP_MARGIN_THRESHOLD = {
     "Technology":             0.40,
@@ -152,7 +152,7 @@ def is_bluechip(fundamentals: dict) -> bool:
     return (dividend_yield >= 0.015) or (rev_growth > 0.05 and gross_margin > threshold)
 
 
-# ── Insider buying & short interest flags ────────────────────────────────
+# ── Insider buying & short interest flags ────────────────────────────
 
 def get_insider_buy_flag(symbol: str) -> str:
     try:
@@ -181,7 +181,7 @@ def get_short_interest_flag(fundamentals: dict) -> str:
     return ""
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────
+# ── Telegram ───────────────────────────────────────────────────────────────
 
 def send_telegram(message: str, retries: int = 2) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -215,7 +215,7 @@ def send_telegram(message: str, retries: int = 2) -> bool:
     return all_ok
 
 
-# ── Heartbeat das 9h ──────────────────────────────────────────────────────
+# ── Heartbeat das 9h ──────────────────────────────────────────────────────────
 
 def _pnl_emoji(v: float) -> str:
     return "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
@@ -295,11 +295,11 @@ def send_heartbeat() -> None:
         f"  💜 CashBack Pie: €{snapshot['cashback_eur']:,.2f}",
     ]
 
-    # ── Flip Fund ────────────────────────────────────────────────────────
+    # ── Flip Fund ───────────────────────────────────────────────────────────────
     if FLIP_FUND_EUR:
         lines.append(f"  🎯 *Flip Fund:* €{FLIP_FUND_EUR:,.2f} disponíveis")
 
-    # ── Alertas de concentração ──────────────────────────────────────────────
+    # ── Alertas de concentração ─────────────────────────────────────────────────────
     if total > 0:
         concentration_warnings = []
         for pos in snapshot["positions"]:
@@ -329,7 +329,7 @@ def send_heartbeat() -> None:
         if concentration_warnings:
             lines += ["", "*🚨 Alertas de concentração:*"] + concentration_warnings
 
-    # ── Earnings próximos das posições actuais ───────────────────────────────
+    # ── Earnings próximos das posições actuais ───────────────────────────────────────
     earnings_alerts = []
     for sym, shares, _ in HOLDINGS:
         if not shares:
@@ -363,7 +363,7 @@ def send_heartbeat() -> None:
     logging.info("Heartbeat enviado.")
 
 
-# ── Portfolio Stress Alert ────────────────────────────────────────────────
+# ── Portfolio Stress Alert ───────────────────────────────────────────────────────
 
 def check_portfolio_stress() -> None:
     global _stress_alerted
@@ -415,7 +415,7 @@ def check_portfolio_stress() -> None:
                 logging.warning(f"Portfolio stress MACRO: {pct_total:.1f}%")
 
 
-# ── Recovery Alert ────────────────────────────────────────────────────────
+# ── Recovery Alert ─────────────────────────────────────────────────────────────
 
 def check_recovery_alerts() -> None:
     import yfinance as yf
@@ -423,7 +423,7 @@ def check_recovery_alerts() -> None:
     if not positions:
         return
 
-    # ── Stop temporal: aviso para posições sem recovery há >60 dias ─────
+    # ── Stop temporal: aviso para posições sem recovery há >60 dias ─────────
     try:
         stale = get_stale_recovery_positions(days=60)
         for p in stale:
@@ -444,7 +444,7 @@ def check_recovery_alerts() -> None:
     except Exception as e:
         logging.warning(f"[recovery] Stale check: {e}")
 
-    # ── Check de recovery normal (target atingido) ───────────────────────
+    # ── Check de recovery normal (target atingido) ─────────────────────────
     for pos in positions:
         if pos.get("alerted"):
             continue
@@ -470,7 +470,7 @@ def check_recovery_alerts() -> None:
             logging.warning(f"Recovery check {sym}: {e}")
 
 
-# ── Weekly structural dip scan (segunda-feira 8h45) ───────────────────────
+# ── Weekly structural dip scan (segunda-feira 8h45) ─────────────────────────
 
 def send_weekly_dip_scan() -> None:
     if datetime.now().weekday() != 0:
@@ -531,7 +531,7 @@ def send_weekly_dip_scan() -> None:
     logging.info(f"Weekly scan enviado: {len(scored)} candidatos")
 
 
-# ── Saturday Weekly Report ────────────────────────────────────────────────
+# ── Saturday Weekly Report ────────────────────────────────────────────────────────
 
 def send_saturday_report() -> None:
     if datetime.now().weekday() != 5:
@@ -651,7 +651,7 @@ def send_saturday_report() -> None:
     logging.info("Saturday report enviado.")
 
 
-# ── Target Sell / Flip ────────────────────────────────────────────────────
+# ── Target Sell / Flip ──────────────────────────────────────────────────────────
 
 _SECTOR_FLIP_CAP = {
     "Technology":             0.55,
@@ -680,7 +680,7 @@ def calculate_flip_target(
         return "N/D", "SEM DADOS"
 
     # Hold Forever — nunca vender
-    if category == "🏛️ Hold Forever" or (is_bluechip(fundamentals) and dip_score >= 60):
+    if category == "🏗️ Hold Forever" or (is_bluechip(fundamentals) and dip_score >= 60):
         return "HOLD ETERNO", "💎 Hold Forever — Acumular em dips, nunca vender"
 
     sector         = fundamentals.get("sector", "")
@@ -727,7 +727,7 @@ def calculate_flip_target(
     return f"${final_target:.1f} (+{final_upside*100:.0f}%)", strategy
 
 
-# ── Ranking Flip ──────────────────────────────────────────────────────────
+# ── Ranking Flip ──────────────────────────────────────────────────────────────
 
 def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exclude_syms: set | None = None) -> str:
     if not ranked_entries:
@@ -758,7 +758,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
         badge         = score_badge(s)
         tier_badge    = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
 
-        # ── Position sizing ───────────────────────────────────────────────
+        # ── Position sizing ─────────────────────────────────────────────────
         _, sizing_str = suggest_position_size(
             score=s,
             beta=beta,
@@ -775,7 +775,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
     return "\n".join(lines)
 
 
-# ── Alerta individual ─────────────────────────────────────────────────────
+# ── Alerta individual ─────────────────────────────────────────────────────────────
 
 def build_alert(
     stock, fundamentals, historical_pe, news,
@@ -808,668 +808,364 @@ def build_alert(
 
     rsi_part = f" | RSI: {rsi_str}" if rsi_str else ""
 
-    lines = [
-        f"📉 *{symbol} — {name}{region_part}*{in_portfolio}",
-        f"Queda: *{change:.1f}%*{drawdown_str}",
-        f"💰 Preço: ${price} | 🏦 Cap: ${mc_b:.1f}B",
-        f"🏢 Sector: {sector_cfg.get('label', sector) or sector}",
-        f"{score_line}{rsi_part}{vol_flag}{insider_flag}{short_flag}{sector_warn}",
-        f"📂 *Categoria: {category}*",
-        "",
-        f"*{emoji} Veredito: {verdict}*",
-    ]
-    for reason in reasons:
-        lines.append(f"  _{reason}_")
-    lines += ["", "*📊 Fundamentos:*"]
-    lines.append(format_valuation_block(fundamentals, historical_pe, sector))
-    if news:
-        lines += ["", "*📰 Notícias:*"]
-        for item in news[:3]:
-            title  = item["title"][:70]
-            url    = item["url"]
-            source = item.get("source", "")
-            lines.append(f"  [{title}]({url}){' _' + source + '_' if source else ''}")
-    lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
-    return "\n".join(lines)
+    valuation_block = format_valuation_block(fundamentals, historical_pe)
 
-
-# ── Análise on-demand (/analisar) ────────────────────────────────────────────
-
-def handle_analyze_ticker(symbol: str) -> str:
-    """
-    Análise completa de qualquer ticker a pedido do utilizador.
-    Devolve uma string formatada para envio via Telegram.
-    Sem filtro de score mínimo — mostra sempre o resultado.
-    Inclui score breakdown detalhado critério a critério.
-    """
-    symbol = symbol.upper().strip()
-    logging.info(f"[/analisar] A analisar {symbol}...")
+    spy_change   = get_spy_change()
+    earnings_d   = get_earnings_days(symbol)
+    earn_warn    = f"\n⚠️ *Earnings em {earnings_d} dias!* — Cautela" if earnings_d is not None and earnings_d < 14 else ""
+    catalyst_data = None
     try:
-        fund = get_fundamentals(symbol, "", min_market_cap=0)  # sem filtro de cap
-        if not fund or fund.get("skip"):
-            return (
-                f"⚠️ *{symbol}* não encontrado ou dados insuficientes.\n"
-                f"_Verifica se o ticker está correcto (ex: AAPL, NVDA, MSFT)_"
-            )
-
-        sector         = fund.get("sector", "")
-        sector_cfg     = get_sector_config(sector)
-        verdict, emoji, reasons = score_fundamentals(fund, sector)
-        earnings_days  = get_earnings_days(symbol)
-        earnings_date  = get_earnings_date(symbol)
-        sector_chg     = get_sector_change(sector)
-        spy_change     = get_spy_change()
-        dip_score, rsi_str = calculate_dip_score(
-            fund, symbol, earnings_days, sector_change=sector_chg
-        )
-        historical_pe  = get_historical_pe(symbol)
-        news           = get_news(symbol)
-        catalyst       = get_catalyst(symbol, fund.get("name", ""))
-        bc_flag        = is_bluechip(fund)
-        category       = classify_dip_category(fund, dip_score, bc_flag)
-        _, strategy    = calculate_flip_target(fund, dip_score, earnings_date, catalyst, spy_change, category=category)
-
-        name         = fund.get("name", symbol)
-        price        = fund.get("price") or 0
-        mc_b         = (fund.get("market_cap") or 0) / 1e9
-        drawdown     = fund.get("drawdown_from_high")
-        drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
-        in_portfolio = " 📦 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
-        bc_tag       = " 💎 Blue chip" if bc_flag else ""
-
-        badge_str  = score_badge(dip_score)
-        score_line = f"{badge_str} Score: {dip_score:.0f}/100"
-
-        vol      = fund.get("volume") or 0
-        avg_vol  = fund.get("average_volume") or 0
-        vol_flag     = " | 📈 Volume spike" if vol and avg_vol and vol > avg_vol * 1.5 else ""
-        insider_flag = get_insider_buy_flag(symbol)
-        short_flag   = get_short_interest_flag(fund)
-        sector_warn  = f" | 🟠 Sector {sector_chg:+.1f}% hoje" if sector_chg is not None and sector_chg <= -2.0 else ""
-        rsi_part     = f" | RSI: {rsi_str}" if rsi_str else ""
-        earn_tag     = f" | 📅 Earnings em {earnings_days}d" if earnings_days is not None else ""
-        spy_str      = f" | SPY: {spy_change:+.1f}%" if spy_change is not None else ""
-
-        lines = [
-            f"🔍 *Análise: {symbol} — {name}*{in_portfolio}{bc_tag}",
-            f"💰 Preço: *${price}*{drawdown_str}{spy_str}",
-            f"🏦 Market cap: ${mc_b:.1f}B | 🏢 {sector_cfg.get('label', sector) or sector}",
-            f"{score_line}{rsi_part}{earn_tag}{vol_flag}{insider_flag}{short_flag}{sector_warn}",
-            f"📂 *Categoria: {category}*",
-            "",
-            f"*{emoji} Veredito: {verdict}*",
-        ]
-        for reason in reasons:
-            lines.append(f"  _{reason}_")
-
-        lines += ["", f"*🎯 Target de venda:*", f"  {strategy}", ""]
-
-        # ── Position Sizing ──────────────────────────────────────────────
-        try:
-            beta = fund.get("beta")
-            _, sizing_str = suggest_position_size(
-                score=dip_score,
-                beta=beta,
-                earnings_days=earnings_days,
-                spy_change=spy_change,
-            )
-            if sizing_str:
-                lines += [f"*💶 Sizing sugerido:* {sizing_str}", ""]
-        except Exception as sz_err:
-            logging.debug(f"[/analisar] sizing {symbol}: {sz_err}")
-
-        # ── Score Breakdown ──────────────────────────────────────────────
-        try:
-            breakdown = build_score_breakdown(fund, symbol, earnings_days, sector_chg)
-            if breakdown:
-                lines += ["", "*🔬 Score Breakdown:*"]
-                for bd_line in breakdown:
-                    lines.append(f"  {bd_line}")
-        except Exception as bd_err:
-            logging.warning(f"[/analisar] score breakdown {symbol}: {bd_err}")
-
-        lines += ["", "*📊 Fundamentos:*"]
-        lines.append(format_valuation_block(fund, historical_pe, sector))
-
-        if news:
-            lines += ["", "*📰 Notícias:*"]
-            for item in news[:3]:
-                title  = item["title"][:70]
-                url    = item["url"]
-                source = item.get("source", "")
-                lines.append(f"  [{title}]({url}){' _' + source + '_' if source else ''}")
-
-        lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')} — via /analisar_")
-
-        # ── Log para base de dados ML ────────────────────────────────────
-        try:
-            rsi_float = float(rsi_str) if rsi_str else None
-            log_alert_snapshot(
-                symbol=symbol,
-                fundamentals=fund,
-                score=dip_score,
-                verdict=verdict,
-                category=category,
-                change_day_pct=0.0,
-                rsi_val=rsi_float,
-                historical_pe=historical_pe,
-                spy_change=spy_change,
-                sector_etf_change=sector_chg,
-            )
-        except Exception as db_err:
-            logging.debug(f"[/analisar] alert_db {symbol}: {db_err}")
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        logging.error(f"[/analisar] {symbol}: {e}")
-        return f"❌ Erro ao analisar *{symbol}*: `{e}`"
-
-
-# ── Handler /mldata ───────────────────────────────────────────────────────
-
-def handle_mldata_command() -> str:
-    """Devolve estatísticas da base de dados ML para o Telegram."""
-    try:
-        stats = get_db_stats()
-        total = stats.get("total", 0)
-        if total == 0:
-            return (
-                "🤖 *Base de dados ML — DipRadar*\n"
-                "_Ainda sem registos. Cada alerta gerado (scan + /analisar) é fotografado automaticamente._\n\n"
-                f"_Ficheiro: {stats.get('db_path', 'N/D')}_"
-            )
-
-        by_cat = stats.get("by_category", {})
-        by_vrd = stats.get("by_verdict", {})
-        last5  = stats.get("last_5", [])
-
-        lines = [
-            "🤖 *Base de dados ML — DipRadar*",
-            f"_Fotografias de alertas para treino futuro de modelos_",
-            "",
-            f"*📸 Total de registos: {total}*",
-            "",
-            "*Por categoria:*",
-        ]
-        for cat, n in sorted(by_cat.items(), key=lambda x: -x[1]):
-            pct = n / total * 100
-            lines.append(f"  {cat}: *{n}* ({pct:.0f}%)")
-
-        lines += ["", "*Por veredito:*"]
-        for vrd, n in sorted(by_vrd.items(), key=lambda x: -x[1]):
-            pct = n / total * 100
-            lines.append(f"  {vrd}: *{n}* ({pct:.0f}%)")
-
-        if last5:
-            lines += ["", "*Últimos 5 alertas registados:*"]
-            for r in last5:
-                lines.append(
-                    f"  • *{r.get('symbol','')}* | {r.get('date_iso','')} | "
-                    f"Score {r.get('score','')} | {r.get('category','')} | {r.get('verdict','')}"
-                )
-
-        needed = max(0, 200 - total)
-        if needed > 0:
-            lines += [
-                "",
-                f"_Progresso para treino ML: {total}/200 ({total/200*100:.0f}%)_",
-                f"_Faltam ~{needed} alertas para ter dados suficientes_",
-            ]
-        else:
-            lines += [
-                "",
-                "✅ *Base de dados suficiente para treino ML!*",
-                "_Podes usar scikit-learn ou XGBoost com alert_db.csv_",
-            ]
-
-        lines.append(f"\n_Ficheiro: {stats.get('db_path', 'N/D')}_")
-        return "\n".join(lines)
-
-    except Exception as e:
-        logging.error(f"[/mldata] {e}")
-        return f"❌ Erro ao ler base de dados ML: `{e}`"
-
-
-# ── Scan contínuo ─────────────────────────────────────────────────────────
-
-def run_scan() -> None:
-    global _scan_running, _sector_etf_cache
-    if not is_market_open():
-        logging.info("Mercado fechado — scan ignorado.")
-        return
-    if _scan_running:
-        logging.warning("Scan anterior ainda em curso — a saltar.")
-        return
-    _scan_running = True
-    _sector_etf_cache = {}
-    today = datetime.now().date().isoformat()
-    logging.info(f"A correr scan — {datetime.now().strftime('%H:%M')}")
-    try:
-        check_portfolio_stress()
-        check_recovery_alerts()
-
-        if WATCHLIST_ENABLED:
-            try:
-                wl_hits = run_watchlist_scan(send_telegram, DIRECT_TICKERS)
-                if wl_hits:
-                    logging.info(f"Watchlist: {wl_hits} alertas enviados")
-            except Exception as e:
-                logging.warning(f"Watchlist scan: {e}")
-
-        losers = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
-        if not losers:
-            logging.info("Sem candidatos hoje.")
-            return
-
-        n         = len(losers)
-        dyn_sleep = max(2, min(8, 60 // max(n, 1)))
-        logging.info(f"  {n} candidatos, sleep dinâmico: {dyn_sleep}s/stock")
-
-        spy_change = get_spy_change()
-
-        for stock in losers:
-            symbol    = stock.get("symbol")
-            alert_key = f"{symbol}_{today}"
-            if not symbol or alert_key in _alerted_today:
-                continue
-            try:
-                logging.info(f"A analisar {symbol} ({stock['change_pct']:.1f}%)...")
-                fundamentals = get_fundamentals(symbol, stock.get("region", ""), MIN_MARKET_CAP)
-                if fundamentals.get("skip"):
-                    append_rejected_log(symbol, stock["change_pct"], "cap_insuficiente")
-                    _alerted_today.add(alert_key); save_alerts(_alerted_today)
-                    continue
-                sector = fundamentals.get("sector", "")
-                verdict, emoji, reasons = score_fundamentals(fundamentals, sector)
-                if verdict == "EVITAR":
-                    append_rejected_log(symbol, stock["change_pct"], "EVITAR", verdict=verdict, sector=sector)
-                    _alerted_today.add(alert_key); save_alerts(_alerted_today)
-                    continue
-                earnings_days      = get_earnings_days(symbol)
-                sector_chg         = get_sector_change(sector)
-                dip_score, rsi_str = calculate_dip_score(
-                    fundamentals, symbol, earnings_days, sector_change=sector_chg
-                )
-                if dip_score < MIN_DIP_SCORE:
-                    append_rejected_log(symbol, stock["change_pct"], "score_baixo",
-                                        score=dip_score, verdict=verdict, sector=sector)
-                    _alerted_today.add(alert_key); save_alerts(_alerted_today)
-                    continue
-
-                bc_flag  = is_bluechip(fundamentals)
-                category = classify_dip_category(fundamentals, dip_score, bc_flag)
-
-                historical_pe = get_historical_pe(symbol)
-                news          = get_news(symbol)
-                message       = build_alert(
-                    stock, fundamentals, historical_pe,
-                    news, verdict, emoji, reasons, dip_score, rsi_str,
-                    category=category,
-                )
-                if send_telegram(message):
-                    _alerted_today.add(alert_key)
-                    save_alerts(_alerted_today)
-                    append_weekly_log(symbol, verdict, dip_score, stock["change_pct"], sector)
-                    price_now = fundamentals.get("price") or 0
-                    if price_now:
-                        append_backtest_entry(symbol, verdict, dip_score, stock["change_pct"], price_now, sector)
-                    _, strategy = calculate_flip_target(fundamentals, dip_score, category=category)
-                    if price_now and "HOLD" not in strategy:
-                        add_recovery_position(symbol, price_now, dip_score, RECOVERY_PCT, verdict)
-
-                    # ── Log para base de dados ML ────────────────────────
-                    try:
-                        rsi_float = float(rsi_str) if rsi_str else None
-                        log_alert_snapshot(
-                            symbol=symbol,
-                            fundamentals=fundamentals,
-                            score=dip_score,
-                            verdict=verdict,
-                            category=category,
-                            change_day_pct=stock["change_pct"],
-                            rsi_val=rsi_float,
-                            historical_pe=historical_pe,
-                            spy_change=spy_change,
-                            sector_etf_change=sector_chg,
-                        )
-                    except Exception as db_err:
-                        logging.debug(f"alert_db {symbol}: {db_err}")
-
-                    logging.info(f"  ✅ Alerta: {symbol} ({verdict}, score {dip_score}/100, {category})")
-                time.sleep(dyn_sleep)
-            except Exception as e:
-                logging.error(f"Erro {symbol}: {e}")
-    finally:
-        _scan_running = False
-
-
-# ── Resumo abertura (15h30) ───────────────────────────────────────────────
-
-def send_open_summary() -> None:
-    tier1 = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
-
-    macro = get_macro_context()
-    spy_str = ""
-    if spy_change := get_spy_change():
-        sign = "+" if spy_change >= 0 else ""
-        spy_str = f"SPY: {sign}{spy_change:.1f}%"
-
-    vix_str = f"VIX: {macro['vix']:.0f}" if macro["vix"] else ""
-    ma_str = ""
-    if macro["spy_vs_20d"] is not None:
-        arrow = "↑" if macro["spy_vs_20d"] >= 0 else "↓"
-        ma_str = f"SPY vs MA20: {arrow}{abs(macro['spy_vs_20d']):.1f}%"
-
-    macro_line = " | ".join(filter(None, [spy_str, vix_str, ma_str]))
-    macro_warn = ""
-    if macro["vix"] and macro["vix"] > 25:
-        macro_warn = "\n_⚠️ VIX elevado — mercado em stress, dips podem continuar_"
-    elif macro["spy_vs_20d"] and macro["spy_vs_20d"] < -3:
-        macro_warn = "\n_⚠️ SPY abaixo da MA20 — contexto de correcção_"
-
-    if not tier1:
-        if macro_line:
-            send_telegram(f"*⚡ Abertura +1h — {datetime.now().strftime('%d/%m %H:%M')}*\n_{macro_line}_\n_Sem quedas ≥{DROP_THRESHOLD:.0f}% hoje_")
-        return
-
-    lines = [
-        f"*⚡ Abertura +1h — {datetime.now().strftime('%d/%m %H:%M')}*",
-        f"_{macro_line}{macro_warn}_" if macro_line else "",
-        f"_{len(tier1)} candidato(s) com queda ≥{DROP_THRESHOLD:.0f}%_",
-        "",
-    ]
-    for s in tier1[:8]:
-        mc_b = (s.get("market_cap") or 0) / 1e9
-        lines.append(f"  📉 *{s['symbol']}*: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
-    lines += ["", "_Resumo completo às 21h15_"]
-    send_telegram("\n".join(filter(None, lines)))
-
-
-# ── Dip log helpers (Feature 8) ───────────────────────────────────────────
-
-_DIP_LOG_FILE = Path("/tmp/dipr_score_log.json")
-
-def _load_dip_log() -> dict:
-    try:
-        if _DIP_LOG_FILE.exists():
-            return json.loads(_DIP_LOG_FILE.read_text())
+        catalyst_data = get_catalyst(symbol, name)
     except Exception:
         pass
-    return {}
+    _, strategy = calculate_flip_target(
+        fundamentals, dip_score,
+        earnings_date=get_earnings_date(symbol),
+        catalyst=catalyst_data,
+        spy_change=spy_change,
+        category=category,
+    )
 
-def _save_dip_log(log: dict) -> None:
+    macro_ctx = ""
     try:
-        cutoff = (datetime.now() - timedelta(days=14)).date().isoformat()
-        pruned = {k: v for k, v in log.items() if k.split("_")[-1] >= cutoff}
-        _DIP_LOG_FILE.write_text(json.dumps(pruned))
-    except Exception as e:
-        logging.warning(f"Dip log save: {e}")
+        mc = get_macro_context()
+        if mc.get("alert"):
+            macro_ctx = f"\n🌎 *Macro:* {mc['summary']}"
+    except Exception:
+        pass
 
-def _get_dip_context(symbol: str, score_today: float, log: dict) -> str:
-    """
-    Devolve string com contexto temporal: há quantos dias está em dip e
-    se o score está a melhorar ou piorar.
-    """
-    entries = {k: v for k, v in log.items() if k.startswith(f"{symbol}_")}
-    if not entries:
-        return "1º dia detectado"
+    score_breakdown = build_score_breakdown(fundamentals, symbol, earnings_d, sector_change=sector_chg)
 
-    dates = sorted(entries.keys())
-    scores = [entries[d] for d in dates]
+    _, sizing_str = suggest_position_size(
+        score=dip_score,
+        beta=fundamentals.get("beta"),
+        earnings_days=earnings_d,
+        spy_change=spy_change,
+    )
 
-    today = datetime.now().date()
-    consecutive = 1
-    for i in range(1, min(len(dates), 14)):
-        check_date = (today - timedelta(days=i)).isoformat()
-        if any(d.endswith(check_date) for d in dates):
-            consecutive += 1
-        else:
-            break
+    return (
+        f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
+        f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
+        f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
+        f"{earn_warn}"
+        f"{valuation_block}"
+        f"\n*Categoria:* {category}\n"
+        f"{score_line}\n"
+        f"{score_breakdown}\n"
+        f"\n*Estratégia:* {strategy}"
+        f"{macro_ctx}"
+        f"\n💶 *Sizing:* {sizing_str}" if sizing_str else
+        f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
+        f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
+        f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
+        f"{earn_warn}"
+        f"{valuation_block}"
+        f"\n*Categoria:* {category}\n"
+        f"{score_line}\n"
+        f"{score_breakdown}\n"
+        f"\n*Estratégia:* {strategy}"
+        f"{macro_ctx}"
+    )
 
-    trend = ""
-    if len(scores) >= 2:
-        prev = scores[-1]
-        if score_today > prev:
-            trend = f" | score ↑ ({prev:.0f}→{score_today:.0f})"
-        elif score_today < prev:
-            trend = f" | score ↓ ({prev:.0f}→{score_today:.0f})"
-        else:
-            trend = f" | score estável ({score_today:.0f})"
 
-    day_label = f"{consecutive}º dia consecutivo"
-    return f"{day_label}{trend}"
+# ── Scan principal ─────────────────────────────────────────────────────────────────
 
-
-# ── Resumo fecho (21h15) ──────────────────────────────────────────────────
-
-def send_close_summary() -> None:
-    global _last_tier3
-    start_time = time.time()
-    WATCHDOG   = 25 * 60
-    spy_change = get_spy_change()
-    all_losers = screen_global_dips(min_drop_pct=3.0, min_market_cap=MIN_MARKET_CAP)
-    if not all_losers:
+def run_scan() -> None:
+    global _scan_running, _alerted_today
+    if _scan_running:
+        logging.warning("Scan já a correr, a ignorar...")
         return
+    _scan_running = True
+    try:
+        if not is_market_open():
+            logging.info("Mercado fechado, scan ignorado.")
+            return
 
-    dip_log    = _load_dip_log()
-    today_iso  = datetime.now().date().isoformat()
+        logging.info("A iniciar scan de dips...")
+        spy_change = get_spy_change()
+        stocks     = screen_global_dips(DROP_THRESHOLD, MIN_MARKET_CAP)
+        if not stocks:
+            logging.info("Sem stocks na triagem.")
+            return
 
-    tier1            = [s for s in all_losers if s["change_pct"] <= -DROP_THRESHOLD]
-    tier2            = [s for s in all_losers if -DROP_THRESHOLD < s["change_pct"] <= -7.0]
-    tier3_candidates = [s for s in all_losers if -8.0 < s["change_pct"] <= -3.0]
+        ranked_entries = []
+        comprar_syms   = set()
 
-    fund_cache:  dict = {}
-    score_cache: dict = {}
+        for stock in stocks:
+            sym = stock["symbol"]
+            if sym in _alerted_today:
+                continue
+            try:
+                time.sleep(3)
+                fund = get_fundamentals(sym, min_market_cap=MIN_MARKET_CAP)
+                if fund.get("skip"):
+                    append_rejected_log({
+                        "symbol": sym, "change": stock["change_pct"],
+                        "reason": fund.get("skip_reason", "skip"),
+                        "score": None, "verdict": None,
+                    })
+                    continue
 
-    def _timed_out():          return (time.time() - start_time) > WATCHDOG
-    def _get_fund(sym, reg=""):
-        if sym not in fund_cache:
-            if _timed_out(): return {"skip": True}
-            fund_cache[sym] = get_fundamentals(sym, reg, MIN_MARKET_CAP)
-        return fund_cache[sym]
-    def _get_score(sym, fund):
-        if sym not in score_cache:
-            ed        = get_earnings_days(sym)
-            sec_chg   = get_sector_change(fund.get("sector", ""))
-            score_cache[sym], _ = calculate_dip_score(fund, sym, ed, sector_change=sec_chg)
-        return score_cache[sym]
+                hist_pe       = get_historical_pe(sym)
+                news          = get_news(sym)
+                earnings_days = get_earnings_days(sym)
+                sector_chg    = get_sector_change(fund.get("sector", ""))
+                score, rsi_str = calculate_dip_score(
+                    fund, sym, earnings_days, sector_change=sector_chg
+                )
 
-    tier3 = []
-    for s in tier3_candidates:
-        if _timed_out(): break
-        sym  = s["symbol"]
-        fund = _get_fund(sym, s.get("region", ""))
-        if fund.get("skip"): continue
-        score = _get_score(sym, fund)
-        if score >= 80:
-            s["_score"]    = score
-            s["_category"] = classify_dip_category(fund, score, is_bluechip(fund))
-            tier3.append(s)
-    tier3.sort(key=lambda x: x.get("_score", 0), reverse=True)
-    _last_tier3 = tier3
+                bc_flag  = is_bluechip(fund)
+                category = classify_dip_category(fund, score, bc_flag)
 
-    spy_header = ""
-    if spy_change is not None:
-        sign       = "+" if spy_change >= 0 else ""
-        macro_warn = " 🌍 DIA MACRO" if spy_change <= -2.0 else ""
-        spy_header = f"_SPY: {sign}{spy_change:.1f}%{macro_warn}_"
+                # Extrair valor numérico do RSI do rsi_str (ex: "35.2 🟡")
+                rsi_val = None
+                try:
+                    rsi_val = float(str(rsi_str).split()[0])
+                except Exception:
+                    pass
 
-    lines = [f"*📋 Resumo Fecho — {datetime.now().strftime('%d/%m/%Y')}*"]
-    if spy_header: lines.append(spy_header)
-    lines.append("")
+                if score < MIN_DIP_SCORE:
+                    append_rejected_log({
+                        "symbol": sym, "change": stock["change_pct"],
+                        "reason": f"score baixo ({score:.0f})",
+                        "score": score, "verdict": "EVITAR",
+                    })
+                    continue
 
-    tier1_syms = {s["symbol"] for s in tier1}
+                # Determinar verdict e tier
+                if score >= 75:
+                    verdict, emoji_str, tier = "COMPRAR", "🟢", 1
+                elif score >= 60:
+                    verdict, emoji_str, tier = "MONITORIZAR", "🟡", 2
+                else:
+                    verdict, emoji_str, tier = "MONITORIZAR", "🔵", 3
 
-    if tier1:
-        lines.append(f"*🔴 TIER 1 — Análise completa (≥{DROP_THRESHOLD:.0f}%):*")
-        for s in tier1[:6]:
-            mc_b         = (s.get("market_cap") or 0) / 1e9
-            drawdown     = get_52w_drawdown(s["symbol"])
-            d_str        = f" | 52w: *{drawdown:.0f}%*" if drawdown is not None else ""
-            in_portfolio = " 📦" if s["symbol"] in DIRECT_TICKERS else ""
-            lines.append(f"  📉 *{s['symbol']}*{in_portfolio}: {s['change_pct']:.1f}% hoje{d_str} — ${mc_b:.1f}B")
-        lines += ["", "_→ Verifica catalisador, FCF e 4 critérios Flip_", ""]
-    else:
-        lines += [f"_Sem quedas ≥{DROP_THRESHOLD:.0f}% hoje_", ""]
+                reasons = []
 
-    if tier2:
-        lines.append(f"*🟡 TIER 2 — Watchlist (7–{DROP_THRESHOLD:.0f}%):*")
-        for s in tier2[:6]:
-            mc_b         = (s.get("market_cap") or 0) / 1e9
-            in_portfolio = " 📦" if s["symbol"] in DIRECT_TICKERS else ""
-            lines.append(f"  👀 *{s['symbol']}*{in_portfolio}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
-        lines += ["", "_→ Monitorizar apenas_", ""]
+                # ── Gravar snapshot ML ──────────────────────────────────
+                log_alert_snapshot(
+                    symbol=sym,
+                    fundamentals=fund,
+                    score=score,
+                    verdict=verdict,
+                    category=category,
+                    change_day_pct=stock["change_pct"],
+                    rsi_val=rsi_val,
+                    historical_pe=hist_pe,
+                    spy_change=spy_change,
+                    sector_etf_change=sector_chg,
+                )
 
-    if tier3:
-        lines.append("*🔵 TIER 3 — Gems Raras (-3/-8%, score ≥80):*")
-        lines.append("")
-        for s in tier3[:5]:
-            sym          = s["symbol"]
-            score        = s.get("_score", 0)
-            category     = s.get("_category", "🔄 Rotação")
-            fund         = fund_cache.get(sym, {})
-            mc_b         = (fund.get("market_cap") or 0) / 1e9
-            sector_label = get_sector_config(fund.get("sector", "")).get("label", "") or fund.get("sector", "")
-            price        = fund.get("price", 0)
-            earnings     = get_earnings_date(sym)
-            catalyst     = get_catalyst(sym, fund.get("name", ""))
-            _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change, category=category)
-            in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
-            log_key      = f"{sym}_{today_iso}"
-            dip_log[log_key] = score
-            context_str  = _get_dip_context(sym, score, dip_log)
-            lines.append(f"  🔥 *{sym}*{in_portfolio} — Score {score:.0f}/100 | ${price} | ${mc_b:.1f}B | {sector_label}")
-            lines.append(f"  _{category} | {context_str}_")
-            lines.append(f"     {strategy}")
-            lines.append("")
-        rest_high = [s for s in tier3[5:] if s.get("_score", 0) >= 80]
-        if rest_high:
-            lines.append(f"  _Score 80+ adicionais: {', '.join(s['symbol'] for s in rest_high)}_")
-            lines.append("")
+                alert_text = build_alert(
+                    stock, fund, hist_pe, news,
+                    verdict, emoji_str, reasons, score, rsi_str,
+                    category=category,
+                )
 
-    ranking_entries = []
-    for tier_num, tier_list in [(1, tier1), (2, tier2), (3, tier3)]:
-        for s in tier_list:
-            sym  = s["symbol"]
-            fund = _get_fund(sym, s.get("region", ""))
-            if fund.get("skip"): continue
-            score = _get_score(sym, fund)
-            if score >= 55:
-                ranking_entries.append({
+                ranked_entries.append({
                     "symbol":        sym,
                     "dip_score":     score,
+                    "tier":          tier,
                     "fundamentals":  fund,
-                    "tier":          tier_num,
-                    "category":      classify_dip_category(fund, score, is_bluechip(fund)),
                     "earnings_date": get_earnings_date(sym),
-                    "earnings_days": get_earnings_days(sym),
-                    "catalyst":      get_catalyst(sym, fund.get("name", "")),
+                    "earnings_days": earnings_days,
+                    "catalyst":      None,
+                    "category":      category,
                 })
 
-    ranking_block = build_flip_ranking(ranking_entries, spy_change, exclude_syms=tier1_syms)
-    if ranking_block: lines.append(ranking_block)
+                send_telegram(alert_text)
+                _alerted_today.add(sym)
+                save_alerts(_alerted_today)
 
-    _save_dip_log(dip_log)
+                if verdict == "COMPRAR":
+                    comprar_syms.add(sym)
+                    add_recovery_position(
+                        sym, score,
+                        price=fund.get("price") or stock.get("price", 0),
+                        target_pct=RECOVERY_PCT,
+                    )
 
-    elapsed = int(time.time() - start_time)
-    lines.append(f"_⏱ Resumo gerado em {elapsed}s_")
-    send_telegram("\n".join(lines))
+                append_weekly_log({
+                    "symbol":  sym,
+                    "score":   score,
+                    "change":  stock["change_pct"],
+                    "verdict": verdict,
+                    "sector":  fund.get("sector", ""),
+                    "date":    datetime.now().strftime("%d/%m"),
+                    "time":    datetime.now().strftime("%H:%M"),
+                })
+                append_backtest_entry({
+                    "symbol":    sym,
+                    "date":      datetime.now().strftime("%Y-%m-%d"),
+                    "price":     fund.get("price") or stock.get("price", 0),
+                    "score":     score,
+                    "verdict":   verdict,
+                })
+
+            except Exception as e:
+                logging.error(f"Erro no scan de {sym}: {e}", exc_info=True)
+
+        # Ranking flip no final do scan
+        if ranked_entries:
+            ranking_text = build_flip_ranking(ranked_entries, spy_change, exclude_syms=comprar_syms)
+            if ranking_text:
+                send_telegram(ranking_text)
+
+    finally:
+        _scan_running = False
+        logging.info("Scan concluído.")
 
 
-# ── Comando /tier3 ───────────────────────────────────────────────────────────
+# ── Watchlist Scan ─────────────────────────────────────────────────────────────────
 
-def handle_tier3_command() -> str:
-    if not _last_tier3:
-        return "🔵 *Tier 3 — Gems Raras*\n_Nenhuma gem detectada no último resumo de fecho._"
+def run_watchlist_job() -> None:
+    if not WATCHLIST_ENABLED:
+        return
+    logging.info("A correr watchlist scan...")
+    try:
+        alerts = run_watchlist_scan(DIRECT_TICKERS)
+        for alert in alerts:
+            send_telegram(alert)
+    except Exception as e:
+        logging.error(f"Watchlist scan: {e}")
+
+
+# ── ML Outcomes Job (domingo 08:00) ───────────────────────────────────────────────
+
+def run_ml_outcomes_job() -> None:
+    """
+    Corre domingo de manhã (08:00) — preenche MFE/MAE/returns
+    para todos os alertas com 30+ dias de histórico.
+    Envia resumo por Telegram.
+    """
+    logging.info("[ml_outcomes] A actualizar outcomes da alert_db...")
+    try:
+        stats = fill_db_outcomes()
+    except Exception as e:
+        logging.error(f"[ml_outcomes] Erro: {e}")
+        send_telegram(f"🤖 *ML Outcomes — Erro*\n`{e}`")
+        return
+
+    if stats.get("updated", 0) == 0 and stats.get("total", 0) == 0:
+        logging.info("[ml_outcomes] Base de dados vazia, nada a fazer.")
+        return
+
+    # Montar resumo para Telegram
+    db_stats = get_db_stats()
+    outcomes = db_stats.get("outcomes", {})
+    labeled  = db_stats.get("labeled", 0)
+    total    = db_stats.get("total", 0)
+
+    outcome_lines = []
+    for label, count in sorted(outcomes.items(), key=lambda x: x[1], reverse=True):
+        emoji_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴"}
+        e = emoji_map.get(label, "📊")
+        pct = count / labeled * 100 if labeled > 0 else 0
+        outcome_lines.append(f"  {e} {label}: {count} ({pct:.0f}%)")
+
     lines = [
-        "🔵 *Tier 3 — Gems Raras* _(do último fecho)_",
-        "_Apenas stocks com queda 3–8% e score ≥80/100_",
+        f"🤖 *ML Outcomes — Update semanal*",
+        f"_{datetime.now().strftime('%d/%m/%Y %H:%M')}_",
+        "",
+        f"*🗓️ Alertas na base de dados:* {total}",
+        f"*📊 Classificados:* {labeled} ({labeled/total*100:.0f}% do total)" if total > 0 else "*📊 Classificados:* 0",
+        f"*✅ Actualizados agora:* {stats.get('updated', 0)}",
+        f"*⏩ Ignorados (dados insuficientes):* {stats.get('skipped', 0)}",
         "",
     ]
-    for s in _last_tier3:
-        sym      = s["symbol"]
-        score    = s.get("_score", 0)
-        category = s.get("_category", "🔄 Rotação")
-        chg      = s.get("change_pct", 0)
-        mc_b     = (s.get("market_cap") or 0) / 1e9
-        in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
-        lines.append(f"  🔥 *{sym}*{in_portfolio} — Score {score:.0f}/100 | {chg:.1f}% | ${mc_b:.1f}B | {category}")
-    lines.append(f"\n_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
-    return "\n".join(lines)
+    if outcome_lines:
+        lines.append("*🎯 Distribuição de outcomes:*")
+        lines.extend(outcome_lines)
+        lines.append("")
+    if labeled >= 50:
+        lines.append("🚦 *Podes considerar treinar o primeiro modelo ML!*")
+        lines.append("_50+ alertas classificados — usa `train_model.py` com XGBoost_")
+    elif labeled > 0:
+        lines.append(f"_🕐 {50 - labeled} alertas até poder treinar o modelo ML_")
+
+    send_telegram("\n".join(lines))
+    logging.info(f"[ml_outcomes] Done: {stats}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ── Bot commands handler ───────────────────────────────────────────────────────────
+
+def poll_bot_commands() -> None:
+    try:
+        bot_commands.poll(
+            token=TELEGRAM_TOKEN,
+            chat_id=TELEGRAM_CHAT_ID,
+            send_fn=send_telegram,
+            context={
+                "get_snapshot":        _get_snapshot,
+                "DIRECT_TICKERS":      DIRECT_TICKERS,
+                "MIN_MARKET_CAP":      MIN_MARKET_CAP,
+                "MIN_DIP_SCORE":       MIN_DIP_SCORE,
+                "DROP_THRESHOLD":      DROP_THRESHOLD,
+                "get_sector_change":   get_sector_change,
+                "is_bluechip":         is_bluechip,
+                "score_badge":         score_badge,
+                "calculate_flip_target": calculate_flip_target,
+                "build_flip_ranking":  build_flip_ranking,
+                "last_tier3":          _last_tier3,
+                "FLIP_FUND_EUR":       FLIP_FUND_EUR,
+                "build_backtest_summary": build_backtest_summary,
+                "get_db_stats":        get_db_stats,
+                "fill_db_outcomes":    fill_db_outcomes,
+            },
+        )
+    except Exception as e:
+        logging.warning(f"poll_bot_commands: {e}")
+
+
+# ── Scheduler ──────────────────────────────────────────────────────────────────────
+
+def setup_schedule() -> None:
+    # Heartbeat diário às 9h
+    schedule.every().day.at("09:00").do(send_heartbeat)
+
+    # Scan principal
+    schedule.every(SCAN_MINUTES).minutes.do(run_scan)
+
+    # Stress check (durante horas de mercado)
+    schedule.every(15).minutes.do(check_portfolio_stress)
+
+    # Watchlist
+    schedule.every(45).minutes.do(run_watchlist_job)
+
+    # Recovery check
+    schedule.every().day.at("15:00").do(check_recovery_alerts)
+    schedule.every().day.at("17:30").do(check_recovery_alerts)
+
+    # Weekly scans
+    schedule.every().monday.at("08:45").do(send_weekly_dip_scan)
+    schedule.every().saturday.at("10:00").do(send_saturday_report)
+
+    # ── ML Outcomes: domingo às 08:00 ─────────────────────────────────
+    schedule.every().sunday.at("08:00").do(run_ml_outcomes_job)
+
+    # Reset diário de alertas e stress à meia-noite
+    schedule.every().day.at("00:01").do(lambda: (
+        clear_alerts(),
+        _alerted_today.clear(),
+        _stress_alerted.clear(),
+        _sector_etf_cache.clear(),
+        logging.info("Reset diário efectuado.")
+    ))
+
+    # Poll de comandos Telegram a cada 10s
+    schedule.every(10).seconds.do(poll_bot_commands)
+
+    logging.info("Scheduler configurado.")
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import pathlib
-    logging.info("=" * 60)
-    logging.info("DipRadar iniciado")
-    logging.info(f"Threshold: {DROP_THRESHOLD}% | Min cap: ${MIN_MARKET_CAP/1e9:.0f}B")
-    logging.info(f"Scan a cada {SCAN_MINUTES} minutos | Min score: {MIN_DIP_SCORE}/100")
-    logging.info(f"Stress: >{STRESS_PCT:.0f}% | Recovery target: +{RECOVERY_PCT:.0f}%")
-    logging.info(f"Watchlist: {'ACTIVA' if WATCHLIST_ENABLED else 'INACTIVA'} ({len(WATCHLIST)} stocks)")
-    logging.info("=" * 60)
-
-    bot_commands.register_callbacks(
-        send_telegram=send_telegram,
-        run_scan=run_scan,
-        get_snapshot=_get_snapshot,
-        backtest_summary=build_backtest_summary,
-        rejected_log=load_rejected_log,
-        is_market_open=is_market_open,
-        tier3_handler=handle_tier3_command,
-        analyze_ticker=handle_analyze_ticker,
-        mldata_handler=handle_mldata_command,
-    )
-    bot_commands.start_bot_listener()
-
-    has_volume = pathlib.Path("/data").exists()
-    tavily_ok  = bool(os.environ.get("TAVILY_API_KEY"))
-
-    # Stats da DB ML no boot
-    try:
-        db_stats   = get_db_stats()
-        db_total   = db_stats.get("total", 0)
-        db_str     = f"✅ {db_total} registos" if db_total > 0 else "🆕 vazia (a começar)"
-    except Exception:
-        db_str = "⚠️ erro ao ler"
-
-    send_telegram(
-        f"🤖 *DipRadar iniciado* ⚠️\n"
-        f"_Restart detectado às {datetime.now().strftime('%d/%m %H:%M')}_\n"
-        f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥80 🔥)\n"
-        f"Score: 0–100 | Min alerta: {MIN_DIP_SCORE}/100\n"
-        f"Badges: 🔥≥80 · ⭐55–79 · 📊<55\n"
-        f"Categorias: 🏛️ Hold Forever · 🏠 Apartamento · 🔄 Rotação\n"
-        f"Portfolio stress: >{STRESS_PCT:.0f}% posição | >3% total\n"
-        f"Recovery alert: +{RECOVERY_PCT:.0f}% do preço de alerta\n"
-        f"Stop temporal recovery: 60 dias sem recuperação\n"
-        f"Backtesting: ✅ automático às 21h30\n"
-        f"Base de dados ML: {db_str}\n"
-        f"Watchlist pessoal: {'✅ ' + str(len(WATCHLIST)) + ' stocks' if WATCHLIST_ENABLED else '⚠️ inactiva'}\n"
-        f"Comandos: /help /status /carteira /scan /analisar /backtest /rejeitados /tier3 /mldata\n"
-        f"Persistência: {('✅ /data/') if has_volume else '⚠️ /tmp/ — configura Railway Volume'}\n"
-        f"Tavily: {('✅') if tavily_ok else '⚠️ não configurado'}\n"
-        f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
-    )
-
-    schedule.every(SCAN_MINUTES).minutes.do(run_scan)
-    schedule.every().day.at("08:45").do(send_weekly_dip_scan)
-    schedule.every().day.at("09:00").do(send_heartbeat)
-    schedule.every().day.at("10:00").do(send_saturday_report)
-    schedule.every().day.at("15:30").do(send_open_summary)
-    schedule.every().day.at("21:15").do(send_close_summary)
-    schedule.every().day.at("21:30").do(backtest_runner)
-    schedule.every().day.at("00:01").do(
-        lambda: (
-            _alerted_today.clear(), save_alerts(_alerted_today),
-            _stress_alerted.clear(),
-            logging.info("Alertas do dia limpos.")
-        )
-    )
-
-    logging.info("Scheduler configurado. A entrar no loop principal...")
+    logging.info("🚀 DipRadar a iniciar...")
+    setup_schedule()
+    send_heartbeat()  # Heartbeat imediato no boot
+    run_scan()        # Scan imediato no boot
+    logging.info("Loop principal iniciado.")
     while True:
         schedule.run_pending()
-        time.sleep(30)
+        time.sleep(1)
