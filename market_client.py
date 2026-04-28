@@ -316,12 +316,24 @@ def get_spy_change() -> float | None:
 
 
 def get_usdeur() -> float:
+    """
+    Devolve a taxa de conversão USD → EUR (ex: 0.8550 significa 1 USD = €0.8550).
+
+    O ticker EURUSD=X no Yahoo Finance representa EUR/USD
+    (quantos USD vale 1 EUR), por exemplo 1.1705.
+    Para converter USD → EUR é necessário inverter: 1 / 1.1705 ≈ 0.8544.
+
+    Fallback: 0.92 (aproximação conservadora).
+    """
     try:
         time.sleep(1)
         inf = yf.Ticker("EURUSD=X").info or {}
-        rate = inf.get("regularMarketPrice") or inf.get("bid")
-        if rate and rate > 0:
-            return round(float(rate), 6)
+        # EURUSD=X = EUR/USD, i.e. 1 EUR = X USD  →  1 USD = 1/X EUR
+        eur_usd = inf.get("regularMarketPrice") or inf.get("bid")
+        if eur_usd and eur_usd > 0:
+            usd_eur = round(1.0 / float(eur_usd), 6)
+            logging.info(f"FX: EUR/USD={eur_usd:.4f} → USD/EUR={usd_eur:.4f}")
+            return usd_eur
     except Exception as e:
         logging.warning(f"USD/EUR rate: {e}")
     return 0.92
