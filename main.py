@@ -35,7 +35,7 @@ from market_client import (
 from portfolio import HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, DIRECT_TICKERS
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
-from score import calculate_dip_score
+from score import calculate_dip_score, build_score_breakdown
 from state import (
     load_alerts, save_alerts, clear_alerts,
     load_weekly_log, save_weekly_log, append_weekly_log,
@@ -723,6 +723,7 @@ def handle_analyze_ticker(symbol: str) -> str:
     Análise completa de qualquer ticker a pedido do utilizador.
     Devolve uma string formatada para envio via Telegram.
     Sem filtro de score mínimo — mostra sempre o resultado.
+    Inclui score breakdown detalhado critério a critério.
     """
     symbol = symbol.upper().strip()
     logging.info(f"[/analisar] A analisar {symbol}...")
@@ -782,6 +783,17 @@ def handle_analyze_ticker(symbol: str) -> str:
             lines.append(f"  _{reason}_")
 
         lines += ["", f"*🎯 Target de venda:*", f"  {strategy}", ""]
+
+        # ── Score Breakdown ──────────────────────────────────────────────
+        try:
+            breakdown = build_score_breakdown(fund, symbol, earnings_days, sector_chg)
+            if breakdown:
+                lines += ["", "*🔬 Score Breakdown:*"]
+                for bd_line in breakdown:
+                    lines.append(f"  {bd_line}")
+        except Exception as bd_err:
+            logging.warning(f"[/analisar] score breakdown {symbol}: {bd_err}")
+
         lines += ["", "*📊 Fundamentos:*"]
         lines.append(format_valuation_block(fund, historical_pe, sector))
 
