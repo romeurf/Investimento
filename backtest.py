@@ -258,8 +258,8 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         if cal.get("suggested_min") is not None:
             lines += [
                 "",
-                "  *\U0001f916 Auto-calibração MIN\_DIP\_SCORE:*",
-                f"    Sugestão baseada em histórico: *score \u2265{cal['suggested_min']}*",
+                "  *\U0001f916 Auto-calibra\u00e7\u00e3o MIN_DIP_SCORE:*",
+                f"    Sugest\u00e3o baseada em hist\u00f3rico: *score \u2265{cal['suggested_min']}*",
                 f"    _{cal['reason']}_",
             ]
             valid_rows = [r for r in cal["all_thresholds"] if r["win_rate"] is not None]
@@ -275,50 +275,34 @@ def build_backtest_summary(min_entries: int = 3) -> str:
                 f"    _\u2192 Actualiza MIN_DIP_SCORE no Railway para {cal['suggested_min']} se concordas_"
             )
         else:
-            lines += ["", f"  _Auto-calibração: {cal.get('reason', 'sem dados')}_"]
+            lines += ["", f"  _Auto-calibra\u00e7\u00e3o: {cal.get('reason', 'sem dados')}_"]
     except Exception as e:
-        logging.warning(f"Auto-calibração: {e}")
+        logging.warning(f"Auto-calibra\u00e7\u00e3o: {e}")
 
     return "\n".join(lines)
 
 
 # ── Historical backtest (F2) ──────────────────────────────────────────────
 
-# Lookback fixo: 5 anos — sweet spot entre dados de crise suficientes
-# e estabilidade fundamental aceitável (2021-2026 apanha bear 2022 + recovery 2023).
 _LOOKBACK_YEARS = 5
-
-# Janelas em dias de mercado (trading days):
-#   1 mês  ≈ 21 td  | 3 meses ≈ 63 td  | 6 meses ≈ 126 td
 _TD_1M  = 21
 _TD_3M  = 63
 _TD_6M  = 126
 
-# Colunas do CSV de saída: super-conjunto de alert_db._FIELDS + campos extra
-# de backtest. O modelo ML apenas usa as colunas que existem em ambas as
-# fontes — o campo 'source' permite filtrar na fase de treino.
 _HIST_FIELDS = [
-    # Identificação
     "date_iso", "symbol", "name", "sector",
-    # Classificação
     "category", "score",
-    # Preço e mercado
     "price", "market_cap_b", "drawdown_52w", "change_day_pct",
-    # Técnicos
     "rsi", "volume_ratio",
-    # Fundamentais (snapshot de hoje)
     "pe", "fcf_yield", "revenue_growth", "gross_margin",
     "debt_equity", "dividend_yield", "analyst_upside",
-    # Outcomes forward-looking (F2-B)
     "price_1m", "price_3m", "price_6m",
     "return_1m", "return_3m", "return_6m",
     "mfe_3m", "mae_3m",
-    "outcome_label",  # WIN_40 | WIN_20 | NEUTRAL | LOSS_15 | "" (pending)
-    # Metadado de rastreabilidade
-    "source",         # sempre "historical_backtest"
+    "outcome_label",
+    "source",
 ]
 
-# Caminho padrão do CSV histórico (separado do alert_db.csv live)
 _HIST_DB_PATH = (
     Path("/data/hist_backtest.csv")
     if Path("/data").exists()
@@ -327,9 +311,6 @@ _HIST_DB_PATH = (
 
 
 def _rsi_series(close_series, period: int = 14):
-    """
-    RSI rolling vectorizado (Wilder EWM) — idêntico ao TradingView/yfinance.
-    """
     delta    = close_series.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
@@ -340,19 +321,11 @@ def _rsi_series(close_series, period: int = 14):
 
 
 def _drawdown_from_rolling_high(close_series, window: int = 252):
-    """
-    Drawdown % vs máximo rolling dos últimos `window` trading days.
-    Valores são sempre <= 0.
-    """
     rolling_max = close_series.rolling(window=window, min_periods=1).max()
     return (close_series - rolling_max) / rolling_max * 100
 
 
 def _build_hybrid_fund(info: dict, row) -> dict:
-    """
-    Dicionário `fund` híbrido:
-      Técnicos = Dia 0 real | Fundamentais = snapshot de hoje.
-    """
     price    = float(row["Close"])
     mc_today = info.get("marketCap") or 0
     fcf_raw  = info.get("freeCashflow")
@@ -379,7 +352,6 @@ def _build_hybrid_fund(info: dict, row) -> dict:
 
 
 def _analyst_upside(info: dict) -> float:
-    """% upside até ao target médio dos analistas."""
     target = info.get("targetMeanPrice")
     price  = info.get("currentPrice") or info.get("regularMarketPrice")
     if target and price and price > 0:
@@ -388,10 +360,6 @@ def _analyst_upside(info: dict) -> float:
 
 
 def _detect_dips(df) -> object:
-    """
-    Indicadores vectorizados + anti-clustering 20d.
-    Condições: RSI < 35 AND Drawdown 52w < -15%.
-    """
     import pandas as pd
 
     df = df.copy()
@@ -414,30 +382,12 @@ def _detect_dips(df) -> object:
     return df.loc[kept]
 
 
-# ── F2-B: forward-looking outcomes ─────────────────────────────────────
-
 def _forward_outcomes(
     df,
     dip_iloc: int,
     price_entry: float,
     category: str,
 ) -> dict:
-    """
-    F2-B — Métricas forward-looking para um dip, usando OHLCV em memória.
-
-    Janelas (trading days):
-      T+1m = iloc+21 | T+3m = iloc+63 | T+6m = iloc+126
-
-    Right-edge censor: se offset > len(df), devolve None ("pending").
-
-    MFE = Max(High[iloc+1..iloc+63] - price_entry) / price_entry
-    MAE = Min(Low[iloc+1..iloc+63]  - price_entry) / price_entry
-
-    outcome_label: canónico via alert_db._resolve_outcome_label.
-      Apartamento  → 6m > 3m > 1m
-      Rotação      → 3m > 6m > 1m
-      Hold Forever → sem label
-    """
     from alert_db import _resolve_outcome_label
     from score import CATEGORY_APARTAMENTO, CATEGORY_HOLD_FOREVER
 
@@ -496,17 +446,7 @@ def _forward_outcomes(
     return result
 
 
-# ── F2-C: CSV writer + idempotency + public entry-point ───────────────
-
 def _load_existing_keys(csv_path: Path) -> set:
-    """
-    Lê o CSV existente e devolve um set de chaves compostas
-    (symbol, date_iso) para evitar duplicados.
-
-    Idempotência: re-correr o build_historical_training_set() não
-    duplica linhas — apenas acrescenta dips novos ou substitui
-    dips com label pendente que entretanto ficaram resolvidos.
-    """
     keys: set = set()
     if not csv_path.exists():
         return keys
@@ -527,13 +467,6 @@ def _write_hist_csv(
     csv_path: Path,
     existing_keys: set,
 ) -> int:
-    """
-    Acrescenta ao CSV apenas as linhas que ainda não existem
-    (guard by existing_keys).
-
-    Cria o ficheiro com cabeçalho se não existir.
-    Devolve o número de linhas efectivamente escritas.
-    """
     new_rows = [
         r for r in dip_rows
         if (r["symbol"], r["date_iso"]) not in existing_keys
@@ -549,7 +482,7 @@ def _write_hist_csv(
             writer = csv.DictWriter(
                 f,
                 fieldnames=_HIST_FIELDS,
-                extrasaction="ignore",  # ignora campos extra do dip_record
+                extrasaction="ignore",
             )
             if write_header:
                 writer.writeheader()
@@ -570,16 +503,6 @@ def run_historical_backtest(
     drawdown_threshold: float = -15.0,
     dry_run: bool = False,
 ) -> dict:
-    """
-    F2 (A+B) — Motor interno: detecção de dips + outcomes forward-looking.
-
-    Preferência: chama build_historical_training_set() para a orquestração
-    completa com escrita CSV (F2-C). Esta função é mantida pública para
-    testes unitários e dry_run.
-
-    Retorna dict:
-      total_dips, written, skipped, censored, errors, dip_rows
-    """
     from score import calculate_dip_score, classify_dip_category, is_bluechip
 
     stats: dict = {
@@ -608,7 +531,6 @@ def run_historical_backtest(
             logging.info(f"[hist_backtest] {symbol}: {len(dip_df)} dip(s) candidatos")
             stats["total_dips"] += len(dip_df)
 
-            # Recalcular indicadores no df_full completo para o slicing forward
             df_full = df_full.copy()
             df_full["rsi_14"]       = _rsi_series(df_full["Close"])
             df_full["drawdown_52w"] = _drawdown_from_rolling_high(df_full["Close"], window=252)
@@ -697,7 +619,7 @@ def run_historical_backtest(
             stats["errors"] += 1
 
     logging.info(
-        f"[hist_backtest] Concluído — total={stats['total_dips']} | "
+        f"[hist_backtest] Conclu\u00eddo \u2014 total={stats['total_dips']} | "
         f"escritos={stats['written']} | ignorados={stats['skipped']} | "
         f"censurados={stats['censored']} | erros={stats['errors']}"
     )
@@ -710,46 +632,8 @@ def build_historical_training_set(
     min_score: float = 45.0,
     dry_run: bool = False,
 ) -> dict:
-    """
-    F2-C — Ponto de entrada público do pipeline histórico completo.
-
-    Orquestra F2-A + F2-B + escrita CSV idempotente:
-      1. Chama run_historical_backtest() para detectar dips e calcular
-         todos os outcomes forward-looking (A+B).
-      2. Carrega as chaves (symbol, date_iso) já presentes no CSV para
-         evitar duplicados (idempotência total).
-      3. Escreve apenas as linhas novas no CSV histórico.
-      4. Reporta stats completas ao chamador.
-
-    O CSV de saída (hist_backtest.csv) tem a mesma estrutura de colunas
-    que alert_db.csv para todas as features de ML partilhadas. O campo
-    'source="historical_backtest"' distingue as duas origens.
-
-    Uso típico (Railway, via main.py ou one-shot):
-      from config import WATCHLIST
-      from backtest import build_historical_training_set
-      stats = build_historical_training_set(tickers=WATCHLIST)
-      print(stats)
-
-    Argumentos:
-      tickers     : lista de símbolos
-      output_path : caminho do CSV (None = _HIST_DB_PATH auto)
-      min_score   : score mínimo (default: 45)
-      dry_run     : se True, não grava nada — devolve stats e dip_rows
-
-    Retorna dict:
-      total_dips : dips detectados antes do filtro score
-      written    : dips que passaram score + foram adicionados ao CSV
-      skipped    : dips abaixo de min_score
-      censored   : dips recentes sem outcome_label (right-edge)
-      duplicates : dips já existentes no CSV (ignorados)
-      errors     : falhas de ticker/dip
-      csv_path   : str — caminho do CSV escrito (ou None em dry_run)
-      dip_rows   : list — todos os dip_records (incluindo duplicados)
-    """
     csv_path = output_path or _HIST_DB_PATH
 
-    # F2-A + F2-B
     stats = run_historical_backtest(
         tickers=tickers,
         output_path=csv_path,
@@ -760,12 +644,11 @@ def build_historical_training_set(
     dip_rows = stats.get("dip_rows", [])
 
     if dry_run:
-        logging.info(f"[hist_csv] dry_run=True — {len(dip_rows)} linhas geradas, sem escrita.")
+        logging.info(f"[hist_csv] dry_run=True \u2014 {len(dip_rows)} linhas geradas, sem escrita.")
         stats["duplicates"] = 0
         stats["csv_path"]   = None
         return stats
 
-    # F2-C: idempotência + escrita
     existing_keys = _load_existing_keys(csv_path)
     duplicates    = sum(
         1 for r in dip_rows
@@ -774,12 +657,12 @@ def build_historical_training_set(
 
     written_now = _write_hist_csv(dip_rows, csv_path, existing_keys)
 
-    stats["written"]    = written_now  # substitui o contador interno
+    stats["written"]    = written_now
     stats["duplicates"] = duplicates
     stats["csv_path"]   = str(csv_path)
 
     logging.info(
-        f"[hist_csv] Pipeline completo — "
+        f"[hist_csv] Pipeline completo \u2014 "
         f"novas={written_now} | duplicados={duplicates} | "
         f"censurados={stats['censored']} | CSV={csv_path}"
     )
