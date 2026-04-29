@@ -41,14 +41,14 @@ WATCHLIST: list[dict[str, Any]] = [
 
     # ── CORE EUROPEU ───────────────────────────────────────────────────────────
     {
-        "symbol":   "IS3N.L",
-        "name":     "iShares Core MSCI EM IMI",
+        "symbol":   "IEMA.L",
+        "name":     "iShares MSCI EM IMI UCITS ETF",
         "slot":     "P1",
         "category": CATEGORY_ROTACAO,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 12.0},
         ],
-        "notes": "Entrada imediata com excesso do fundo de emergência. Diversificação Emerging Markets.",
+        "notes": "Entrada imediata com excesso do fundo de emergência. Diversificação Emerging Markets. Ticker LSE.",
     },
 
     # ── DIVIDENDO / REIT ──────────────────────────────────────────────────────
