@@ -1,14 +1,14 @@
 """
-DipRadar — Stock Alert Bot
-Trigger: Yahoo Finance day_losers
-Fundamentais: yfinance
-Catalisadores: Tavily Search API
-Deploy: Railway.app
+DipRadar — Stock Alert Bot v2.0
+Scheduler: APScheduler (duas janelas EOD: 17h45 EU, 21h15 US)
+Data feed: Tiingo EOD + yfinance fallback
 
 Variáveis Railway obrigatórias:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
   TZ=Europe/Lisbon
+
 Variáveis opcionais:
+  TIINGO_API_KEY               (Chunk 3a — data feed principal)
   DROP_THRESHOLD=8
   MIN_MARKET_CAP=2000000000
   SCAN_EVERY_MINUTES=30
@@ -17,16 +17,21 @@ Variáveis opcionais:
   PORTFOLIO_STRESS_PCT=5
   RECOVERY_TARGET_PCT=15
   WATCHLIST_SCAN_ENABLED=true
+  DEGRADATION_DROP_THRESHOLD=15
 """
 
 import os
-import json
 import time
 import logging
-import schedule
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
+
+# APScheduler — substitui `schedule` para cron jobs precisos
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron       import CronTrigger
+import pytz
+
 from market_client import (
     screen_global_dips, screen_structural_dips, screen_period_dips,
     get_fundamentals, get_news, get_historical_pe,
@@ -62,6 +67,12 @@ from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCH
 from alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
 
+# Chunk 3a — data feed
+from data_feed import get_eod_prices, get_latest_price, is_tiingo_available
+
+# Chunk 3 — universe
+from universe import get_full_universe, get_ml_universe, ETF_TICKERS, is_etf
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -76,9 +87,9 @@ MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "50"))
 STRESS_PCT        = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
 RECOVERY_PCT      = float(os.environ.get("RECOVERY_TARGET_PCT", "15"))
 WATCHLIST_ENABLED = os.environ.get("WATCHLIST_SCAN_ENABLED", "true").lower() == "true"
-
-# Degradação: alerta quando score cai >= este valor face ao entry_score
 DEGRADATION_DROP_THRESHOLD = int(os.environ.get("DEGRADATION_DROP_THRESHOLD", "15"))
+
+LISBON_TZ = pytz.timezone("Europe/Lisbon")
 
 _alerted_today:  set  = load_alerts()
 _scan_running:   bool = False
@@ -101,11 +112,9 @@ _SECTOR_ETF = {
     "Real Estate":            "XLRE",
     "Basic Materials":        "XLB",
 }
-
 _sector_etf_cache: dict = {}
 
 def get_sector_change(sector: str) -> float | None:
-    """Retorna a variação do ETF sectorial no dia. Cache por sessão."""
     etf = _SECTOR_ETF.get(sector)
     if not etf:
         return None
@@ -322,8 +331,11 @@ def send_heartbeat() -> None:
     if earnings_alerts:
         lines += ["", "*📅 Earnings próximos (carteira):*"] + sorted(earnings_alerts)
 
+    # Indicador Tiingo
+    tiingo_ok = is_tiingo_available()
     lines += [
         "",
+        f"_{'🟢 Tiingo EOD activo' if tiingo_ok else '🟡 yfinance (sem chave Tiingo)'}_",
         "_Mercado abre às 14h30 Lisboa_",
     ]
 
@@ -390,56 +402,69 @@ def check_portfolio_stress() -> None:
                 logging.warning(f"Portfolio stress MACRO: {pct_total:.1f}%")
 
 
-# ── Thesis Degradation Check ──────────────────────────────────────────────────
+# ── Thesis Degradation Check (EOD-aware) ──────────────────────────────────────
 
-def check_thesis_degradation() -> None:
+def check_thesis_degradation(region: str = "ALL") -> None:
     """
-    Corre diariamente às 15:30 (mercado US aberto).
-    Para cada posição activa com entry_score definido e category != ETF:
-      - Calcula score actual via calculate_dip_score()
-      - Actualiza last_score e last_price
-      - Se drop >= DEGRADATION_DROP_THRESHOLD e ainda não alertado → envia alerta
-      - Se score recuperou para >= entry_score - 5 → reseta flag
-    ETFs são ignorados (category == "ETF" ou entry_score is None).
-    """
-    if not is_market_open():
-        logging.info("[degradation] Mercado fechado, check ignorado.")
-        return
+    Verifica degradação de tese usando preços EOD limpos (Tiingo/yfinance).
+    Chamado em boleia pelo scan europeu (17h45) e americano (21h15).
 
+    region: "EU" | "US" | "ALL"
+      EU  — tickers com sufixo de exchange europeia (.DE, .PA, .L, etc.)
+      US  — tickers sem sufixo (mercado americano)
+      ALL — todos
+    """
     positions = get_positions()
     if not positions:
         logging.info("[degradation] Sem posições activas.")
         return
 
-    logging.info(f"[degradation] A verificar {len(positions)} posições...")
+    _EU_SUFFIXES = (".DE", ".PA", ".AS", ".MC", ".MI", ".L", ".SW",
+                   ".ST", ".CO", ".OL", ".HE", ".BR", ".LS", ".VI", ".WA", ".I")
 
-    for sym, pos in positions.items():
-        entry_score = pos.get("entry_score")
-        category    = pos.get("category", "")
+    def _is_eu(ticker: str) -> bool:
+        return any(ticker.upper().endswith(s) for s in _EU_SUFFIXES)
 
-        # ETFs e posições sem entry_score não participam
-        if entry_score is None or category == "ETF":
-            continue
+    to_check = {
+        sym: pos for sym, pos in positions.items()
+        if (
+            pos.get("entry_score") is not None
+            and pos.get("category", "") != "ETF"
+            and (region == "ALL"
+                 or (region == "EU" and _is_eu(sym))
+                 or (region == "US" and not _is_eu(sym)))
+        )
+    }
 
+    if not to_check:
+        logging.info(f"[degradation] Sem posições para região '{region}'.")
+        return
+
+    logging.info(f"[degradation] A verificar {len(to_check)} posições ({region})...")
+
+    for sym, pos in to_check.items():
+        entry_score = pos["entry_score"]
         try:
-            time.sleep(3)
+            time.sleep(2)
+            # Usa preço EOD limpo via data_feed
+            price = get_latest_price(sym) or 0
+
             fund = get_fundamentals(sym, min_market_cap=0)
             if fund.get("skip"):
-                logging.warning(f"[degradation] {sym}: skip ({fund.get('skip_reason')})")
                 continue
+            if price:
+                fund["price"] = price  # sobrescreve com EOD
 
             earnings_days = get_earnings_days(sym)
             sector_chg    = get_sector_change(fund.get("sector", ""))
             score, _      = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg)
-            price         = fund.get("price") or 0
+            category      = pos.get("category", "")
 
-            # Actualiza dados na posição
             update_position_data(sym, price=price, score=score, category=category)
 
-            drop = entry_score - score
+            drop            = entry_score - score
             already_alerted = pos.get("degradation_alerted", False)
 
-            # Reset se score recuperou
             if already_alerted and score >= entry_score - 5:
                 reset_degradation_flag(sym)
                 send_telegram(
@@ -448,53 +473,42 @@ def check_thesis_degradation() -> None:
                     f"_Flag de degradação limpa — posição estabilizada_\n"
                     f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
                 )
-                logging.info(f"[degradation] {sym}: tese recuperada (score {score:.0f} vs entry {entry_score})")
                 continue
 
-            # Alerta se degradação significativa e ainda não alertado
             if drop >= DEGRADATION_DROP_THRESHOLD and not already_alerted:
-                entry_date  = pos.get("entry_date", "N/D")
-                avg_price   = pos.get("avg_price", 0)
-                pnl_pct     = (price - avg_price) / avg_price * 100 if avg_price else 0
-                sector_cfg  = get_sector_config(fund.get("sector", ""))
-                sector_name = sector_cfg.get("label", fund.get("sector", ""))
-
+                entry_date = pos.get("entry_date", "N/D")
+                avg_price  = pos.get("avg_price", 0)
+                pnl_pct    = (price - avg_price) / avg_price * 100 if avg_price else 0
+                sector_cfg = get_sector_config(fund.get("sector", ""))
                 score_breakdown = build_score_breakdown(fund, sym, earnings_days, sector_change=sector_chg)
 
                 lines = [
                     f"🧨 *Degradação de Tese: {sym}*",
                     f"_Posição em carteira desde {entry_date}_",
+                    f"_Dados EOD — mercado já fechado_",
                     "",
                     f"  📉 Score entry: *{entry_score}/100*",
                     f"  📊 Score actual: *{score:.0f}/100*",
                     f"  🔻 Drop: *-{drop:.0f} pts*",
                     "",
-                    f"  💰 Preço médio: ${avg_price:.2f} | Actual: ${price:.2f}",
+                    f"  💰 Preço médio: ${avg_price:.2f} | Fecho EOD: ${price:.2f}",
                     f"  {_pnl_emoji(pnl_pct)} P&L posição: {pnl_pct:+.1f}%",
-                    f"  🏷️ Categoria: {category} | {sector_name}",
+                    f"  🏷️ Categoria: {category} | {sector_cfg.get('label', '')}",
                     "",
                     score_breakdown,
                     "",
                     f"*⚠️ Reavalia a tese de investimento.*",
-                    f"_Considera: reforçar (se fundamentais OK), manter ou fechar_",
+                    f"_Preço de fecho limpo — considera a tua ordem para amanhã_",
                     f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_",
                 ]
                 send_telegram("\n".join(lines))
                 mark_degradation_alerted(sym)
-                logging.warning(
-                    f"[degradation] Alerta enviado: {sym} "
-                    f"entry={entry_score} actual={score:.0f} drop={drop:.0f}pts"
-                )
-            else:
-                logging.info(
-                    f"[degradation] {sym}: score {score:.0f}/100 "
-                    f"(entry {entry_score}, drop {drop:.0f}pts) — OK"
-                )
+                logging.warning(f"[degradation] {sym}: drop {drop:.0f}pts (entry={entry_score} actual={score:.0f})")
 
         except Exception as e:
             logging.error(f"[degradation] Erro em {sym}: {e}", exc_info=True)
 
-    logging.info("[degradation] Check concluído.")
+    logging.info(f"[degradation] Check ({region}) concluído.")
 
 
 # ── Recovery Alert ────────────────────────────────────────────────────────────
@@ -521,7 +535,6 @@ def check_recovery_alerts() -> None:
                 f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
             )
             mark_stale_alerted(sym)
-            logging.info(f"[recovery] Stop temporal enviado: {sym} ({days_held}d)")
     except Exception as e:
         logging.warning(f"[recovery] Stale check: {e}")
 
@@ -545,7 +558,6 @@ def check_recovery_alerts() -> None:
                     f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
                 )
                 mark_recovery_alerted(sym)
-                logging.info(f"Recovery alert: {sym} ${current:.2f} (+{pct_recovery:.1f}%)")
         except Exception as e:
             logging.warning(f"Recovery check {sym}: {e}")
 
@@ -608,7 +620,6 @@ def send_weekly_dip_scan() -> None:
         lines.append(f"   _{s['category']} | {s['sector']}{rsi_tag}{earn_tag}{upside_tag}_")
         lines.append("")
     send_telegram("\n".join(lines))
-    logging.info(f"Weekly scan enviado: {len(scored)} candidatos")
 
 
 # ── Saturday Weekly Report ────────────────────────────────────────────────────
@@ -728,7 +739,6 @@ def send_saturday_report() -> None:
     save_weekly_log([])
     lines += ["", "_⏰ Próximo report: sábado às 10h_"]
     send_telegram("\n".join(lines))
-    logging.info("Saturday report enviado.")
 
 
 # ── Target Sell / Flip ────────────────────────────────────────────────────────
@@ -835,14 +845,9 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
         _, strategy   = calculate_flip_target(f, s, earnings, catalyst, spy_change, category=category)
         badge         = score_badge(s)
         tier_badge    = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
-
         _, sizing_str = suggest_position_size(
-            score=s,
-            beta=beta,
-            earnings_days=earnings_days,
-            spy_change=spy_change,
+            score=s, beta=beta, earnings_days=earnings_days, spy_change=spy_change,
         )
-
         lines.append(f"*{i}. {sym}*{in_portfolio} {tier_badge} | Score {s:.0f}/100 {badge} | {category}")
         lines.append(f"   💰 ${price} | 🏦 ${mc_b:.1f}B")
         lines.append(f"   {strategy}")
@@ -971,11 +976,7 @@ def analyze_ticker(symbol: str) -> str:
         except Exception:
             pass
 
-        stock_dict = {
-            "symbol":     symbol,
-            "change_pct": change_pct,
-            "region":     "",
-        }
+        stock_dict = {"symbol": symbol, "change_pct": change_pct, "region": ""}
 
         if score >= 75:
             verdict, emoji_str = "COMPRAR", "🟢"
@@ -1070,36 +1071,24 @@ def run_scan() -> None:
                 else:
                     verdict, emoji_str, tier = "MONITORIZAR", "🔵", 3
 
-                reasons = []
-
                 log_alert_snapshot(
-                    symbol=sym,
-                    fundamentals=fund,
-                    score=score,
-                    verdict=verdict,
-                    category=category,
-                    change_day_pct=stock["change_pct"],
-                    rsi_val=rsi_val,
-                    historical_pe=hist_pe,
-                    spy_change=spy_change,
+                    symbol=sym, fundamentals=fund, score=score,
+                    verdict=verdict, category=category,
+                    change_day_pct=stock["change_pct"], rsi_val=rsi_val,
+                    historical_pe=hist_pe, spy_change=spy_change,
                     sector_etf_change=sector_chg,
                 )
 
                 alert_text = build_alert(
                     stock, fund, hist_pe, news,
-                    verdict, emoji_str, reasons, score, rsi_str,
+                    verdict, emoji_str, [], score, rsi_str,
                     category=category,
                 )
 
                 ranked_entries.append({
-                    "symbol":        sym,
-                    "dip_score":     score,
-                    "tier":          tier,
-                    "fundamentals":  fund,
-                    "earnings_date": get_earnings_date(sym),
-                    "earnings_days": earnings_days,
-                    "catalyst":      None,
-                    "category":      category,
+                    "symbol": sym, "dip_score": score, "tier": tier,
+                    "fundamentals": fund, "earnings_date": get_earnings_date(sym),
+                    "earnings_days": earnings_days, "catalyst": None, "category": category,
                 })
 
                 send_telegram(alert_text)
@@ -1115,20 +1104,15 @@ def run_scan() -> None:
                     )
 
                 append_weekly_log({
-                    "symbol":  sym,
-                    "score":   score,
-                    "change":  stock["change_pct"],
-                    "verdict": verdict,
-                    "sector":  fund.get("sector", ""),
-                    "date":    datetime.now().strftime("%d/%m"),
-                    "time":    datetime.now().strftime("%H:%M"),
+                    "symbol": sym, "score": score, "change": stock["change_pct"],
+                    "verdict": verdict, "sector": fund.get("sector", ""),
+                    "date": datetime.now().strftime("%d/%m"),
+                    "time": datetime.now().strftime("%H:%M"),
                 })
                 append_backtest_entry({
-                    "symbol":    sym,
-                    "date":      datetime.now().strftime("%Y-%m-%d"),
-                    "price":     fund.get("price") or stock.get("price", 0),
-                    "score":     score,
-                    "verdict":   verdict,
+                    "symbol": sym, "date": datetime.now().strftime("%Y-%m-%d"),
+                    "price": fund.get("price") or stock.get("price", 0),
+                    "score": score, "verdict": verdict,
                 })
 
             except Exception as e:
@@ -1170,7 +1154,6 @@ def run_ml_outcomes_job() -> None:
         return
 
     if stats.get("updated", 0) == 0 and stats.get("total", 0) == 0:
-        logging.info("[ml_outcomes] Base de dados vazia, nada a fazer.")
         return
 
     db_stats = get_db_stats()
@@ -1201,12 +1184,10 @@ def run_ml_outcomes_job() -> None:
         lines.append("")
     if labeled >= 50:
         lines.append("🚦 *Podes considerar treinar o primeiro modelo ML!*")
-        lines.append("_50+ alertas classificados — usa `train_model.py` com XGBoost_")
     elif labeled > 0:
         lines.append(f"_🕐 {50 - labeled} alertas até poder treinar o modelo ML_")
 
     send_telegram("\n".join(lines))
-    logging.info(f"[ml_outcomes] Done: {stats}")
 
 
 # ── Bot commands handler ──────────────────────────────────────────────────────
@@ -1236,7 +1217,6 @@ def poll_bot_commands() -> None:
                 "analyze_ticker":             analyze_ticker,
                 "get_fundamentals":           get_fundamentals,
                 "get_earnings_days":          get_earnings_days,
-                # Chunk 2c — portfolio activo
                 "get_positions":              get_positions,
                 "update_position_data":       update_position_data,
                 "mark_degradation_alerted":   mark_degradation_alerted,
@@ -1248,38 +1228,161 @@ def poll_bot_commands() -> None:
         logging.warning(f"poll_bot_commands: {e}")
 
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
+# ── EOD Scan Jobs (Chunk 3) ───────────────────────────────────────────────────
 
-def setup_schedule() -> None:
-    schedule.every().day.at("09:00").do(send_heartbeat)
-    schedule.every(SCAN_MINUTES).minutes.do(run_scan)
-    schedule.every(15).minutes.do(check_portfolio_stress)
-    schedule.every(45).minutes.do(run_watchlist_job)
-    schedule.every().day.at("15:00").do(check_recovery_alerts)
-    schedule.every().day.at("15:30").do(check_thesis_degradation)   # Chunk 2c
-    schedule.every().day.at("17:30").do(check_recovery_alerts)
-    schedule.every().monday.at("08:45").do(send_weekly_dip_scan)
-    schedule.every().saturday.at("10:00").do(send_saturday_report)
-    schedule.every().sunday.at("08:00").do(run_ml_outcomes_job)
-    schedule.every().day.at("00:01").do(lambda: (
-        clear_alerts(),
-        _alerted_today.clear(),
-        _stress_alerted.clear(),
-        _sector_etf_cache.clear(),
+def eod_scan_europe() -> None:
+    """
+    17h45 WEST — Scan EOD para Europa.
+    1. check_thesis_degradation (posições EU com dados EOD)
+    2. run_watchlist_job (tickers europeus na watchlist)
+    3. check_recovery_alerts
+    """
+    logging.info("[EOD EU 17:45] A iniciar scan europeu...")
+    check_thesis_degradation(region="EU")
+    run_watchlist_job()
+    check_recovery_alerts()
+    logging.info("[EOD EU 17:45] Scan europeu concluído.")
+
+
+def eod_scan_us() -> None:
+    """
+    21h15 WEST — Scan EOD para EUA.
+    1. check_thesis_degradation (posições US com dados EOD)
+    2. run_scan (dip scan principal)
+    3. check_recovery_alerts
+    """
+    logging.info("[EOD US 21:15] A iniciar scan americano...")
+    check_thesis_degradation(region="US")
+    run_scan()
+    check_recovery_alerts()
+    logging.info("[EOD US 21:15] Scan americano concluído.")
+
+
+# ── Scheduler APScheduler ─────────────────────────────────────────────────────
+
+def setup_schedule() -> BlockingScheduler:
+    """
+    Scheduler APScheduler com todas as janelas de operação.
+
+    Janelas EOD (Chunk 3):
+      17h45 WEST — eod_scan_europe()  (Europa fechou às 16h30)
+      21h15 WEST — eod_scan_us()      (EUA fechou às 21h00)
+
+    Restantes jobs mantidos de versões anteriores.
+    """
+    scheduler = BlockingScheduler(timezone=LISBON_TZ)
+
+    # ── Heartbeat diário ───────────────────────────────────────────────────────
+    scheduler.add_job(
+        send_heartbeat, CronTrigger(hour=9, minute=0, timezone=LISBON_TZ),
+        id="heartbeat", name="Heartbeat 09:00",
+    )
+
+    # ── Scan intra-dia (durante horário de mercado) ────────────────────────────
+    # Mantido para alertas em tempo real durante a sessão
+    scheduler.add_job(
+        run_scan,
+        CronTrigger(
+            minute=f"*/{SCAN_MINUTES}",
+            hour="14-21",  # 14h30-21h00 WEST (US market hours)
+            day_of_week="mon-fri",
+            timezone=LISBON_TZ,
+        ),
+        id="intraday_scan", name=f"Scan intra-dia /{SCAN_MINUTES}min",
+    )
+
+    # ── Portfolio stress (durante mercado US) ──────────────────────────────────
+    scheduler.add_job(
+        check_portfolio_stress,
+        CronTrigger(
+            minute="*/15",
+            hour="14-21",
+            day_of_week="mon-fri",
+            timezone=LISBON_TZ,
+        ),
+        id="stress_check", name="Portfolio stress /15min",
+    )
+
+    # ── Watchlist intra-dia ────────────────────────────────────────────────────
+    scheduler.add_job(
+        run_watchlist_job,
+        CronTrigger(
+            minute="*/45",
+            hour="9-21",
+            day_of_week="mon-fri",
+            timezone=LISBON_TZ,
+        ),
+        id="watchlist_intraday", name="Watchlist intra-dia /45min",
+    )
+
+    # ── EOD Europa — 17h45 WEST ────────────────────────────────────────────────
+    scheduler.add_job(
+        eod_scan_europe,
+        CronTrigger(hour=17, minute=45, day_of_week="mon-fri", timezone=LISBON_TZ),
+        id="eod_europe", name="EOD Europa 17:45",
+    )
+
+    # ── EOD USA — 21h15 WEST ──────────────────────────────────────────────────
+    scheduler.add_job(
+        eod_scan_us,
+        CronTrigger(hour=21, minute=15, day_of_week="mon-fri", timezone=LISBON_TZ),
+        id="eod_us", name="EOD EUA 21:15",
+    )
+
+    # ── Weekly jobs ────────────────────────────────────────────────────────────
+    scheduler.add_job(
+        send_weekly_dip_scan,
+        CronTrigger(day_of_week="mon", hour=8, minute=45, timezone=LISBON_TZ),
+        id="weekly_dip_scan", name="Weekly dip scan seg 08:45",
+    )
+    scheduler.add_job(
+        send_saturday_report,
+        CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=LISBON_TZ),
+        id="saturday_report", name="Saturday report 10:00",
+    )
+    scheduler.add_job(
+        run_ml_outcomes_job,
+        CronTrigger(day_of_week="sun", hour=8, minute=0, timezone=LISBON_TZ),
+        id="ml_outcomes", name="ML outcomes dom 08:00",
+    )
+
+    # ── Reset diário meia-noite ────────────────────────────────────────────────
+    def _daily_reset():
+        clear_alerts()
+        _alerted_today.clear()
+        _stress_alerted.clear()
+        _sector_etf_cache.clear()
         logging.info("Reset diário efectuado.")
-    ))
-    schedule.every(10).seconds.do(poll_bot_commands)
-    logging.info("Scheduler configurado.")
+
+    scheduler.add_job(
+        _daily_reset,
+        CronTrigger(hour=0, minute=1, timezone=LISBON_TZ),
+        id="daily_reset", name="Reset diário 00:01",
+    )
+
+    # ── Bot commands polling ───────────────────────────────────────────────────
+    scheduler.add_job(
+        poll_bot_commands,
+        "interval", seconds=10,
+        id="bot_poll", name="Bot poll /10s",
+    )
+
+    logging.info("[scheduler] APScheduler configurado com todas as janelas.")
+    return scheduler
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.info("🚀 DipRadar a iniciar...")
-    setup_schedule()
+    logging.info("🚀 DipRadar v2.0 a iniciar...")
+    logging.info(f"  Tiingo: {'🟢 ACTIVO' if is_tiingo_available() else '🟡 sem chave — yfinance fallback'}")
+
+    scheduler = setup_schedule()
+
     send_heartbeat()
-    run_scan()
-    logging.info("Loop principal iniciado.")
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+
+    logging.info("[scheduler] A arrancar loop principal...")
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("DipRadar encerrado.")
