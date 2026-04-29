@@ -1121,7 +1121,30 @@ def run_scan() -> None:
                         f"[ml] {sym}: label={ml_result.label} "
                         f"prob={ml_result.win_prob:.2f} conf={ml_result.confidence}"
                     )
+                  
+                # ── Score V2 Engine (Chunk 9) ──────────────────────────────
+                ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
+                score_data = score_from_fundamentals(fund, ml_prob=ml_prob_v2)
 
+                if score_data.get("skip_recommended"):
+                    append_rejected_log({
+                        "symbol": sym, "change": stock["change_pct"],
+                        "reason": f"v2_skip: conf={score_data['confidence']:.2f}",
+                        "score": score_data["final_score"], "verdict": "SKIP",
+                    })
+                    logging.info(f"[v2] {sym} rejeitado — confidence insuficiente")
+                    continue
+
+                score = score_data["final_score"]
+                logging.info(
+                    f"[v2] {sym}: final={score:.1f} | "
+                    f"Q={score_data['quality_score']:.2f} "
+                    f"V={score_data['value_score']:.2f} "
+                    f"T={score_data['timing_score']:.2f} "
+                    f"conf={score_data['confidence']:.2f} "
+                    f"trap={score_data['is_value_trap']}"
+                )
+              
                 log_alert_snapshot(
                     symbol=sym, fundamentals=fund, score=score,
                     verdict=verdict, category=category,
