@@ -1,560 +1,507 @@
 """
-ml_pipeline.py — DipRadar 2.0 | Chunk 4: O Tridente
+ml_pipeline.py — Chunk 7: Motor de treino local standalone.
 
-Arquitectura de três modelos isolados:
-  Modelo 1 — O Porteiro      : RandomForest/XGB Classificador WIN_40/WIN_20/NEUTRAL/LOSS_15
-  Modelo 2 — O Sommelier MFE : Regressor treinado APENAS em vencedores (WIN_40 + WIN_20)
-  Modelo 3 — O Gestor MAE    : Regressor de risco de drawdown > -5% antes do MFE
+USO:
+    python ml_pipeline.py --train dados_historicos.parquet
+    python ml_pipeline.py --train dados_historicos.parquet --output models/
+    python ml_pipeline.py --train dados_historicos.parquet --algo xgb --no-stage2
+    python ml_pipeline.py --train dados_historicos.parquet --fixed-threshold 0.55
 
-Anti-leakage garantido: generate_targets() usa apenas preços futuros (shift negativo)
-e os targets são removidos do feature set antes do treino.
+OUTPUT:
+    data/dip_model_stage1.pkl   — Porteiro (WIN vs NO_WIN)
+    data/dip_model_stage2.pkl   — Sommelier (WIN_40 vs WIN_20)  [opcional]
+
+ESTRUTURA DO BUNDLE (compatível com ml_predictor.py):
+    {
+        "model":            Pipeline (imputer + scaler + classifier),
+        "feature_columns":  list[str],   # ordem exata das colunas
+        "threshold":        float,        # threshold de Precision-Recall ótimo
+        "algorithm":        str,
+        "auc_pr":           float,
+        "n_samples":        int,
+        "train_date":       str,
+    }
 """
 
-import os
-import logging
+from __future__ import annotations
+
+import argparse
+import pickle
+import sys
 import warnings
-import joblib
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-from pathlib import Path
-from typing import Optional
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.metrics import classification_report, mean_absolute_error, r2_score
+# ──────────────────────────────────────────────────────────────────────────────
+# FEATURE COLS — espelho exato do _FEATURE_MAP no ml_predictor.py
+# ──────────────────────────────────────────────────────────────────────────────
 
-try:
-    from xgboost import XGBClassifier, XGBRegressor
-    XGB_AVAILABLE = True
-except ImportError:
-    XGB_AVAILABLE = False
-    warnings.warn("xgboost not installed — a usar RandomForest como fallback")
-
-try:
-    from imblearn.over_sampling import SMOTE
-    SMOTE_AVAILABLE = True
-except ImportError:
-    SMOTE_AVAILABLE = False
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Constantes
-# ---------------------------------------------------------------------------
-MODELS_DIR = Path(os.getenv("MODELS_DIR", "models"))
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_PATH = MODELS_DIR / "dip_model.pkl"
-
-FORWARD_WINDOW = int(os.getenv("FORWARD_WINDOW", "20"))   # dias de look-ahead
-WIN_40_THRESH  = float(os.getenv("WIN_40_THRESH",  "0.40"))  # +40%
-WIN_20_THRESH  = float(os.getenv("WIN_20_THRESH",  "0.20"))  # +20%
-LOSS_THRESH    = float(os.getenv("LOSS_THRESH",   "-0.15"))  # -15%
-MAE_RISK_THRESH = float(os.getenv("MAE_RISK_THRESH", "-0.05")) # -5% = risco
-
-# Features técnicas e fundamentais que o modelo consome
-# (devem existir no DataFrame de entrada)
-FEATURE_COLS = [
-    # Momentum / Técnicas
-    "rsi_14", "rsi_7",
-    "drawdown_from_52w_high",
-    "pct_change_5d", "pct_change_20d", "pct_change_60d",
-    "vol_ratio_20_50",          # volume relativo 20d vs 50d
-    "atr_14_pct",               # ATR normalizado por preço
-    "dist_from_200ma",          # distância da MA200
-    "dist_from_50ma",
-    # Fundamentais
-    "pe_ratio",
-    "pb_ratio",
-    "ps_ratio",
-    "debt_to_equity",
-    "roe",
-    "revenue_growth_yoy",
+FEATURE_COLS: list[str] = [
+    # Técnico
+    "rsi",
+    "drawdown_pct",          # alias no predictor: drawdown_from_high
+    "change_day_pct",
+    # Valuação
+    "pe_ratio",              # alias: pe
+    "pb_ratio",              # alias: pb
+    "fcf_yield",
+    "analyst_upside",
+    # Crescimento
+    "revenue_growth",
     "gross_margin",
-    "analyst_upside_pct",       # (target_price - price) / price
-    # Macro proxy
-    "sector_rsi_delta",         # RSI da ação vs RSI médio do sector
+    # Saúde financeira
+    "debt_to_equity",
+    "beta",
+    "short_pct",             # alias: short_percent_of_float
+    # Contexto de mercado
+    "spy_change",
+    "sector_etf_change",
+    "earnings_days",
+    "market_cap_b",          # alias: market_cap / 1e9
+    # Score do motor de regras (meta-feature poderosa)
+    "dip_score",             # alias: score
 ]
 
-# Colunas de target (nunca entram no X de treino)
-TARGET_COLS = ["_label", "_mfe", "_mae", "_future_max", "_future_min"]
+# Mapeamento alias → nome canónico (colunas do Parquet podem vir com nomes originais)
+COL_ALIASES: dict[str, str] = {
+    "drawdown_from_high":     "drawdown_pct",
+    "pe":                     "pe_ratio",
+    "pb":                     "pb_ratio",
+    "short_percent_of_float": "short_pct",
+    "score":                  "dip_score",
+    "market_cap":             "market_cap_b",
+}
+
+# Colunas alvo
+TARGET_COL = "outcome_label"   # WIN_40 | WIN_20 | NEUTRAL | LOSS_15
+TARGET_S1  = "target_s1"       # 1 = WIN | 0 = NO_WIN
+TARGET_S2  = "target_s2"       # 1 = WIN_40 | 0 = WIN_20 (subset de wins)
 
 
-# ===========================================================================
-# 1. GERAÇÃO DE TARGETS (sem data leakage)
-# ===========================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. CARREGAMENTO E PRÉ-PROCESSAMENTO
+# ──────────────────────────────────────────────────────────────────────────────
 
-def generate_targets(df: pd.DataFrame, price_col: str = "close") -> pd.DataFrame:
-    """
-    Calcula os três targets usando preços futuros (forward-looking).
-    Adiciona colunas _label, _mfe, _mae ao DataFrame.
+def load_and_prep(parquet_path: str) -> pd.DataFrame:
+    print(f"[pipeline] A ler {parquet_path} ...")
+    df = pd.read_parquet(parquet_path)
+    print(f"[pipeline] Raw shape: {df.shape}")
 
-    Anti-leakage: usa shift(-N) para olhar para o futuro —
-    estas colunas são SEMPRE removidas antes de qualquer treino.
+    # Normaliza nomes de colunas (lowercase)
+    df.rename(columns=str.lower, inplace=True)
 
-    Args:
-        df: DataFrame com coluna `price_col` e pelo menos FORWARD_WINDOW
-            linhas futuras por ticker.
-        price_col: nome da coluna de preço de fecho.
+    # Aplica aliases
+    for alias, canon in COL_ALIASES.items():
+        if alias in df.columns and canon not in df.columns:
+            df[canon] = df[alias]
 
-    Returns:
-        DataFrame original + colunas _label, _mfe, _mae.
-        As últimas FORWARD_WINDOW linhas ficam com NaN (descartadas no treino).
-    """
-    df = df.copy()
-    n = FORWARD_WINDOW
+    # market_cap em billions (detecta se está em unidade absoluta)
+    if "market_cap_b" in df.columns:
+        df["market_cap_b"] = df["market_cap_b"].apply(
+            lambda v: float(v) / 1e9 if (v is not None and not np.isnan(float(v)) and abs(float(v)) > 1e7) else v
+        )
 
-    # Preço de entrada = preço actual
-    entry = df[price_col]
+    # Remove linhas sem label válido
+    df = df[df[TARGET_COL].notna()].copy()
+    df = df[df[TARGET_COL].isin(["WIN_40", "WIN_20", "NEUTRAL", "LOSS_15"])].copy()
+    print(f"[pipeline] Após filtro de labels: {len(df)} linhas")
 
-    # Máximo e mínimo dentro da janela futura
-    df["_future_max"] = (
-        df[price_col]
-        .shift(-1)                              # começa no dia seguinte
-        .rolling(window=n, min_periods=n)
-        .max()
-        .shift(-(n - 1))                        # alinha com a linha de entrada
+    # Deriva targets binários
+    df[TARGET_S1] = df[TARGET_COL].apply(lambda x: 1 if x in ("WIN_40", "WIN_20") else 0)
+    df[TARGET_S2] = df[TARGET_COL].apply(
+        lambda x: (1 if x == "WIN_40" else 0) if x in ("WIN_40", "WIN_20") else np.nan
     )
-    df["_future_min"] = (
-        df[price_col]
-        .shift(-1)
-        .rolling(window=n, min_periods=n)
-        .min()
-        .shift(-(n - 1))
+
+    # Adiciona colunas em falta com NaN (SimpleImputer trata depois)
+    for col in FEATURE_COLS:
+        if col not in df.columns:
+            df[col] = np.nan
+            print(f"[pipeline] Aviso: coluna '{col}' não encontrada — imputada com NaN")
+
+    # Ordena cronologicamente para split sem look-ahead
+    date_col = next(
+        (c for c in df.columns if c in ("date", "alert_date", "ts", "timestamp")), None
     )
+    if date_col:
+        df.sort_values(date_col, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        print(f"[pipeline] Ordenado por '{date_col}'")
+    else:
+        print("[pipeline] Aviso: sem coluna de data — assume ordem cronológica existente")
 
-    # MFE = retorno máximo possível dentro da janela (em %)
-    df["_mfe"] = (df["_future_max"] - entry) / entry * 100
-
-    # MAE = drawdown máximo possível dentro da janela (em %)
-    df["_mae"] = (df["_future_min"] - entry) / entry * 100
-
-    # Retorno de fecho ao fim de FORWARD_WINDOW dias
-    df["_fwd_return"] = df[price_col].pct_change(n).shift(-n)
-
-    # Label de classificação
-    def _classify(row):
-        r = row["_fwd_return"]
-        mfe = row["_mfe"]
-        if pd.isna(r):
-            return np.nan
-        if mfe >= WIN_40_THRESH * 100:
-            return "WIN_40"
-        elif r >= WIN_20_THRESH * 100 or mfe >= WIN_20_THRESH * 100:
-            return "WIN_20"
-        elif r <= LOSS_THRESH * 100:
-            return "LOSS_15"
-        else:
-            return "NEUTRAL"
-
-    df["_label"] = df.apply(_classify, axis=1)
-
-    # Drop coluna auxiliar
-    df.drop(columns=["_fwd_return"], inplace=True)
-
-    log.info(
-        "generate_targets: %d linhas | label dist:\n%s",
-        len(df.dropna(subset=["_label"])),
-        df["_label"].value_counts(dropna=True).to_string(),
-    )
     return df
 
 
-# ===========================================================================
-# 2. CONSTRUÇÃO DOS PIPELINES sklearn (com Imputer + Scaler anti-leakage)
-# ===========================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. SPLIT TEMPORAL (sem look-ahead bias)
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _build_classifier():
-    """Pipeline do Porteiro — imputer + scaler + classificador."""
-    estimator = (
-        XGBClassifier(
+def temporal_split(
+    df: pd.DataFrame, test_ratio: float = 0.20
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Divide train/test por ordem cronológica (sem shuffle)."""
+    n     = len(df)
+    split = int(n * (1 - test_ratio))
+    train = df.iloc[:split].copy()
+    test  = df.iloc[split:].copy()
+    print(
+        f"[pipeline] Split: train={len(train)} | test={len(test)} "
+        f"(test ratio={test_ratio:.0%})"
+    )
+    return train, test
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. TREINO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_pipeline(algo: str = "rf", scale: bool = True):
+    """Constrói sklearn Pipeline: imputer + (scaler) + classifier."""
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    steps: list = [("imputer", SimpleImputer(strategy="median"))]
+    if scale:
+        steps.append(("scaler", StandardScaler()))
+
+    if algo == "rf":
+        clf = RandomForestClassifier(
             n_estimators=400,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            use_label_encoder=False,
-            eval_metric="mlogloss",
-            random_state=42,
-            n_jobs=-1,
-        )
-        if XGB_AVAILABLE
-        else RandomForestClassifier(
-            n_estimators=400,
-            max_depth=10,
+            max_depth=8,
             min_samples_leaf=5,
             class_weight="balanced",
             random_state=42,
             n_jobs=-1,
         )
-    )
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler",  StandardScaler()),
-        ("clf",     estimator),
-    ])
-
-
-def _build_mfe_regressor():
-    """Pipeline do Sommelier MFE — treinado APENAS em vencedores."""
-    estimator = (
-        XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            n_jobs=-1,
-        )
-        if XGB_AVAILABLE
-        else RandomForestRegressor(
-            n_estimators=300,
-            max_depth=8,
-            min_samples_leaf=5,
-            random_state=42,
-            n_jobs=-1,
-        )
-    )
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler",  StandardScaler()),
-        ("reg",     estimator),
-    ])
-
-
-def _build_mae_regressor():
-    """Pipeline do Gestor de Risco MAE — regressor de drawdown."""
-    estimator = (
-        XGBRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            n_jobs=-1,
-        )
-        if XGB_AVAILABLE
-        else RandomForestRegressor(
-            n_estimators=300,
-            max_depth=8,
-            min_samples_leaf=5,
-            random_state=42,
-            n_jobs=-1,
-        )
-    )
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler",  StandardScaler()),
-        ("reg",     estimator),
-    ])
-
-
-# ===========================================================================
-# 3. CLASSE TRIDENTE
-# ===========================================================================
-
-class TridentModel:
-    """
-    Encapsula os três modelos do Tridente.
-
-    Uso:
-        trident = TridentModel()
-        trident.fit(df_com_targets)
-        trident.save()
-
-        trident = TridentModel.load()
-        resultado = trident.predict(row_series)
-    """
-
-    CLASS_ORDER = ["WIN_40", "WIN_20", "NEUTRAL", "LOSS_15"]
-    WIN_CLASSES  = {"WIN_40", "WIN_20"}
-
-    def __init__(self):
-        self.porteiro  = _build_classifier()
-        self.sommelier = _build_mfe_regressor()
-        self.gestor    = _build_mae_regressor()
-        self._feature_cols: list[str] = FEATURE_COLS
-        self._trained = False
-
-    # -------------------------------------------------------------------
-    # fit
-    # -------------------------------------------------------------------
-    def fit(self, df: pd.DataFrame) -> "TridentModel":
-        """
-        Treina os três modelos.
-
-        Args:
-            df: DataFrame com features + colunas _label, _mfe, _mae
-                (geradas por generate_targets).
-
-        Raises:
-            ValueError: se as colunas obrigatórias não existirem.
-        """
-        required = set(self._feature_cols + ["_label", "_mfe", "_mae"])
-        missing  = required - set(df.columns)
-        if missing:
-            raise ValueError(f"Colunas em falta no DataFrame: {missing}")
-
-        # Remove linhas sem target (as últimas FORWARD_WINDOW por ticker)
-        df_clean = df.dropna(subset=["_label", "_mfe", "_mae"]).copy()
-        log.info("fit: %d amostras depois de dropna targets", len(df_clean))
-
-        # Feature matrix — garantia anti-leakage: apenas FEATURE_COLS
-        X = df_clean[self._feature_cols]
-        y_class = df_clean["_label"]
-        y_mfe   = df_clean["_mfe"]
-        y_mae   = df_clean["_mae"]
-
-        # ---- Modelo 1: Porteiro ----------------------------------------
-        log.info("Treino Porteiro (classificador)...")
-        X_clf, y_clf = X, y_class
-
-        # SMOTE para balancear classes se disponível
-        if SMOTE_AVAILABLE:
-            try:
-                sm = SMOTE(random_state=42, k_neighbors=3)
-                # SMOTE precisa de arrays numpy (não Pipeline), aplicamos antes
-                imputer_tmp  = SimpleImputer(strategy="median")
-                X_imp = imputer_tmp.fit_transform(X_clf)
-                X_sm, y_sm = sm.fit_resample(X_imp, y_clf)
-                # Re-wrap como DataFrame para o Pipeline (scaler + clf)
-                X_clf_final = pd.DataFrame(X_sm, columns=self._feature_cols)
-                y_clf_final = pd.Series(y_sm)
-                # Ajusta o Pipeline sem o imputer (já feito)
-                pipe_no_imp = Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("clf",    self.porteiro.named_steps["clf"]),
-                ])
-                pipe_no_imp.fit(X_clf_final, y_clf_final)
-                # Substitui o porteiro pelo pipeline ajustado
-                self.porteiro = pipe_no_imp
-                log.info("SMOTE aplicado: %d amostras", len(X_clf_final))
-            except Exception as e:
-                log.warning("SMOTE falhou (%s) — treino sem balanceamento", e)
-                self.porteiro.fit(X_clf, y_clf)
-        else:
-            self.porteiro.fit(X_clf, y_clf)
-
-        # Cross-val rápido (3-fold)
+    elif algo == "xgb":
         try:
-            cv_scores = cross_val_score(
-                self.porteiro, X_clf, y_clf,
-                cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-                scoring="f1_weighted", n_jobs=-1,
+            from xgboost import XGBClassifier
+            clf = XGBClassifier(
+                n_estimators=400,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                eval_metric="logloss",
+                verbosity=0,
+                use_label_encoder=False,
             )
-            log.info("Porteiro CV f1_weighted: %.3f ± %.3f", cv_scores.mean(), cv_scores.std())
-        except Exception as e:
-            log.warning("Cross-val Porteiro falhou: %s", e)
-
-        # ---- Modelo 2: Sommelier MFE (apenas vencedores) ---------------
-        log.info("Treino Sommelier MFE (apenas WIN_40 + WIN_20)...")
-        mask_win = y_class.isin(self.WIN_CLASSES)
-        X_win    = X[mask_win]
-        y_mfe_win = y_mfe[mask_win]
-
-        if len(X_win) < 30:
-            log.warning("Sommelier: apenas %d amostras vencedoras — modelo pode ser fraco", len(X_win))
-
-        self.sommelier.fit(X_win, y_mfe_win)
-        mfe_pred  = self.sommelier.predict(X_win)
-        mfe_mae   = mean_absolute_error(y_mfe_win, mfe_pred)
-        mfe_r2    = r2_score(y_mfe_win, mfe_pred)
-        log.info("Sommelier MFE — MAE: %.2f%% | R²: %.3f (in-sample)", mfe_mae, mfe_r2)
-
-        # ---- Modelo 3: Gestor MAE (drawdown, todo o dataset) -----------
-        log.info("Treino Gestor MAE (risco de drawdown)...")
-        self.gestor.fit(X, y_mae)
-        mae_pred = self.gestor.predict(X)
-        mae_mae  = mean_absolute_error(y_mae, mae_pred)
-        mae_r2   = r2_score(y_mae, mae_pred)
-        log.info("Gestor MAE — MAE: %.2f%% | R²: %.3f (in-sample)", mae_mae, mae_r2)
-
-        self._trained = True
-        log.info("✅ Tridente treinado com sucesso.")
-        return self
-
-    # -------------------------------------------------------------------
-    # predict
-    # -------------------------------------------------------------------
-    def predict(self, X: pd.DataFrame | pd.Series) -> dict:
-        """
-        Inferência ao vivo para uma ou mais linhas.
-
-        Args:
-            X: pd.Series (linha única) ou pd.DataFrame (múltiplas linhas).
-               Deve conter as colunas de FEATURE_COLS.
-
-        Returns (linha única):
-            {
-                "class":         "WIN_20",
-                "confidence":    0.78,
-                "mfe_target":    24.5,    # % ganho esperado
-                "mae_risk":     -3.2,     # % drawdown esperado
-                "mae_risk_flag": True,    # True se mae_risk < MAE_RISK_THRESH
-            }
-        Returns (múltiplas linhas):
-            Lista de dicionários acima.
-        """
-        if not self._trained:
-            raise RuntimeError("TridentModel não treinado. Chama fit() ou load() primeiro.")
-
-        # Normaliza para DataFrame
-        if isinstance(X, pd.Series):
-            X_df = X[self._feature_cols].to_frame().T
-            single = True
-        else:
-            X_df = X[self._feature_cols]
-            single = False
-
-        # Porteiro
-        proba = self.porteiro.predict_proba(X_df)
-        classes = self.porteiro.classes_
-        pred_classes = self.porteiro.predict(X_df)
-
-        results = []
-        for i, pred_class in enumerate(pred_classes):
-            conf = float(proba[i][list(classes).index(pred_class)])
-
-            # Sommelier MFE — só corre se classe vencedora
-            if pred_class in self.WIN_CLASSES:
-                mfe_val = float(self.sommelier.predict(X_df.iloc[[i]])[0])
-            else:
-                mfe_val = 0.0
-
-            # Gestor MAE — sempre
-            mae_val  = float(self.gestor.predict(X_df.iloc[[i]])[0])
-            mae_flag = mae_val <= MAE_RISK_THRESH * 100
-
-            results.append({
-                "class":         pred_class,
-                "confidence":    round(conf, 4),
-                "mfe_target":    round(mfe_val, 2),
-                "mae_risk":      round(mae_val, 2),
-                "mae_risk_flag": mae_flag,
-            })
-
-        return results[0] if single else results
-
-    # -------------------------------------------------------------------
-    # feature importance
-    # -------------------------------------------------------------------
-    def feature_importance(self) -> pd.DataFrame:
-        """Devolve importância de features do Porteiro (se disponível)."""
+        except ImportError:
+            print("[pipeline] xgboost não instalado — fallback para GradientBoosting")
+            clf = GradientBoostingClassifier(
+                n_estimators=300, max_depth=5, learning_rate=0.05,
+                subsample=0.8, random_state=42,
+            )
+    elif algo == "lgbm":
         try:
-            clf = self.porteiro.named_steps.get("clf")
-            imp = clf.feature_importances_
-            return (
-                pd.DataFrame({"feature": self._feature_cols, "importance": imp})
-                .sort_values("importance", ascending=False)
-                .reset_index(drop=True)
+            from lightgbm import LGBMClassifier
+            clf = LGBMClassifier(
+                n_estimators=400, max_depth=8, learning_rate=0.05,
+                class_weight="balanced", random_state=42,
+                n_jobs=-1, verbose=-1,
             )
-        except Exception as e:
-            log.warning("feature_importance indisponível: %s", e)
-            return pd.DataFrame()
+        except ImportError:
+            print("[pipeline] lightgbm não instalado — fallback para RF")
+            clf = RandomForestClassifier(
+                n_estimators=400, class_weight="balanced",
+                random_state=42, n_jobs=-1,
+            )
+    else:
+        raise ValueError(f"Algoritmo desconhecido: {algo!r}  (usa rf | xgb | lgbm)")
 
-    # -------------------------------------------------------------------
-    # persistência
-    # -------------------------------------------------------------------
-    def save(self, path: Path = MODEL_PATH) -> None:
-        joblib.dump(self, path)
-        log.info("Tridente guardado em %s", path)
-
-    @classmethod
-    def load(cls, path: Path = MODEL_PATH) -> "TridentModel":
-        if not path.exists():
-            raise FileNotFoundError(f"Modelo não encontrado: {path}")
-        model = joblib.load(path)
-        log.info("Tridente carregado de %s", path)
-        return model
+    steps.append(("clf", clf))
+    return Pipeline(steps)
 
 
-# ===========================================================================
-# 4. FUNÇÃO DE INFERÊNCIA PÚBLICA (importada pelo main.py)
-# ===========================================================================
-
-_trident_cache: Optional[TridentModel] = None
-
-
-def predict_dip(features: pd.Series | dict) -> dict:
+def _find_optimal_threshold(
+    pipeline, X_test: np.ndarray, y_test: np.ndarray
+) -> float:
     """
-    Função de inferência ao vivo. Carrega o modelo na primeira chamada
-    e reutiliza (singleton em memória).
-
-    Args:
-        features: pd.Series ou dict com as FEATURE_COLS do ticker.
-
-    Returns:
-        {
-            "class":         "WIN_20",
-            "confidence":    0.78,
-            "mfe_target":    24.5,
-            "mae_risk":     -3.2,
-            "mae_risk_flag": True,
-        }
-
-    Raises:
-        FileNotFoundError: se dip_model.pkl não existir (corre train primeiro).
+    Threshold que maximiza F1 no test set,
+    com constraint de Precision >= 0.40 (evita excesso de falsos positivos).
     """
-    global _trident_cache
+    from sklearn.metrics import precision_recall_curve
 
-    if _trident_cache is None:
-        _trident_cache = TridentModel.load(MODEL_PATH)
+    probs          = pipeline.predict_proba(X_test)[:, 1]
+    prec, rec, thr = precision_recall_curve(y_test, probs)
+    f1s            = 2 * prec * rec / (prec + rec + 1e-9)
+    valid          = prec[:-1] >= 0.40
+    if valid.any():
+        best_idx = np.where(valid, f1s[:-1], 0.0).argmax()
+    else:
+        best_idx = f1s[:-1].argmax()
+    best_thr = float(thr[best_idx])
+    print(f"[pipeline] Threshold ótimo: {best_thr:.4f} (F1={f1s[best_idx]:.3f})")
+    return best_thr
 
-    if isinstance(features, dict):
-        features = pd.Series(features)
 
-    return _trident_cache.predict(features)
+def train_stage1(
+    train_df: pd.DataFrame,
+    test_df:  pd.DataFrame,
+    algo:     str  = "rf",
+    threshold_search: bool = True,
+) -> dict:
+    from sklearn.metrics import (
+        classification_report,
+        confusion_matrix,
+        average_precision_score,
+    )
+
+    X_train = train_df[FEATURE_COLS].values.astype(np.float32)
+    y_train = train_df[TARGET_S1].values
+    X_test  = test_df[FEATURE_COLS].values.astype(np.float32)
+    y_test  = test_df[TARGET_S1].values
+
+    print(f"\n{'='*60}")
+    print(f"[STAGE 1 — Porteiro] {algo.upper()} | {len(X_train)} amostras de treino")
+    print(f"  Wins treino: {y_train.sum()} ({y_train.mean():.1%})")
+    print(f"  Wins teste:  {y_test.sum()} ({y_test.mean():.1%})")
+    print(f"{'='*60}")
+
+    pipeline = _build_pipeline(algo=algo, scale=(algo in ("rf", "lgbm")))
+
+    # XGBoost: scale_pos_weight para imbalance (alternativa ao class_weight)
+    if algo == "xgb":
+        ratio = max((y_train == 0).sum() / max((y_train == 1).sum(), 1), 1.0)
+        pipeline.named_steps["clf"].set_params(scale_pos_weight=ratio)
+        print(f"[pipeline] XGB scale_pos_weight = {ratio:.2f}")
+
+    pipeline.fit(X_train, y_train)
+
+    # Threshold
+    threshold = 0.50
+    if threshold_search:
+        threshold = _find_optimal_threshold(pipeline, X_test, y_test)
+
+    probs  = pipeline.predict_proba(X_test)[:, 1]
+    y_pred = (probs >= threshold).astype(int)
+    auc_pr = average_precision_score(y_test, probs)
+
+    print(f"\n[STAGE 1] Resultados @ threshold = {threshold:.4f}")
+    print(f"  AUC-PR: {auc_pr:.4f}  (1.0 = perfeito | baseline = {y_test.mean():.3f})")
+    print()
+    print(classification_report(
+        y_test, y_pred,
+        target_names=["NO_WIN (0)", "WIN (1)"],
+        digits=3,
+    ))
+
+    # Confusion matrix anotada
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    print("  Confusion Matrix:")
+    print(f"  {'':18} Pred NO_WIN  Pred WIN")
+    print(f"  Real NO_WIN      {tn:7d}   {fp:7d}")
+    print(f"  Real WIN         {fn:7d}   {tp:7d}")
+    print(f"  FP (alertas errados): {fp}  │  FN (dips perdidos): {fn}")
+
+    # Feature importance
+    clf_step = pipeline.named_steps["clf"]
+    if hasattr(clf_step, "feature_importances_"):
+        imp  = clf_step.feature_importances_
+        fi   = sorted(zip(FEATURE_COLS, imp), key=lambda x: x[1], reverse=True)
+        print("\n  Feature Importance (Top 10):")
+        for feat, score in fi[:10]:
+            bar = "█" * int(score * 60)
+            print(f"    {feat:<26} {score:.4f}  {bar}")
+
+    return {
+        "model":           pipeline,
+        "feature_columns": FEATURE_COLS,
+        "threshold":       threshold,
+        "algorithm":       algo,
+        "auc_pr":          round(auc_pr, 4),
+        "n_samples":       int(len(X_train)),
+        "train_date":      datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
 
 
-# ===========================================================================
-# 5. ENTRYPOINT DE TREINO (python ml_pipeline.py --train)
-# ===========================================================================
+def train_stage2(
+    train_df: pd.DataFrame,
+    test_df:  pd.DataFrame,
+    algo:     str = "rf",
+) -> dict | None:
+    from sklearn.metrics import classification_report, average_precision_score
+
+    # Filtra só as linhas WIN (40 ou 20)
+    tr = train_df[train_df[TARGET_S2].notna()].copy()
+    te = test_df[test_df[TARGET_S2].notna()].copy()
+
+    if len(tr) < 30:
+        print(f"[STAGE 2] Amostras insuficientes ({len(tr)} wins) — saltado")
+        return None
+
+    X_train = tr[FEATURE_COLS].values.astype(np.float32)
+    y_train = tr[TARGET_S2].values
+    X_test  = te[FEATURE_COLS].values.astype(np.float32) if len(te) >= 5 else X_train[:5]
+    y_test  = te[TARGET_S2].values if len(te) >= 5 else y_train[:5]
+
+    print(f"\n{'='*60}")
+    print(f"[STAGE 2 — Sommelier] {algo.upper()} | {len(tr)} wins de treino")
+    print(f"  WIN_40 treino: {int((y_train==1).sum())} | WIN_20: {int((y_train==0).sum())}")
+    print(f"{'='*60}")
+
+    pipeline = _build_pipeline(algo=algo, scale=(algo in ("rf", "lgbm")))
+    pipeline.fit(X_train, y_train)
+
+    auc_pr = 0.0
+    if len(te) >= 10:
+        probs  = pipeline.predict_proba(X_test)[:, 1]
+        y_pred = (probs >= 0.50).astype(int)
+        auc_pr = average_precision_score(y_test, probs)
+        print(f"[STAGE 2] AUC-PR: {auc_pr:.4f}")
+        print(classification_report(
+            y_test, y_pred,
+            target_names=["WIN_20 (0)", "WIN_40 (1)"],
+            digits=3,
+        ))
+    else:
+        print("[STAGE 2] Test set pequeno — métricas omitidas")
+
+    return {
+        "model":           pipeline,
+        "feature_columns": FEATURE_COLS,
+        "threshold":       0.55,
+        "algorithm":       algo,
+        "auc_pr":          round(auc_pr, 4),
+        "n_samples":       int(len(tr)),
+        "train_date":      datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. EXPORT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _save_bundle(bundle: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        pickle.dump(bundle, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    size_kb = path.stat().st_size / 1024
+    print(f"[pipeline] ✅ Guardado: {path}  ({size_kb:.1f} KB)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. CLI
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="DipRadar ML Pipeline — treino local standalone",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p.add_argument(
+        "--train", metavar="PARQUET", required=True,
+        help="Caminho para o ficheiro Parquet histórico com outcome_label",
+    )
+    p.add_argument(
+        "--output", metavar="DIR", default="data",
+        help="Directoório de saída para os .pkl  (default: data/)",
+    )
+    p.add_argument(
+        "--algo", choices=["rf", "xgb", "lgbm"], default="rf",
+        help="Algoritmo: rf | xgb | lgbm  (default: rf)",
+    )
+    p.add_argument(
+        "--test-ratio", type=float, default=0.20, metavar="RATIO",
+        help="Fracção reservada para teste  (default: 0.20)",
+    )
+    p.add_argument(
+        "--no-stage2", action="store_true",
+        help="Salta o treino do Stage 2 (Sommelier WIN_40 vs WIN_20)",
+    )
+    p.add_argument(
+        "--no-threshold-search", action="store_true",
+        help="Usa threshold fixo 0.50 em vez de optimizar pelo PR curve",
+    )
+    p.add_argument(
+        "--fixed-threshold", type=float, default=None, metavar="FLOAT",
+        help="Força threshold específico (ex: 0.55). Ignora --no-threshold-search",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args    = _parse_args()
+    out_dir = Path(args.output)
+
+    # Verifica dependências mínimas
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        print("ERRO: scikit-learn não instalado.  Executa: pip install scikit-learn")
+        sys.exit(1)
+
+    # ─ Carrega e prepara
+    df = load_and_prep(args.train)
+
+    # Distribuição de labels
+    dist = df[TARGET_COL].value_counts().to_dict()
+    print(f"\n[pipeline] Distribuição de outcome_label:")
+    for lbl, cnt in sorted(dist.items(), key=lambda x: x[1], reverse=True):
+        pct = cnt / len(df) * 100
+        bar = "█" * int(pct / 2)
+        print(f"  {lbl:<12} {cnt:5d}  ({pct:5.1f}%)  {bar}")
+
+    # Verifica mínimo de amostras
+    n_wins = int(df[TARGET_S1].sum())
+    if len(df) < 30 or n_wins < 10:
+        print(f"\nERRO: dados insuficientes ({len(df)} linhas, {n_wins} wins).")
+        print("  Adiciona mais tickers com /watchlist add e corre /admin_backfill_ml.")
+        sys.exit(1)
+
+    # ─ Split temporal
+    train_df, test_df = temporal_split(df, test_ratio=args.test_ratio)
+
+    do_search = not args.no_threshold_search and (args.fixed_threshold is None)
+
+    # ─ Stage 1 (Porteiro)
+    bundle_s1 = train_stage1(train_df, test_df, algo=args.algo, threshold_search=do_search)
+    if args.fixed_threshold is not None:
+        bundle_s1["threshold"] = args.fixed_threshold
+        print(f"[pipeline] Threshold override: {args.fixed_threshold}")
+
+    path_s1 = out_dir / "dip_model_stage1.pkl"
+    _save_bundle(bundle_s1, path_s1)
+
+    # ─ Stage 2 (Sommelier)
+    bundle_s2 = None
+    if not args.no_stage2:
+        bundle_s2 = train_stage2(train_df, test_df, algo=args.algo)
+        if bundle_s2:
+            path_s2 = out_dir / "dip_model_stage2.pkl"
+            _save_bundle(bundle_s2, path_s2)
+    else:
+        print("[pipeline] Stage 2 saltado (--no-stage2)")
+
+    # ─ Sumário final
+    print(f"\n{'='*60}")
+    print("TREINO CONCLUÍDO")
+    print(f"  Algoritmo : {args.algo.upper()}")
+    print(f"  AUC-PR S1 : {bundle_s1['auc_pr']:.4f}")
+    print(f"  Threshold : {bundle_s1['threshold']:.4f}")
+    print(f"  Features  : {len(bundle_s1['feature_columns'])}")
+    if bundle_s2:
+        print(f"  AUC-PR S2 : {bundle_s2['auc_pr']:.4f}")
+    print(f"  Output    : {path_s1}")
+    print(f"{'='*60}")
+    print()
+    print("DEPLOY NO RAILWAY:")
+    print(f"  railway run -- python -c \"")
+    print(f"    import shutil; shutil.copy('{path_s1}', '/data/dip_model_stage1.pkl')\"")
+    print("  (ou usa o Railway CLI / scp / rsync para copiar o .pkl para o volume /data)")
+    print("  Confirma com /mldata no Telegram. O bot detecta automaticamente.")
+    print()
+
 
 if __name__ == "__main__":
-    import argparse
-    import sys
-
-    parser = argparse.ArgumentParser(description="DipRadar — Tridente ML Pipeline")
-    parser.add_argument(
-        "--train", metavar="PARQUET_OR_CSV",
-        help="Caminho para o ficheiro de dados históricos (parquet ou csv)",
-    )
-    parser.add_argument(
-        "--feature-report", action="store_true",
-        help="Imprime importância de features após treino",
-    )
-    args = parser.parse_args()
-
-    if not args.train:
-        parser.print_help()
-        sys.exit(0)
-
-    data_path = Path(args.train)
-    log.info("A carregar dados de %s ...", data_path)
-
-    if data_path.suffix == ".parquet":
-        df_raw = pd.read_parquet(data_path)
-    else:
-        df_raw = pd.read_csv(data_path, parse_dates=True, index_col=0)
-
-    log.info("Dataset: %d linhas x %d colunas", *df_raw.shape)
-
-    # Gera targets (anti-leakage)
-    df_targets = generate_targets(df_raw)
-
-    # Treina Tridente
-    trident = TridentModel()
-    trident.fit(df_targets)
-    trident.save()
-
-    if args.feature_report:
-        fi = trident.feature_importance()
-        if not fi.empty:
-            print("\n--- Feature Importance (Porteiro) ---")
-            print(fi.to_string(index=False))
+    main()
