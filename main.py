@@ -51,6 +51,7 @@ from valuation import format_valuation_block
 from score import (
     calculate_dip_score, build_score_breakdown, classify_dip_category,
     is_bluechip,
+    score_from_fundamentals, format_score_v2_breakdown,
     CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO,
 )
 from state import (
@@ -997,7 +998,18 @@ def analyze_ticker(symbol: str) -> str:
             "change_day_pct":   change_pct,
         }
         ml_result = ml_score(ml_features)
-
+              
+      # ── Score V2 Engine (Chunk 9) ──────────────────────────────
+        ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
+        score_data = score_from_fundamentals(fund, ml_prob=ml_prob_v2)
+        score      = score_data["final_score"]
+        v2_note    = format_score_v2_breakdown(score_data)
+        logging.info(
+            f"[v2/analisar] {symbol}: {score:.1f} | "
+            f"skip={score_data.get('skip_recommended')} "
+            f"trap={score_data.get('is_value_trap')}"
+        )
+      
         stock_dict = {"symbol": symbol, "change_pct": change_pct, "region": ""}
 
         if score >= 75:
