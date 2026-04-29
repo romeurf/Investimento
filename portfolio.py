@@ -18,14 +18,14 @@ Cache write-through:
   Escritas vão SEMPRE para Google Sheets primeiro, depois actualizam a cache.
   Leituras usam sempre a cache (zero chamadas extra à API).
 
-Compatibilidade com código legado:
-  HOLDINGS            — list[(ticker, shares, avg_cost)] lida de env HOLDING_<TICKER>=shares,avg_cost
-  CASHBACK_EUR_VALUES — dict vazio (cashback eliminado; posições migradas para HOLDING_<TICKER>)
-  PPR_SHARES          — float lido de env PPR_SHARES
-  PPR_AVG_COST        — float lido de env PPR_AVG_COST
-  DIRECT_TICKERS / CASHBACK_TICKERS — mantidos para não quebrar imports.
-  suggest_position_size() — mantida para o Flip Fund.
-  Todas as assinaturas públicas são idênticas à versão anterior.
+Variáveis de ambiente esperadas no Railway:
+  HOLDING_<TICKER>=shares,avg_cost  — 4 posições holding (ex: HOLDING_CRWD=10,180.50)
+  PPR_SHARES=<float>                — actualizado manualmente no Railway
+  PPR_AVG_COST=<float>              — actualizado manualmente no Railway
+  FLIP_FUND_EUR=<float>             — capital do Flip Fund
+
+Nota: o sistema de CASHBACK foi eliminado. As antigas posições CASHBACK_<TICKER>
+foram migradas para HOLDING_<TICKER> com shares e avg_cost reais.
 """
 
 from __future__ import annotations
@@ -42,15 +42,14 @@ from universe import is_etf
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────
-# Compatibilidade legado
+# Tickers legacy (mantidos para compatibilidade de imports em main.py)
 # ─────────────────────────────────────────────────────────────────────────
-DIRECT_TICKERS   = ["NVO", "ADBE", "UBER", "EUNL", "MSFT", "PINS", "ADP", "CRM", "VICI",
-                    "CRWD", "PLTR", "NOW", "DUOL"]
-CASHBACK_TICKERS: list = []  # eliminado — posições migradas para HOLDING_<TICKER>
+DIRECT_TICKERS = ["NVO", "ADBE", "UBER", "EUNL", "MSFT", "PINS", "ADP", "CRM", "VICI",
+                   "CRWD", "PLTR", "NOW", "DUOL"]
 
 USD_TICKERS = {
     "NVO", "ADBE", "UBER", "MSFT", "PINS", "ADP", "CRM", "VICI",
-    "CRWD", "PLTR", "NOW", "DUOL", "ACWI",
+    "CRWD", "PLTR", "NOW", "DUOL",
 }
 EUR_TICKERS = {"EUNL", "EUNL.DE", "IS3N.DE", "ALV.DE", "IEMA"}
 
@@ -65,16 +64,10 @@ def _float_env(key: str, default: float = 0.0) -> float:
 FLIP_FUND_EUR = _float_env("FLIP_FUND_EUR")
 
 # ─────────────────────────────────────────────────────────────────────────
-# Legacy bridge — variáveis exigidas pelo main.py
-#
-# HOLDINGS: lê env vars com o padrão HOLDING_<TICKER>=shares,avg_cost
+# HOLDINGS — lê env vars com o padrão HOLDING_<TICKER>=shares,avg_cost
 #   Ex: HOLDING_NVO=25,87.50  →  ("NVO", 25.0, 87.50)
 #
-# CASHBACK_EUR_VALUES: dict vazio — cashback eliminado.
-#   As antigas posições CASHBACK_CRWD, CASHBACK_PLTR, etc. estão agora
-#   em HOLDING_CRWD, HOLDING_PLTR, etc. com shares e avg_cost reais.
-#
-# PPR_SHARES / PPR_AVG_COST: lidos directamente de env vars homónimas
+# PPR_SHARES / PPR_AVG_COST: actualizados manualmente no Railway
 # ─────────────────────────────────────────────────────────────────────────
 
 def _parse_holdings_env() -> list[tuple[str, float, float]]:
@@ -98,7 +91,6 @@ def _parse_holdings_env() -> list[tuple[str, float, float]]:
 
 # Variáveis públicas exigidas pelo main.py
 HOLDINGS: list[tuple[str, float, float]] = _parse_holdings_env()
-CASHBACK_EUR_VALUES: dict[str, float]    = {}  # cashback eliminado
 PPR_SHARES   = _float_env("PPR_SHARES")
 PPR_AVG_COST = _float_env("PPR_AVG_COST")
 
