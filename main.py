@@ -459,9 +459,17 @@ def check_thesis_degradation(region: str = "ALL") -> None:
             if price:
                 fund["price"] = price
 
-            earnings_days = get_earnings_days(sym)
-            sector_chg    = get_sector_change(fund.get("sector", ""))
-            score, _      = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg)
+            earnings_days  = get_earnings_days(sym)
+            sector_chg     = get_sector_change(fund.get("sector", ""))
+            _ml_feat_deg   = {
+                **fund,
+                "spy_change":        get_spy_change(),
+                "sector_etf_change": sector_chg,
+                "earnings_days":     earnings_days,
+            }
+            _ml_res_deg  = ml_score(_ml_feat_deg)
+            _ml_prob_deg = _ml_res_deg.win_prob if _ml_res_deg.model_ready else None
+            score, _      = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg, ml_prob=_ml_prob_deg)
             category      = pos.get("category", "")
 
             update_position_data(sym, price=price, score=score, category=category)
@@ -583,7 +591,15 @@ def send_weekly_dip_scan() -> None:
             if fund.get("skip"): continue
             earnings_days  = get_earnings_days(sym)
             sector_chg     = get_sector_change(fund.get("sector", ""))
-            score, rsi_str = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg)
+                        _ml_feat_wk  = {
+                **fund,
+                "spy_change":        None,
+                "sector_etf_change": sector_chg,
+                "earnings_days":     earnings_days,
+            }
+            _ml_res_wk   = ml_score(_ml_feat_wk)
+            _ml_prob_wk  = _ml_res_wk.win_prob if _ml_res_wk.model_ready else None
+            score, rsi_str = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg, ml_prob=_ml_prob_wk)
             if score >= 70:
                 bc_flag  = is_bluechip(fund)
                 category = classify_dip_category(fund, score, bc_flag)
