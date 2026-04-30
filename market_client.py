@@ -549,20 +549,34 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
     """
     Calcula o snapshot actual da carteira.
 
-    PPR (ISIN PTARMJHM0003):
-      Valor = ppr_shares * ppr_avg_cost  (custo histórico em EUR, actualizado manualmente no Railway)
-      P&L diário/semanal/mensal = valor_ppr * retorno_% do ACWI no período
+    Fonte de custo (por ordem de prioridade):
+      1. Google Sheets — Entry_Price (avg_price) via portfolio.get_positions()
+      2. Env var — avg_cost passado em holdings (HOLDING_<TICKER>=shares,avg_cost)
+      3. Se nenhum disponível → custo desconhecido; o holding é excluído de
+         total_cost E total_eur para não contaminar pnl_total (evita inflação).
 
-      NOTA: O ACWI é usado APENAS como proxy de retorno percentual do mercado global.
-      NÃO é usado para calcular o valor absoluto (as UP têm preços completamente
-      diferentes do ETF ACWI). O valor em EUR é actualizado manualmente via
-      PPR_SHARES e PPR_AVG_COST no Railway quando recebes o extrato mensal.
+    Pressuposto de moeda:
+      avg_price/avg_cost estão na moeda ORIGINAL da compra:
+        - USD_TICKERS → preço em USD  → fx = usd_eur aplicado em ambos os lados
+        - EUR_TICKERS → preço em EUR  → fx = 1.0
+
+    PPR (ISIN PTARMJHM0003):
+      Valor = ppr_shares * ppr_avg_cost  (custo histórico em EUR)
+      P&L diário/semanal/mensal = valor_ppr * retorno_% do ACWI no período (proxy)
     """
-    from portfolio import USD_TICKERS
+    from portfolio import USD_TICKERS, get_positions
+
+    # Custo de referência do GSheets (fonte primária)
+    try:
+        _gs_positions = get_positions()
+    except Exception as e:
+        logging.warning(f"get_portfolio_snapshot: falha ao ler GSheets — {e}")
+        _gs_positions = {}
 
     positions  = []
     total_eur  = 0.0
     total_cost = 0.0
+    cost_complete = True   # flag: False se algum holding ficou sem custo
     price_cache: dict[str, dict] = {}
 
     def _get_prices(symbol: str) -> dict:
@@ -586,7 +600,7 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
             return {}
 
     # ── Posições normais (HOLDING_*) ──────────────────────────────────────────
-    for symbol, shares, avg_cost in holdings:
+    for symbol, shares, avg_cost_env in holdings:
         if not shares:
             continue
         prices = _get_prices(symbol)
@@ -604,11 +618,28 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
         pnl_m = ((prices["now"] - prices["month_ago"]) * fx * shares
                  if prices.get("month_ago") else None)
 
+        # ── Resolução do custo médio: GSheets > env var ───────────────────────
+        # avg_price no GSheets e avg_cost no env var estão na moeda original da
+        # compra (USD para USD_TICKERS, EUR para EUR_TICKERS).
+        # Aplicamos fx em cost_eur para ficar simétrico com value_eur (ambos EUR).
+        gs_pos   = _gs_positions.get(symbol) or {}
+        ref_cost = gs_pos.get("avg_price") or avg_cost_env or None
+
         pnl_total = cost_eur = None
-        if avg_cost:
-            cost_eur  = shares * avg_cost
-            pnl_total = value_eur - cost_eur
+        if ref_cost and float(ref_cost) > 0:
+            cost_eur   = shares * float(ref_cost) * fx   # FIX: fx aplicado ao custo
+            pnl_total  = value_eur - cost_eur
             total_cost += cost_eur
+            total_eur  += value_eur
+        else:
+            # Custo desconhecido: exclui este holding de total_eur E total_cost
+            # para não distorcer pnl_total agregado.
+            cost_complete = False
+            logging.warning(
+                f"get_portfolio_snapshot: {symbol} sem custo médio "
+                f"(GSheets avg_price={gs_pos.get('avg_price')}, "
+                f"env avg_cost={avg_cost_env}) — excluído do pnl_total"
+            )
 
         positions.append({
             "symbol":    symbol,
@@ -619,8 +650,8 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
             "pnl_week":  round(pnl_w, 2) if pnl_w is not None else None,
             "pnl_month": round(pnl_m, 2) if pnl_m is not None else None,
             "pnl_total": round(pnl_total, 2) if pnl_total is not None else None,
+            "cost_missing": ref_cost is None or float(ref_cost or 0) <= 0,
         })
-        total_eur += value_eur
 
     # ── PPR (ISIN PTARMJHM0003, proxy ACWI para P&L %) ───────────────────────
     ppr_cost      = ppr_shares * ppr_avg_cost
@@ -651,16 +682,28 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
     if ppr_pnl_week  is not None: agg_week  += ppr_pnl_week
     if ppr_pnl_month is not None: agg_month += ppr_pnl_month
 
+    # pnl_total só é calculado se total_cost > 0 E todos os holdings têm custo
+    pnl_total_agg = None
+    if total_cost > 0 and cost_complete:
+        pnl_total_agg = round(total_eur - total_cost, 2)
+    elif total_cost > 0 and not cost_complete:
+        # Parcial: calcula mas assinala que é incompleto
+        pnl_total_agg = round(total_eur - total_cost, 2)
+        logging.warning(
+            "get_portfolio_snapshot: pnl_total parcial — alguns holdings sem custo médio"
+        )
+
     return {
-        "total_eur":  round(total_eur, 2),
-        "total_cost": round(total_cost, 2),
-        "pnl_day":    round(agg_day, 2),
-        "pnl_week":   round(agg_week, 2),
-        "pnl_month":  round(agg_month, 2),
-        "pnl_total":  round(total_eur - total_cost, 2) if total_cost > 0 else None,
-        "positions":  positions,
-        "ppr_value":  round(ppr_value_eur, 2),
-        "usd_eur":    usd_eur,
+        "total_eur":      round(total_eur, 2),
+        "total_cost":     round(total_cost, 2),
+        "pnl_day":        round(agg_day, 2),
+        "pnl_week":       round(agg_week, 2),
+        "pnl_month":      round(agg_month, 2),
+        "pnl_total":      pnl_total_agg,
+        "cost_complete":  cost_complete,   # False = pnl_total pode estar subestimado
+        "positions":      positions,
+        "ppr_value":      round(ppr_value_eur, 2),
+        "usd_eur":        usd_eur,
     }
 
 
