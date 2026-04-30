@@ -65,6 +65,10 @@ _MARKET_OPEN_MIN  = 30
 _MARKET_CLOSE_UTC = 20
 _MARKET_CLOSE_MIN = 0
 
+# Yield máximo aceitável (25 %). Qualquer valor acima é lixo do yfinance
+# e seria injectado como feature inválida no modelo ML.
+_MAX_DIVIDEND_YIELD = 0.25
+
 
 def is_market_open() -> bool:
     now = datetime.now(timezone.utc)
@@ -399,9 +403,26 @@ def _yf_info(symbol: str) -> dict:
 
 
 def _normalize_dividend_yield(raw: float | None) -> float | None:
+    """
+    Normaliza o dividendYield do yfinance para um valor decimal (ex: 0.032 = 3.2%).
+
+    O yfinance é inconsistente: pode devolver 0.032, 3.2 ou até valores absurdos
+    como 640 (bug conhecido). A lógica:
+      1. Se raw > 0.50 → assume que está em percentagem → divide por 100
+      2. Após normalização, aplica hard cap de _MAX_DIVIDEND_YIELD (25%)
+         — qualquer yield > 25% é lixo de dados e devolvemos None
+         para não contaminar features do modelo ML.
+    """
     if raw is None or raw <= 0:
         return None
-    return float(raw) / 100 if raw > 0.50 else float(raw)
+    normalized = float(raw) / 100 if raw > 0.50 else float(raw)
+    if normalized > _MAX_DIVIDEND_YIELD:
+        logging.warning(
+            f"dividend_yield descartado: raw={raw} → normalized={normalized:.4f} "
+            f"(>{_MAX_DIVIDEND_YIELD:.0%}) — provável lixo do yfinance"
+        )
+        return None
+    return normalized
 
 
 def _normalize_ratio(raw: float | None) -> float | None:
@@ -584,12 +605,7 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
         total_eur += value_eur
 
     # ── PPR (ISIN PTARMJHM0003, proxy ACWI para P&L %) ───────────────────────
-    #
-    # Valor = custo histórico (ppr_shares * ppr_avg_cost em EUR).
-    # Actualiza PPR_SHARES e PPR_AVG_COST no Railway quando recebes o extrato.
-    # P&L usa ACWI APENAS para retorno % (nunca preço absoluto × UP).
-    # ─────────────────────────────────────────────────────────────────────────
-    ppr_cost      = ppr_shares * ppr_avg_cost  # valor em EUR (custo histórico)
+    ppr_cost      = ppr_shares * ppr_avg_cost
     ppr_value_eur = ppr_cost
 
     ppr_pnl_day = ppr_pnl_week = ppr_pnl_month = None
