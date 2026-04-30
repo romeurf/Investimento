@@ -43,15 +43,17 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────
 # Tickers legacy (mantidos para compatibilidade de imports em main.py)
+# NOTA: ETFs europeus requerem sufixo de bolsa para o yfinance funcionar.
+#       EUNL → EUNL.DE (Xetra). Sem sufixo devolve 404.
 # ─────────────────────────────────────────────────────────────────────────
-DIRECT_TICKERS = ["NVO", "ADBE", "UBER", "EUNL", "MSFT", "PINS", "ADP", "CRM", "VICI",
+DIRECT_TICKERS = ["NVO", "ADBE", "UBER", "EUNL.DE", "MSFT", "PINS", "ADP", "CRM", "VICI",
                    "CRWD", "PLTR", "NOW", "DUOL"]
 
 USD_TICKERS = {
     "NVO", "ADBE", "UBER", "MSFT", "PINS", "ADP", "CRM", "VICI",
     "CRWD", "PLTR", "NOW", "DUOL",
 }
-EUR_TICKERS = {"EUNL", "EUNL.DE", "IS3N.DE", "ALV.DE", "IEMA"}
+EUR_TICKERS = {"EUNL.DE", "IS3N.DE", "ALV.DE", "IEMA"}
 
 
 def _float_env(key: str, default: float = 0.0) -> float:
