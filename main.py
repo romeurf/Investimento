@@ -591,7 +591,7 @@ def send_weekly_dip_scan() -> None:
             if fund.get("skip"): continue
             earnings_days  = get_earnings_days(sym)
             sector_chg     = get_sector_change(fund.get("sector", ""))
-                        _ml_feat_wk  = {
+            _ml_feat_wk    = {
                 **fund,
                 "spy_change":        None,
                 "sector_etf_change": sector_chg,
