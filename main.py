@@ -932,7 +932,8 @@ def build_alert(
 
     rsi_part = f" | RSI: {rsi_str}" if rsi_str else ""
 
-    valuation_block = format_valuation_block(fundamentals, historical_pe)
+    # FIX: pass sector as third argument (required by format_valuation_block)
+    valuation_block = format_valuation_block(fundamentals, historical_pe, sector)
 
     spy_change   = get_spy_change()
     earnings_d   = get_earnings_days(symbol)
@@ -1184,8 +1185,6 @@ def run_scan() -> None:
                 )
 
                 # ── Feature 8: Dip Persistente ────────────────────────────
-                # record_dip_day() é idempotente: se o scan correr 2x no mesmo
-                # dia para o mesmo ticker, não duplica a entrada.
                 dip_state = record_dip_day(
                     sym,
                     score,
@@ -1254,7 +1253,6 @@ def run_scan() -> None:
                 send_telegram(ranking_text)
 
     finally:
-        # ── Feature 8: purgar streaks de stocks que saíram do radar hoje ──
         expire_missing_streaks(_scan_syms_scored)
         _scan_running = False
         logging.info("Scan concluído.")
