@@ -483,6 +483,11 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
         result["analyst_upside"] = (target - price) / price * 100
         result["analyst_target"] = target
 
+    # RSI (14 dias) — calculado via histórico de preços separadamente do .info.
+    # Injectado aqui para que score_from_fundamentals() o encontre directamente
+    # em fundamentals["rsi"] sem precisar de uma chamada extra no caller.
+    result["rsi"] = get_rsi(symbol)
+
     return result
 
 
