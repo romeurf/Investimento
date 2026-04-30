@@ -62,6 +62,8 @@ from state import (
     load_recovery_watch, add_recovery_position,
     mark_recovery_alerted, remove_recovery_position,
     get_stale_recovery_positions, mark_stale_alerted,
+    # ── Feature 8: Dip Persistente ──────────────────────────────────
+    record_dip_day, mark_persistent_alerted, expire_missing_streaks,
 )
 from backtest import backtest_runner, build_backtest_summary
 from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
@@ -76,6 +78,9 @@ from universe import get_full_universe, get_ml_universe, ETF_TICKERS, is_etf
 
 # Chunk 6 — ML predictor
 from ml_predictor import ml_score, ml_badge, is_model_ready, MLResult
+
+# Feature 8 — Dip Persistente
+from persistent_dip import check_and_alert_streak
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1070,6 +1075,8 @@ def run_scan() -> None:
         logging.warning("Scan já a correr, a ignorar...")
         return
     _scan_running = True
+    # ── Feature 8: conjunto de symbols que passaram score >= MIN_DIP_SCORE ──
+    _scan_syms_scored: set[str] = set()
     try:
         if not is_market_open():
             logging.info("Mercado fechado, scan ignorado.")
@@ -1171,6 +1178,23 @@ def run_scan() -> None:
                     f"trap={score_data['is_value_trap']}"
                 )
 
+                # ── Feature 8: Dip Persistente ────────────────────────────
+                # record_dip_day() é idempotente: se o scan correr 2x no mesmo
+                # dia para o mesmo ticker, não duplica a entrada.
+                dip_state = record_dip_day(
+                    sym,
+                    score,
+                    fund.get("price", 0),
+                    stock["change_pct"],
+                    verdict,
+                )
+                _scan_syms_scored.add(sym)
+                check_and_alert_streak(
+                    sym, dip_state, score, category,
+                    fund, send_telegram, DIRECT_TICKERS, LISBON_TZ,
+                )
+                # ──────────────────────────────────────────────────────────
+
                 log_alert_snapshot(
                     symbol=sym, fundamentals=fund, score=score,
                     verdict=verdict, category=category,
@@ -1225,6 +1249,8 @@ def run_scan() -> None:
                 send_telegram(ranking_text)
 
     finally:
+        # ── Feature 8: purgar streaks de stocks que saíram do radar hoje ──
+        expire_missing_streaks(_scan_syms_scored)
         _scan_running = False
         logging.info("Scan concluído.")
 
