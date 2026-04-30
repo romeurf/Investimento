@@ -119,7 +119,7 @@ def log_alert_snapshot(
     category: str,
     change_day_pct: float = 0.0,
     rsi_val: float | None = None,
-    historical_pe: float | None = None,
+    historical_pe: float | dict | None = None,
     spy_change: float | None = None,
     sector_etf_change: float | None = None,
 ) -> None:
@@ -127,6 +127,9 @@ def log_alert_snapshot(
     Regista um alerta na base de dados ML.
     Campos de resultado (return_1m, MFE, etc.) ficam vazios para serem
     preenchidos futuramente pelo fill_db_outcomes().
+
+    historical_pe pode ser um dict (de get_historical_pe) ou um float/None.
+    Extrai pe_hist_median se for dict.
     """
     _ensure_header()
     try:
@@ -137,6 +140,12 @@ def log_alert_snapshot(
             fundamentals.get("volume"),
             fundamentals.get("average_volume"),
         )
+
+        # historical_pe pode chegar como dict (get_historical_pe()) ou float
+        if isinstance(historical_pe, dict):
+            _pe_hist_val = historical_pe.get("pe_hist_median")
+        else:
+            _pe_hist_val = historical_pe
 
         row = {
             "date_iso":         datetime.now().date().isoformat(),
@@ -154,7 +163,7 @@ def log_alert_snapshot(
             "rsi":              round(rsi_val, 1) if rsi_val is not None else "",
             "volume_ratio":     vol_ratio,
             "pe":               fundamentals.get("pe") or "",
-            "pe_historical":    round(historical_pe, 1) if historical_pe is not None else "",
+            "pe_historical":    round(_pe_hist_val, 1) if _pe_hist_val is not None else "",
             "pe_fair":          pe_fair,
             "fcf_yield":        round(fundamentals.get("fcf_yield") or 0, 4) if fundamentals.get("fcf_yield") is not None else "",
             "revenue_growth":   round(fundamentals.get("revenue_growth") or 0, 4),
