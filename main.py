@@ -41,7 +41,7 @@ from market_client import (
     get_macro_context,
 )
 from portfolio import (
-    HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST,
+    HOLDINGS, PPR_SHARES, PPR_AVG_COST,
     DIRECT_TICKERS, FLIP_FUND_EUR, suggest_position_size,
     get_positions, update_position_data,
     mark_degradation_alerted, reset_degradation_flag,
@@ -217,7 +217,7 @@ def _pnl_emoji(v: float) -> str:
 def _get_snapshot() -> dict:
     usd_eur = get_usdeur()
     return get_portfolio_snapshot(
-        HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, usd_eur
+        HOLDINGS, {}, PPR_SHARES, PPR_AVG_COST, usd_eur
     )
 
 def send_heartbeat() -> None:
@@ -238,7 +238,7 @@ def send_heartbeat() -> None:
         send_telegram(
             f"🤖 *DipRadar — Bom dia!* {datetime.now().strftime('%d/%m/%Y')}\n"
             f"⚠️ *Variáveis da carteira em falta no Railway.*\n"
-            f"_Adiciona HOLDING_*, CASHBACK_*, PPR_SHARES, PPR_AVG_COST nas env vars._"
+            f"_Adiciona HOLDING_*, PPR_SHARES, PPR_AVG_COST nas env vars._"
         )
         return
 
@@ -285,8 +285,7 @@ def send_heartbeat() -> None:
 
     lines += [
         "",
-        f"  📊 PPR (proxy ACWI): €{snapshot['ppr_value']:,.2f}",
-        f"  💜 CashBack Pie: €{snapshot['cashback_eur']:,.2f}",
+        f"  📊 PPR: €{snapshot['ppr_value']:,.2f}",
     ]
 
     if FLIP_FUND_EUR:
@@ -998,7 +997,7 @@ def analyze_ticker(symbol: str) -> str:
             "change_day_pct":   change_pct,
         }
         ml_result = ml_score(ml_features)
-              
+
         # ── Score V2 Engine (Chunk 9) ──────────────────────────────
         ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
         score_data = score_from_fundamentals(fund, ml_prob=ml_prob_v2)
@@ -1009,7 +1008,7 @@ def analyze_ticker(symbol: str) -> str:
             f"skip={score_data.get('skip_recommended')} "
             f"trap={score_data.get('is_value_trap')}"
         )
-      
+
         stock_dict = {"symbol": symbol, "change_pct": change_pct, "region": ""}
 
         if score >= 75:
@@ -1121,7 +1120,7 @@ def run_scan() -> None:
                         f"[ml] {sym}: label={ml_result.label} "
                         f"prob={ml_result.win_prob:.2f} conf={ml_result.confidence}"
                     )
-                  
+
                 # ── Score V2 Engine (Chunk 9) ──────────────────────────────
                 ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
                 score_data = score_from_fundamentals(fund, ml_prob=ml_prob_v2)
@@ -1144,7 +1143,7 @@ def run_scan() -> None:
                     f"conf={score_data['confidence']:.2f} "
                     f"trap={score_data['is_value_trap']}"
                 )
-              
+
                 log_alert_snapshot(
                     symbol=sym, fundamentals=fund, score=score,
                     verdict=verdict, category=category,
@@ -1306,12 +1305,6 @@ def poll_bot_commands() -> None:
 # ── EOD Scan Jobs (Chunk 3) ───────────────────────────────────────────────────
 
 def eod_scan_europe() -> None:
-    """
-    17h45 WEST — Scan EOD para Europa.
-    1. check_thesis_degradation (posições EU com dados EOD)
-    2. run_watchlist_job (tickers europeus na watchlist)
-    3. check_recovery_alerts
-    """
     logging.info("[EOD EU 17:45] A iniciar scan europeu...")
     check_thesis_degradation(region="EU")
     run_watchlist_job()
@@ -1320,12 +1313,6 @@ def eod_scan_europe() -> None:
 
 
 def eod_scan_us() -> None:
-    """
-    21h15 WEST — Scan EOD para EUA.
-    1. check_thesis_degradation (posições US com dados EOD)
-    2. run_scan (dip scan principal)
-    3. check_recovery_alerts
-    """
     logging.info("[EOD US 21:15] A iniciar scan americano...")
     check_thesis_degradation(region="US")
     run_scan()
@@ -1336,24 +1323,12 @@ def eod_scan_us() -> None:
 # ── Scheduler APScheduler ─────────────────────────────────────────────────────
 
 def setup_schedule() -> BlockingScheduler:
-    """
-    Scheduler APScheduler com todas as janelas de operação.
-
-    Janelas EOD (Chunk 3):
-      17h45 WEST — eod_scan_europe()  (Europa fechou às 16h30)
-      21h15 WEST — eod_scan_us()      (EUA fechou às 21h00)
-
-    Restantes jobs mantidos de versões anteriores.
-    """
     scheduler = BlockingScheduler(timezone=LISBON_TZ)
 
-    # ── Heartbeat diário ───────────────────────────────────────────────────────
     scheduler.add_job(
         send_heartbeat, CronTrigger(hour=9, minute=0, timezone=LISBON_TZ),
         id="heartbeat", name="Heartbeat 09:00",
     )
-
-    # ── Scan intra-dia (durante horário de mercado) ────────────────────────────
     scheduler.add_job(
         run_scan,
         CronTrigger(
@@ -1364,8 +1339,6 @@ def setup_schedule() -> BlockingScheduler:
         ),
         id="intraday_scan", name=f"Scan intra-dia /{SCAN_MINUTES}min",
     )
-
-    # ── Portfolio stress (durante mercado US) ──────────────────────────────────
     scheduler.add_job(
         check_portfolio_stress,
         CronTrigger(
@@ -1376,8 +1349,6 @@ def setup_schedule() -> BlockingScheduler:
         ),
         id="stress_check", name="Portfolio stress /15min",
     )
-
-    # ── Watchlist intra-dia ────────────────────────────────────────────────────
     scheduler.add_job(
         run_watchlist_job,
         CronTrigger(
@@ -1388,22 +1359,16 @@ def setup_schedule() -> BlockingScheduler:
         ),
         id="watchlist_intraday", name="Watchlist intra-dia /45min",
     )
-
-    # ── EOD Europa — 17h45 WEST ────────────────────────────────────────────────
     scheduler.add_job(
         eod_scan_europe,
         CronTrigger(hour=17, minute=45, day_of_week="mon-fri", timezone=LISBON_TZ),
         id="eod_europe", name="EOD Europa 17:45",
     )
-
-    # ── EOD USA — 21h15 WEST ──────────────────────────────────────────────────
     scheduler.add_job(
         eod_scan_us,
         CronTrigger(hour=21, minute=15, day_of_week="mon-fri", timezone=LISBON_TZ),
         id="eod_us", name="EOD EUA 21:15",
     )
-
-    # ── Weekly jobs ────────────────────────────────────────────────────────────
     scheduler.add_job(
         send_weekly_dip_scan,
         CronTrigger(day_of_week="mon", hour=8, minute=45, timezone=LISBON_TZ),
@@ -1420,7 +1385,6 @@ def setup_schedule() -> BlockingScheduler:
         id="ml_outcomes", name="ML outcomes dom 08:00",
     )
 
-    # ── Reset diário meia-noite ────────────────────────────────────────────────
     def _daily_reset():
         clear_alerts()
         _alerted_today.clear()
@@ -1433,8 +1397,6 @@ def setup_schedule() -> BlockingScheduler:
         CronTrigger(hour=0, minute=1, timezone=LISBON_TZ),
         id="daily_reset", name="Reset diário 00:01",
     )
-
-    # ── Bot commands polling ───────────────────────────────────────────────────
     scheduler.add_job(
         poll_bot_commands,
         "interval", seconds=10,
@@ -1453,7 +1415,6 @@ if __name__ == "__main__":
     logging.info(f"  ML Model: {'🟢 PRONTO' if is_model_ready() else '🟡 não treinado — só score de regras'}")
 
     scheduler = setup_schedule()
-
     send_heartbeat()
 
     logging.info("[scheduler] A arrancar loop principal...")
