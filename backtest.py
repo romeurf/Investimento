@@ -27,8 +27,14 @@ Lógica:
     Fundamentais slow-moving do yf.info (pe, fcf_yield, revenue_growth,
     debt_equity, gross_margin, analyst_upside) foram removidos — eram
     valores de hoje a avaliar dips de 2020/2022.
-    O motor score_from_fundamentals() penaliza automaticamente a ausência
-    dessas métricas via confidence, garantindo honestidade matemática.
+
+  NOTA SOBRE CONFIANÇA NO MODO HISTÓRICO:
+    A ausência de fundamentais produz confidence≈0.25 e skip_recommended=True
+    em score_from_fundamentals(). No modo histórico este check é IGNORADO:
+    queremos TODOS os dips (winners + losers) para treino ML — o outcome_label
+    é o sinal de treino correcto. O score gravado reflecte apenas o hemisfério
+    Timing (rsi + drawdown + volume), que é honesto e disponível.
+    min_score default = 0.0 (recolhe todos os dips acima do filtro técnico).
 
 Nenhuma API key necessária — usa yfinance.history().
 """
@@ -350,9 +356,12 @@ def _build_hybrid_fund(info: dict, row) -> dict:
         pe, revenue_growth, fcf_yield, debt_equity, roic,
         gross_margin, dividend_yield, analyst_upside
 
-    A ausência das métricas fundamentais activa automaticamente a penalização
-    de confiança no motor score_from_fundamentals(), que assume z=0
-    (neutralidade) e reduz o confidence multiplier — matematicamente honesto.
+    A ausência das métricas fundamentais produz confidence≈0.25 e
+    skip_recommended=True no motor score_from_fundamentals(). Este
+    comportamento é esperado e CORRECTO para o modo histórico — o
+    run_historical_backtest() ignora skip_recommended expressamente.
+    O score resultante reflecte apenas o hemisfério Timing (rsi +
+    drawdown + volume), que é a única informação honesta disponível.
     """
     return {
         "price":              float(row["Close"]),
@@ -514,16 +523,32 @@ def run_historical_backtest(
     tickers: list[str],
     output_path: Path | None = None,
     lookback_years: int = _LOOKBACK_YEARS,
-    min_score: float = 45.0,
+    min_score: float = 0.0,
     rsi_threshold: float = 35.0,
     drawdown_threshold: float = -15.0,
     dry_run: bool = False,
 ) -> dict:
+    """
+    F2 — Backtest histórico para geração de dados de treino ML.
+
+    min_score default = 0.0: recolhe TODOS os dips acima dos filtros
+    técnicos (RSI + drawdown). O modelo ML precisa de winners e losers
+    — o outcome_label é o sinal de treino, não o score composto.
+
+    skip_recommended é ignorado: produz sempre True em modo histórico
+    porque _build_hybrid_fund omite fundamentais (anti look-ahead bias).
+    Confidence baixa é esperada e correcta neste contexto.
+    """
     from score import score_from_fundamentals, classify_dip_category, is_bluechip
 
     stats: dict = {
-        "total_dips": 0, "written": 0, "skipped": 0,
-        "censored":   0, "errors":  0, "dip_rows": [],
+        "total_dips":     0,
+        "written":        0,
+        "skipped":        0,
+        "ignored_score":  0,
+        "censored":       0,
+        "errors":         0,
+        "dip_rows":       [],
     }
 
     for symbol in tickers:
@@ -555,21 +580,18 @@ def run_historical_backtest(
 
             for dip_date, row in dip_df.iterrows():
                 try:
-                    fund_hist = _build_hybrid_fund(info, row)
-
+                    fund_hist  = _build_hybrid_fund(info, row)
                     score_data = score_from_fundamentals(fund_hist)
 
-                    if score_data.get("skip_recommended", False):
-                        stats["skipped"] += 1
-                        logging.info(
-                            f"[hist_backtest] skip {symbol} {dip_date.date()} | "
-                            f"confidence={score_data.get('confidence', 0):.2f}"
-                        )
-                        continue
+                    # NOTA: skip_recommended é ignorado em modo histórico.
+                    # _build_hybrid_fund omite fundamentais (anti look-ahead bias),
+                    # produzindo confidence≈0.25 e skip_recommended=True sempre.
+                    # Para treino ML queremos TODOS os dips — o outcome_label
+                    # é o sinal correcto; skip_recommended não se aplica aqui.
 
                     final_score = float(score_data["final_score"])
-                    if final_score < min_score:
-                        stats["skipped"] += 1
+                    if min_score > 0 and final_score < min_score:
+                        stats["ignored_score"] += 1
                         continue
 
                     bc_flag  = is_bluechip(fund_hist)
@@ -645,7 +667,7 @@ def run_historical_backtest(
 
     logging.info(
         f"[hist_backtest] Conclu\u00eddo \u2014 total={stats['total_dips']} | "
-        f"escritos={stats['written']} | ignorados={stats['skipped']} | "
+        f"escritos={stats['written']} | ignorados_score={stats['ignored_score']} | "
         f"censurados={stats['censored']} | erros={stats['errors']}"
     )
     return stats
@@ -654,9 +676,16 @@ def run_historical_backtest(
 def build_historical_training_set(
     tickers: list[str],
     output_path: Path | None = None,
-    min_score: float = 45.0,
+    min_score: float = 0.0,
     dry_run: bool = False,
 ) -> dict:
+    """
+    Entry-point principal para o backfill ML.
+
+    min_score default = 0.0: todos os dips acima do filtro técnico
+    (RSI<35, drawdown<-15%) são recolhidos para treino. O ML aprende
+    a discriminar winners/losers a partir das features técnicas.
+    """
     csv_path = output_path or _HIST_DB_PATH
 
     stats = run_historical_backtest(
