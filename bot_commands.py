@@ -966,11 +966,26 @@ def _handle_liquidez(parts: list[str]) -> None:
         )
 
 
+# ── helpers ───────────────────────────────────────────────────────────────────────
+
+def _fetch_eur_usd() -> float:
+    """Devolve taxa EUR/USD via yfinance. Fallback para 1.0 em caso de erro."""
+    try:
+        import yfinance as yf
+        info = yf.Ticker("EURUSD=X").fast_info
+        rate = float(getattr(info, "last_price", None) or info.get("lastPrice") or 0)
+        if rate > 0:
+            return rate
+    except Exception:
+        pass
+    return 1.0
+
+
 # ── /portfolio handler ────────────────────────────────────────────────────────────
 
 def _handle_portfolio(parts: list[str]) -> None:
     try:
-        from portfolio import get_positions, get_liquidity
+        from portfolio import get_positions, get_liquidity, EUR_TICKERS
     except Exception as e:
         _reply(f"❌ Módulo portfolio não disponível: `{e}`")
         return
@@ -978,6 +993,7 @@ def _handle_portfolio(parts: list[str]) -> None:
     positions = get_positions()
     liquidity = get_liquidity()
 
+    # ── detalhe de um ticker específico ──────────────────────────────────────────
     if len(parts) >= 2:
         symbol = parts[1].upper().strip()
         pos    = positions.get(symbol)
@@ -987,6 +1003,8 @@ def _handle_portfolio(parts: list[str]) -> None:
                 "_Usa `/portfolio` para ver todas as posições._"
             )
             return
+        is_eur     = symbol in EUR_TICKERS
+        cur        = "€" if is_eur else "$"
         last_price = pos.get("last_price") or pos["avg_price"]
         pnl_u      = (last_price - pos["avg_price"]) * pos["shares"]
         pnl_pct    = (last_price - pos["avg_price"]) / pos["avg_price"] * 100 if pos["avg_price"] else 0
@@ -995,9 +1013,9 @@ def _handle_portfolio(parts: list[str]) -> None:
         _reply(
             f"📋 *{symbol}* — {pos.get('name', symbol)}\n\n"
             f"  📦 Shares: *{pos['shares']}x*\n"
-            f"  💵 Preço médio: *${pos['avg_price']:.2f}*\n"
-            f"  📈 Preço actual: *${last_price:.2f}*\n"
-            f"  {em} P&L não realizado: *${pnl_u:+.2f}* ({pnl_pct:+.1f}%)\n"
+            f"  💵 Preço médio: *{cur}{pos['avg_price']:.2f}*\n"
+            f"  📈 Preço actual: *{cur}{last_price:.2f}*\n"
+            f"  {em} P&L não realizado: *{cur}{pnl_u:+.2f}* ({pnl_pct:+.1f}%)\n"
             f"  🏷️ Categoria: _{pos.get('category', 'N/D')}_\n"
             f"  🎯 Score actual: {score_str}\n"
             f"  📅 Entrada: {pos.get('entry_date', 'N/D')}\n"
@@ -1006,6 +1024,7 @@ def _handle_portfolio(parts: list[str]) -> None:
         )
         return
 
+    # ── carteira vazia ────────────────────────────────────────────────────────────
     if not positions:
         liq_em = "🟢" if liquidity >= 0 else "🔴"
         _reply(
@@ -1015,9 +1034,14 @@ def _handle_portfolio(parts: list[str]) -> None:
         )
         return
 
-    total_cost    = 0.0
-    total_current = 0.0
-    lines         = [f"*📊 Carteira Activa — {datetime.now().strftime('%d/%m %H:%M')}*", ""]
+    # ── obter FX rate EUR/USD ─────────────────────────────────────────────────────
+    eur_usd = _fetch_eur_usd()
+    fx_note = f"_{eur_usd:.4f} EUR/USD_" if eur_usd != 1.0 else "_FX indisponível — totais aproximados_"
+
+    # ── lista completa agrupada por categoria ─────────────────────────────────────
+    total_cost_usd    = 0.0
+    total_current_usd = 0.0
+    lines             = [f"*📊 Carteira Activa — {datetime.now().strftime('%d/%m %H:%M')}*", f"  {fx_note}", ""]
 
     by_cat: dict[str, list] = {}
     for sym, pos in positions.items():
@@ -1027,6 +1051,8 @@ def _handle_portfolio(parts: list[str]) -> None:
     for cat, items in sorted(by_cat.items()):
         lines.append(f"*{cat}*")
         for sym, pos in sorted(items, key=lambda x: x[0]):
+            is_eur     = sym in EUR_TICKERS
+            cur        = "€" if is_eur else "$"
             last_price = pos.get("last_price") or pos["avg_price"]
             cost       = pos["avg_price"] * pos["shares"]
             current    = last_price * pos["shares"]
@@ -1036,22 +1062,33 @@ def _handle_portfolio(parts: list[str]) -> None:
             score_str  = f" | 🎯{pos['last_score']}" if pos.get("last_score") is not None else ""
             degrade    = " ⚠️" if pos.get("degradation_alerted") else ""
             lines.append(
-                f"  {em} *{sym}*{degrade} — {pos['shares']}x @ ${pos['avg_price']:.2f}"
-                f" → ${last_price:.2f} | *{pnl_pct:+.1f}%*{score_str}"
+                f"  {em} *{sym}*{degrade} — {pos['shares']}x @ {cur}{pos['avg_price']:.2f}"
+                f" → {cur}{last_price:.2f} | *{pnl_pct:+.1f}%*{score_str}"
             )
-            total_cost    += cost
-            total_current += current
+            # converter tudo para USD para o total consolidado
+            fx = eur_usd if is_eur else 1.0
+            total_cost_usd    += cost * fx
+            total_current_usd += current * fx
         lines.append("")
 
-    total_pnl     = total_current - total_cost
-    total_pnl_pct = total_pnl / total_cost * 100 if total_cost else 0
-    em_total      = "🟢" if total_pnl >= 0 else "🔴"
-    liq_em        = "🟢" if liquidity >= 0 else "🔴"
+    total_pnl_usd  = total_current_usd - total_cost_usd
+    total_pnl_pct  = total_pnl_usd / total_cost_usd * 100 if total_cost_usd else 0
+    em_total       = "🟢" if total_pnl_usd >= 0 else "🔴"
+    liq_em         = "🟢" if liquidity >= 0 else "🔴"
+
+    # converter totais para EUR
+    total_cost_eur    = total_cost_usd / eur_usd if eur_usd else total_cost_usd
+    total_current_eur = total_current_usd / eur_usd if eur_usd else total_current_usd
+    total_pnl_eur     = total_pnl_usd / eur_usd if eur_usd else total_pnl_usd
+    grand_total_eur   = total_current_eur + liquidity
 
     lines += [
         "─────────────────",
-        f"  {em_total} P&L não realizado: *${total_pnl:+.2f}* ({total_pnl_pct:+.1f}%)",
-        f"  💵 Liquidez disponível: {liq_em} *€{liquidity:.2f}*",
+        f"  📥 Investido:  *€{total_cost_eur:,.0f}* (≈${total_cost_usd:,.0f})",
+        f"  📦 Actual:     *€{total_current_eur:,.0f}* (≈${total_current_usd:,.0f})",
+        f"  {em_total} P&L:       *€{total_pnl_eur:+,.2f}* ({total_pnl_pct:+.1f}%)",
+        f"  {liq_em} Liquidez:  *€{liquidity:.2f}*",
+        f"  💼 Total:      *€{grand_total_eur:,.0f}*",
         "",
         "_`/portfolio TICK` para detalhe · `/buy` · `/sell`_",
     ]
