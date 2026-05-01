@@ -3,7 +3,7 @@ bootstrap_ml.py — Dual-Layer ML: Camada A (preço, 20 anos) + Camada B (fundam
 
 O UNIVERSO está hardcoded directamente neste ficheiro (S&P 500, Nasdaq 100, STOXX 200,
 FTSE 100, carteira e watchlist do utilizador). Zero dependências externas, zero scraping.
-~830 tickers únicos após deduplicação.
+~880 tickers únicos após deduplicação.
 
 MODO AUTOMÁTICO (agendado pelo bot, corre às 02:00 UTC todos os dias):
     - Janela = [hoje - anos_config, ontem]
@@ -35,6 +35,9 @@ MODO COLAB — backfill em batches (Google Drive como persistência):
     O argumento --slice START END limita o backfill aos tickers UNIVERSE[START:END].
     O Parquet no Drive é acumulado incrementalmente — cada sessão retoma de onde parou.
     --drive-dir define o directório onde os Parquets e .pkl são guardados/lidos.
+
+    NOTA: Se apagares o Parquet para recomeçar do zero, não há problema —
+    cada batch acumula incrementalmente. Começa sempre pelo Batch 0-200.
 
 OUTPUT:
     <data_dir>/dip_model_price.pkl    ← Camada A (só técnicas)
@@ -213,7 +216,7 @@ def _load_universe() -> list[str]:
                 all_tickers.append(t)
                 seen.add(t)
 
-    log.info(f"[universe] Universo total: {len(all_tickers)} tickers (hardcoded, zero scraping)")
+    log.info(f"[universe] Universo total: {len(all_tickers)} tickers ML (hardcoded, zero scraping)")
     return all_tickers
 
 
@@ -877,12 +880,13 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "DipRadar — Dual-Layer ML\n"
-            "Universo: hardcoded (~830 tickers únicos, zero scraping)\n\n"
+            "Universo: hardcoded (~880 tickers únicos, zero scraping)\n\n"
             "COLAB (batch incremental, ~200 tickers por sessão de 90 min):\n"
             "  Sessão 1: python bootstrap_ml.py --layer price --slice 0 200 --drive-dir /content/drive/MyDrive/DipRadar\n"
             "  Sessão 2: python bootstrap_ml.py --layer price --slice 200 400 --drive-dir /content/drive/MyDrive/DipRadar\n"
             "  Sessão 3: python bootstrap_ml.py --layer price --slice 400 600 --drive-dir /content/drive/MyDrive/DipRadar\n"
-            "  Sessão 4: python bootstrap_ml.py --layer price --slice 600 830 --drive-dir /content/drive/MyDrive/DipRadar\n"
+            "  Sessão 4: python bootstrap_ml.py --layer price --slice 600 800 --drive-dir /content/drive/MyDrive/DipRadar\n"
+            "  Sessão 5: python bootstrap_ml.py --layer price --slice 800 999 --drive-dir /content/drive/MyDrive/DipRadar\n"
             "  Sessão final: python bootstrap_ml.py --layer price --skip-backfill --drive-dir /content/drive/MyDrive/DipRadar"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
