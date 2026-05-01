@@ -1322,6 +1322,92 @@ def run_ml_outcomes_job() -> None:
     send_telegram("\n".join(lines))
 
 
+# ── Monthly ML Retrain Job (dia 1 de cada mês, 06:00) ─────────────────────────
+
+def run_monthly_retrain() -> None:
+    """
+    Corre no dia 1 de cada mês às 06:00 Lisboa.
+    1. Preenche outcomes em falta (fill_db_outcomes via Tiingo).
+    2. Retreina o modelo ML se houver dados suficientes.
+    3. Envia relatório de métricas pelo Telegram.
+    """
+    logging.info("[monthly_retrain] A iniciar retreino mensal...")
+    now_str = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
+
+    # Passo 1: preencher outcomes
+    try:
+        stats = fill_db_outcomes()
+        updated  = stats.get("updated", 0)
+        skipped  = stats.get("skipped", 0)
+        logging.info(f"[monthly_retrain] Outcomes: {updated} actualizados, {skipped} ignorados")
+    except Exception as e:
+        logging.error(f"[monthly_retrain] fill_db_outcomes: {e}")
+        send_telegram(
+            f"⚠️ *Retreino Mensal — Erro ao preencher outcomes*\n"
+            f"`{e}`\n_⏰ {now_str}_"
+        )
+        return
+
+    # Passo 2: treinar modelo
+    try:
+        from train_model import train_all
+        result = train_all()
+
+        s1 = result.get("stage1", {})
+        s2 = result.get("stage2", {})
+
+        lines = [
+            f"🤖 *Retreino Mensal Concluído*",
+            f"_{now_str}_",
+            "",
+            f"*📊 Stage 1 (filtro de qualidade):*",
+            f"  AUC-PR: *{s1.get('auc_pr', 'N/A')}*",
+            f"  Amostras: *{s1.get('n_samples', 'N/A')}*",
+            f"  Features: {s1.get('n_features', 'N/A')}",
+        ]
+        if s2:
+            lines += [
+                "",
+                f"*📈 Stage 2 (timing):*",
+                f"  AUC-PR: *{s2.get('auc_pr', 'N/A')}*",
+                f"  Amostras: *{s2.get('n_samples', 'N/A')}*",
+            ]
+        lines += [
+            "",
+            f"*✅ Outcomes preenchidos agora:* {updated}",
+            f"*⏩ Ignorados:* {skipped}",
+            "",
+            f"_Próximo retreino: dia 1 do mês seguinte às 06h_",
+        ]
+        send_telegram("\n".join(lines))
+        logging.info(f"[monthly_retrain] Retreino concluído. S1 AUC-PR={s1.get('auc_pr')}")
+
+    except ValueError as e:
+        # Dados insuficientes — não é erro crítico
+        db_stats = get_db_stats()
+        labeled  = db_stats.get("labeled", 0)
+        needed   = 30
+        lines = [
+            f"⏳ *Retreino Mensal — Dados insuficientes*",
+            f"_{now_str}_",
+            "",
+            f"Alertas classificados: *{labeled}/{needed}*",
+            f"`{e}`",
+            "",
+            f"*✅ Outcomes preenchidos agora:* {updated}",
+            f"_O modelo será treinado quando houver {needed} alertas classificados._",
+        ]
+        send_telegram("\n".join(lines))
+        logging.warning(f"[monthly_retrain] Dados insuficientes: {e}")
+
+    except Exception as e:
+        logging.error(f"[monthly_retrain] train_all: {e}", exc_info=True)
+        send_telegram(
+            f"❌ *Retreino Mensal — Erro*\n"
+            f"`{e}`\n_⏰ {now_str}_"
+        )
+
+
 # ── Bot commands handler ──────────────────────────────────────────────────────
 
 def poll_bot_commands() -> None:
@@ -1441,6 +1527,12 @@ def setup_schedule() -> BlockingScheduler:
         run_ml_outcomes_job,
         CronTrigger(day_of_week="sun", hour=8, minute=0, timezone=LISBON_TZ),
         id="ml_outcomes", name="ML outcomes dom 08:00",
+    )
+    # ── Retreino mensal automático ─────────────────────────────────────────────
+    scheduler.add_job(
+        run_monthly_retrain,
+        CronTrigger(day=1, hour=6, minute=0, timezone=LISBON_TZ),
+        id="monthly_retrain", name="Retreino ML dia 1 06:00",
     )
 
     def _daily_reset():
