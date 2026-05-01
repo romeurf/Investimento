@@ -356,6 +356,11 @@ def _handle_mldata(force_update: bool = False) -> None:
 
 # ── /admin_backfill_ml ──────────────────────────────────────────────────────────
 
+# Timeout máximo por ticker (segundos). Se o yfinance pendurar mais do que isto,
+# o ticker é marcado como erro e o backfill continua para o próximo.
+_BACKFILL_TICKER_TIMEOUT = int(os.environ.get("BACKFILL_TICKER_TIMEOUT", 90))
+
+
 def _handle_admin_backfill_ml() -> None:
     global _backfill_running
 
@@ -366,7 +371,6 @@ def _handle_admin_backfill_ml() -> None:
     dynamic = load_dynamic_watchlist()
     static  = []
     try:
-        # fix: importar de watchlist (lista de dicts), não de config
         from watchlist import WATCHLIST as _STATIC_WL
         static = [e["symbol"] for e in _STATIC_WL]
     except Exception:
@@ -378,69 +382,177 @@ def _handle_admin_backfill_ml() -> None:
         return
 
     n = len(tickers)
+    est_min = n * 4 // 60 + 1
+    est_max = n * 6 // 60 + 2
     _reply(
         f"⏳ *A iniciar a Máquina do Tempo* — {n} ticker(s) | lookback 5 anos\n"
-        f"_Estimativa: {n * 4 // 60 + 1}–{n * 6 // 60 + 2} minutos..._\n"
-        "_O bot continua a responder durante o processo._"
+        f"_Estimativa: {est_min}–{est_max} minutos..._\n"
+        f"_Vais receber update após cada ticker. Timeout por ticker: {_BACKFILL_TICKER_TIMEOUT}s._"
     )
 
     def _run():
         global _backfill_running
         _backfill_running = True
         start_ts = time.time()
+
+        # Importações necessárias dentro da thread
+        from backtest import (
+            run_historical_backtest,
+            _load_existing_keys,
+            _write_hist_csv,
+            _HIST_DB_PATH,
+        )
+        from pathlib import Path
+
+        csv_path      = _HIST_DB_PATH
+        existing_keys = _load_existing_keys(csv_path)
+
+        total_dips     = 0
+        total_written  = 0
+        total_skipped  = 0
+        total_censored = 0
+        total_dupes    = 0
+        total_errors   = 0
+        all_dip_rows: list[dict] = []
+
         try:
-            from backtest import build_historical_training_set
-            stats    = build_historical_training_set(tickers=tickers)
-            elapsed  = int(time.time() - start_ts)
-            mins, secs = divmod(elapsed, 60)
-            total    = stats.get("total_dips", 0)
-            written  = stats.get("written", 0)
-            skipped  = stats.get("skipped", 0)
-            censored = stats.get("censored", 0)
-            dupes    = stats.get("duplicates", 0)
-            errors   = stats.get("errors", 0)
-            csv_path = stats.get("csv_path") or "N/D"
-            dip_rows = stats.get("dip_rows", [])
-            label_counts: dict = {}
-            for row in dip_rows:
-                lbl = row.get("outcome_label") or "pending"
-                label_counts[lbl] = label_counts.get(lbl, 0) + 1
+            for i, sym in enumerate(tickers, 1):
+                ticker_start = time.time()
+                _reply(
+                    f"🔄 *[{i}/{n}]* `{sym}` — a descarregar 5 anos de dados..."
+                )
 
-            em_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴", "pending": "⏳"}
-            lines = [
-                "✅ *Backfill ML concluído!*",
-                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_", "",
-                f"*🗂️ Ficheiro:* `{csv_path}`", "",
-                "*📊 Pipeline stats:*",
-                f"  📡 Dips detectados:  *{total}*",
-                f"  ✍️  Escritos no CSV: *{written}*",
-                f"  🚫 Ignorados (score): *{skipped}*",
-                f"  ⏳ Censurados (edge): *{censored}*",
-                f"  🔁 Duplicados (skip): *{dupes}*",
-            ]
-            if errors: lines.append(f"  ⚠️ Erros de ticker: *{errors}*")
-            lines.append("")
-            if label_counts:
-                lines.append("*🎯 Distribuição de outcomes:*")
-                for lbl, cnt in sorted(label_counts.items(), key=lambda x: x[1], reverse=True):
-                    pct = cnt / len(dip_rows) * 100 if dip_rows else 0
-                    lines.append(f"  {em_map.get(lbl,'📊')} {lbl}: *{cnt}* ({pct:.0f}%)")
-                lines.append("")
+                # Corre run_historical_backtest para UM ticker com timeout via thread
+                result_holder: list[dict] = []
+                error_holder:  list[str]  = []
 
-            total_labeled = sum(cnt for lbl, cnt in label_counts.items() if lbl != "pending")
-            if total_labeled >= 100:
-                lines.append("🟢 *Pronto para treinar!* Usa `/admin_train_ml`")
-            elif total_labeled >= 30:
-                lines.append(f"🟡 *{total_labeled} amostras* — podes já tentar `/admin_train_ml`")
-            else:
-                lines.append(f"🕐 *{total_labeled} amostras* — adiciona mais tickers à watchlist.")
+                def _fetch(s=sym, rh=result_holder, eh=error_holder):
+                    try:
+                        stats = run_historical_backtest(
+                            tickers=[s],
+                            min_score=0.0,
+                            dry_run=False,
+                        )
+                        rh.append(stats)
+                    except Exception as exc:
+                        eh.append(str(exc))
 
-            _reply("\n".join(lines))
+                t = threading.Thread(target=_fetch, daemon=True)
+                t.start()
+                t.join(timeout=_BACKFILL_TICKER_TIMEOUT)
+
+                elapsed_ticker = int(time.time() - ticker_start)
+
+                if t.is_alive():
+                    # Timeout — o yfinance ficou pendurado
+                    total_errors += 1
+                    _reply(
+                        f"⏱️ *[{i}/{n}]* `{sym}` — *timeout* ({_BACKFILL_TICKER_TIMEOUT}s)\n"
+                        f"_A avançar para o próximo ticker._"
+                    )
+                    logging.warning(f"[admin_backfill] {sym}: timeout após {_BACKFILL_TICKER_TIMEOUT}s")
+                    continue
+
+                if error_holder:
+                    total_errors += 1
+                    _reply(
+                        f"⚠️ *[{i}/{n}]* `{sym}` — erro: `{error_holder[0][:80]}`"
+                    )
+                    logging.warning(f"[admin_backfill] {sym}: {error_holder[0]}")
+                    continue
+
+                if not result_holder:
+                    total_errors += 1
+                    _reply(f"⚠️ *[{i}/{n}]* `{sym}` — sem resultado (dados insuficientes?)")
+                    continue
+
+                stats      = result_holder[0]
+                dip_rows   = stats.get("dip_rows", [])
+                n_dips     = stats.get("total_dips", 0)
+                n_censored = stats.get("censored", 0)
+                n_skipped  = stats.get("ignored_score", 0)
+                n_err      = stats.get("errors", 0)
+
+                # Escrita incremental para este ticker
+                dupes_ticker   = sum(1 for r in dip_rows if (r["symbol"], r["date_iso"]) in existing_keys)
+                written_ticker = _write_hist_csv(dip_rows, csv_path, existing_keys)
+                # Actualiza existing_keys para evitar duplicados nos tickers seguintes
+                for r in dip_rows:
+                    existing_keys.add((r["symbol"], r["date_iso"]))
+
+                total_dips     += n_dips
+                total_written  += written_ticker
+                total_skipped  += n_skipped
+                total_censored += n_censored
+                total_dupes    += dupes_ticker
+                total_errors   += n_err
+                all_dip_rows   += dip_rows
+
+                # Distribuição de outcomes para este ticker
+                label_counts: dict = {}
+                for row in dip_rows:
+                    lbl = row.get("outcome_label") or "pending"
+                    label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
+                em_map   = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴", "pending": "⏳"}
+                lbl_str  = " | ".join(
+                    f"{em_map.get(k,'📊')}{k}:{v}"
+                    for k, v in sorted(label_counts.items(), key=lambda x: x[1], reverse=True)
+                ) if label_counts else "_sem dips_"
+
+                status_em = "✅" if n_dips > 0 else "➖"
+                _reply(
+                    f"{status_em} *[{i}/{n}]* `{sym}` — "
+                    f"*{n_dips}* dips | +{written_ticker} linhas | {elapsed_ticker}s\n"
+                    f"  {lbl_str}"
+                )
+
         except Exception as e:
-            logging.error(f"[admin_backfill] Erro: {e}")
-            _reply(f"❌ *Backfill falhou:*\n`{e}`\n_Verifica os logs no Railway._")
+            logging.error(f"[admin_backfill] Erro fatal no loop: {e}")
+            _reply(f"❌ *Backfill interrompido por erro fatal:*\n`{e}`")
         finally:
             _backfill_running = False
+
+        # ── Relatório final ──────────────────────────────────────────────────
+        elapsed  = int(time.time() - start_ts)
+        mins, secs = divmod(elapsed, 60)
+
+        label_counts_total: dict = {}
+        for row in all_dip_rows:
+            lbl = row.get("outcome_label") or "pending"
+            label_counts_total[lbl] = label_counts_total.get(lbl, 0) + 1
+
+        em_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴", "pending": "⏳"}
+        lines = [
+            "✅ *Backfill ML concluído!*",
+            f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_", "",
+            f"*🗂️ Ficheiro:* `{str(csv_path)}`", "",
+            "*📊 Pipeline stats:*",
+            f"  📡 Dips detectados:  *{total_dips}*",
+            f"  ✍️  Escritos no CSV: *{total_written}*",
+            f"  🚫 Ignorados (score): *{total_skipped}*",
+            f"  ⏳ Censurados (edge): *{total_censored}*",
+            f"  🔁 Duplicados (skip): *{total_dupes}*",
+        ]
+        if total_errors:
+            lines.append(f"  ⚠️ Erros/timeouts: *{total_errors}*")
+        lines.append("")
+        if label_counts_total:
+            lines.append("*🎯 Distribuição de outcomes:*")
+            for lbl, cnt in sorted(label_counts_total.items(), key=lambda x: x[1], reverse=True):
+                pct = cnt / len(all_dip_rows) * 100 if all_dip_rows else 0
+                lines.append(f"  {em_map.get(lbl,'📊')} {lbl}: *{cnt}* ({pct:.0f}%)")
+            lines.append("")
+
+        total_labeled = sum(cnt for lbl, cnt in label_counts_total.items() if lbl != "pending")
+        if total_labeled >= 100:
+            lines.append("🟢 *Pronto para treinar!* Usa `/admin_train_ml`")
+        elif total_labeled >= 30:
+            lines.append(f"🟡 *{total_labeled} amostras* — podes já tentar `/admin_train_ml`")
+        else:
+            lines.append(f"🕐 *{total_labeled} amostras* — adiciona mais tickers à watchlist.")
+
+        _reply("\n".join(lines))
 
     threading.Thread(target=_run, daemon=True, name="admin-backfill").start()
 
