@@ -1,11 +1,28 @@
 """
 ml_pipeline.py — Chunk 7: Motor de treino local standalone.
 
-USO:
+USO CLI (terminal):
     python ml_pipeline.py --train dados_historicos.parquet
     python ml_pipeline.py --train dados_historicos.parquet --output models/
     python ml_pipeline.py --train dados_historicos.parquet --algo xgb --no-stage2
     python ml_pipeline.py --train dados_historicos.parquet --fixed-threshold 0.55
+
+USO JUPYTER / GOOGLE COLAB (sem argparse):
+    # Configura os parâmetros aqui antes de correr a célula:
+    import sys, types
+    _COLAB_ARGS = types.SimpleNamespace(
+        train="dados_historicos.parquet",
+        output="data",
+        algo="rf",
+        test_ratio=0.20,
+        no_stage2=False,
+        no_threshold_search=False,
+        fixed_threshold=None,
+    )
+    # Depois importa e corre:
+    import ml_pipeline; ml_pipeline._COLAB_ARGS = _COLAB_ARGS; ml_pipeline.main()
+
+    ─── OU simplesmente edita COLAB_PARAMS abaixo e corre a célula directamente ───
 
 OUTPUT:
     data/dip_model_stage1.pkl   — Porteiro (WIN vs NO_WIN)
@@ -28,6 +45,7 @@ from __future__ import annotations
 import argparse
 import pickle
 import sys
+import types
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +55,35 @@ import pandas as pd
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PARÂMETROS PARA COLAB / JUPYTER
+# Edita estes valores quando correres directamente num notebook.
+# Em execução CLI normal (python ml_pipeline.py --train ...) são ignorados.
+# ──────────────────────────────────────────────────────────────────────────────
+
+COLAB_PARAMS = {
+    "train":               "dados_historicos.parquet",  # <-- muda este caminho
+    "output":              "data",
+    "algo":                "rf",          # rf | xgb | lgbm
+    "test_ratio":          0.20,
+    "no_stage2":           False,
+    "no_threshold_search": False,
+    "fixed_threshold":     None,          # ex: 0.55 para forçar
+}
+
+# Variável interna; pode ser sobrescrita externamente (ver docstring acima)
+_COLAB_ARGS: types.SimpleNamespace | None = None
+
+
+def _is_notebook() -> bool:
+    """Detecta se está a correr dentro de IPython/Jupyter/Colab."""
+    try:
+        shell = get_ipython().__class__.__name__  # type: ignore[name-defined]  # noqa: F821
+        return shell in ("ZMQInteractiveShell", "Shell", "TerminalInteractiveShell")
+    except NameError:
+        return False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FEATURE COLS — espelho exato do _FEATURE_MAP no ml_predictor.py
@@ -391,10 +438,27 @@ def _save_bundle(bundle: dict, path: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. CLI
+# 5. RESOLUÇÃO DE ARGUMENTOS (CLI ou Notebook)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
+    """Retorna argumentos a partir de CLI ou, em ambiente notebook, de COLAB_PARAMS."""
+    if _is_notebook():
+        # Notebook/Colab: usa _COLAB_ARGS (se injectado externamente) ou COLAB_PARAMS
+        src = _COLAB_ARGS if _COLAB_ARGS is not None else types.SimpleNamespace(**COLAB_PARAMS)
+        # Garante que test_ratio tem o nome correcto (argparse usa test_ratio, não test-ratio)
+        if not hasattr(src, "test_ratio") and hasattr(src, "test-ratio"):
+            src.test_ratio = getattr(src, "test-ratio")
+        print(f"[pipeline] Modo Notebook/Colab — a usar COLAB_PARAMS")
+        print(f"  train           = {src.train}")
+        print(f"  output          = {src.output}")
+        print(f"  algo            = {src.algo}")
+        print(f"  test_ratio      = {src.test_ratio}")
+        print(f"  no_stage2       = {src.no_stage2}")
+        print(f"  fixed_threshold = {src.fixed_threshold}")
+        return src
+
+    # Modo CLI normal
     p = argparse.ArgumentParser(
         description="DipRadar ML Pipeline — treino local standalone",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -405,7 +469,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--output", metavar="DIR", default="data",
-        help="Directoório de saída para os .pkl  (default: data/)",
+        help="Directório de saída para os .pkl  (default: data/)",
     )
     p.add_argument(
         "--algo", choices=["rf", "xgb", "lgbm"], default="rf",
@@ -413,6 +477,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--test-ratio", type=float, default=0.20, metavar="RATIO",
+        dest="test_ratio",
         help="Fracção reservada para teste  (default: 0.20)",
     )
     p.add_argument(
@@ -425,6 +490,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--fixed-threshold", type=float, default=None, metavar="FLOAT",
+        dest="fixed_threshold",
         help="Força threshold específico (ex: 0.55). Ignora --no-threshold-search",
     )
     return p.parse_args()
@@ -462,7 +528,7 @@ def main() -> None:
     # ─ Split temporal
     train_df, test_df = temporal_split(df, test_ratio=args.test_ratio)
 
-    do_search = not args.no_threshold_search and (args.fixed_threshold is None)
+    do_search = (not getattr(args, "no_threshold_search", False)) and (args.fixed_threshold is None)
 
     # ─ Stage 1 (Porteiro)
     bundle_s1 = train_stage1(train_df, test_df, algo=args.algo, threshold_search=do_search)
@@ -475,13 +541,13 @@ def main() -> None:
 
     # ─ Stage 2 (Sommelier)
     bundle_s2 = None
-    if not args.no_stage2:
+    if not getattr(args, "no_stage2", False):
         bundle_s2 = train_stage2(train_df, test_df, algo=args.algo)
         if bundle_s2:
             path_s2 = out_dir / "dip_model_stage2.pkl"
             _save_bundle(bundle_s2, path_s2)
     else:
-        print("[pipeline] Stage 2 saltado (--no-stage2)")
+        print("[pipeline] Stage 2 saltado (no_stage2=True)")
 
     # ─ Sumário final
     print(f"\n{'='*60}")
