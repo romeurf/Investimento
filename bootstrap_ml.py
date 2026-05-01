@@ -1,30 +1,33 @@
 """
-bootstrap_ml.py — Backfill histórico + treino ML standalone.
+bootstrap_ml.py — Backfill histórico + treino ML com janela deslizante de 5 anos.
 
-Corre DENTRO do container Railway (tem acesso ao volume /data/).
+MODO AUTOMÁTICO (agendado pelo bot, corre às 02:00 UTC todos os dias):
+    - Janela = [hoje - 5 anos, ontem]
+    - Registos com alert_date < (hoje - 5 anos) são eliminados automaticamente
+    - Novos registos do dia anterior são adicionados
+    - Treino re-corre sempre que há dados novos
 
-USO:
-    railway run python bootstrap_ml.py
+MODO MANUAL (Railway CLI / Colab):
+    railway run python bootstrap_ml.py          # janela auto de 5 anos
     railway run python bootstrap_ml.py --algo xgb
-    railway run python bootstrap_ml.py --start 2020-01-01 --end 2024-06-01
+    railway run python bootstrap_ml.py --skip-backfill   # só treino
 
 OUTPUT:
     /data/dip_model_stage1.pkl
     /data/dip_model_stage2.pkl  (se wins suficientes)
-    /data/alert_db.csv          (NÃO sobrescreve se já existir — faz merge)
+    /data/ml_training_data.parquet  (janela activa — substituído a cada run)
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 import os
 import pickle
 import sys
 import time
 import warnings
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -42,11 +45,21 @@ log = logging.getLogger("bootstrap_ml")
 DATA_DIR = Path("/data") if Path("/data").exists() else Path("./data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-PKL_S1 = DATA_DIR / "dip_model_stage1.pkl"
-PKL_S2 = DATA_DIR / "dip_model_stage2.pkl"
-CSV_DB = DATA_DIR / "alert_db.csv"
+PKL_S1   = DATA_DIR / "dip_model_stage1.pkl"
+PKL_S2   = DATA_DIR / "dip_model_stage2.pkl"
+PARQUET  = DATA_DIR / "ml_training_data.parquet"   # janela activa
 
-# ── Features (espelho exacto do ml_predictor.py) ──────────────────────────────
+# ── Janela deslizante ──────────────────────────────────────────────────────────
+WINDOW_YEARS = 5
+
+def _window() -> tuple[date, date]:
+    """Retorna (start, end) da janela activa. End = ontem; Start = ontem - 5 anos."""
+    end   = date.today() - timedelta(days=1)
+    start = end.replace(year=end.year - WINDOW_YEARS)
+    return start, end
+
+
+# ── Features ──────────────────────────────────────────────────────────────────
 FEATURE_COLS: list[str] = [
     "rsi", "drawdown_pct", "change_day_pct",
     "pe_ratio", "pb_ratio", "fcf_yield", "analyst_upside",
@@ -56,7 +69,7 @@ FEATURE_COLS: list[str] = [
     "market_cap_b", "dip_score",
 ]
 
-# ── Universo de acções ─────────────────────────────────────────────────────────
+# ── Universo ──────────────────────────────────────────────────────────────────
 UNIVERSE = [
     # Tech
     "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA","AMD","INTC","CRM",
@@ -88,8 +101,7 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain  = delta.clip(lower=0).rolling(period).mean()
     loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + gain / (loss + 1e-9)))
 
 
 def outcome_label(ret: float) -> str:
@@ -99,8 +111,8 @@ def outcome_label(ret: float) -> str:
     else:            return "LOSS_15"
 
 
-def get_price_near(hist: pd.DataFrame, target: datetime.date, window: int = 5) -> float | None:
-    for d in [0, 1, -1, 2, -2, 3, -3, 4, 5]:
+def get_price_near(hist: pd.DataFrame, target: date, window: int = 5) -> float | None:
+    for d in range(-3, 6):
         check = target + timedelta(days=d)
         m = hist[hist.index.date == check]
         if not m.empty:
@@ -142,42 +154,61 @@ def simple_dip_score(r: dict) -> float:
     return min(max(score, 0), 100)
 
 
-# ── Backfill ───────────────────────────────────────────────────────────────────
+# ── Backfill incremental ───────────────────────────────────────────────────────
 
-def run_backfill(start: str, end: str, dip_thresh: float = -0.04,
-                 max_per_ticker: int = 8) -> pd.DataFrame:
+def run_backfill(
+    start: date,
+    end:   date,
+    dip_thresh: float = 0.04,
+    max_per_ticker: int = 8,
+    existing_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Busca dados históricos para a janela [start, end].
+    Se existing_df fornecido, só processa tickers/datas que ainda não existem
+    (evita re-buscar tudo a cada run diário).
+    """
     try:
         import yfinance as yf
     except ImportError:
         log.error("yfinance não instalado — pip install yfinance")
         sys.exit(1)
 
-    log.info(f"Backfill: {start} → {end} | {len(UNIVERSE)} tickers")
+    # Datas já presentes no dataset existente
+    existing_keys: set[tuple] = set()
+    if existing_df is not None and not existing_df.empty:
+        existing_keys = set(
+            zip(existing_df["symbol"].astype(str),
+                existing_df["alert_date"].astype(str))
+        )
 
-    # SPY para contexto macro
-    log.info("A buscar SPY...")
-    spy_hist = yf.Ticker("SPY").history(start=start, end="2025-06-01", interval="1d")
+    start_str = start.isoformat()
+    # Busca dados até hoje + 6 meses para poder calcular outcomes futuros
+    fetch_end = min(end + timedelta(days=200), date.today()).isoformat()
+
+    log.info(f"Backfill: {start_str} → {end.isoformat()} | {len(UNIVERSE)} tickers")
+    log.info(f"  Já existentes: {len(existing_keys)} (serão ignorados)")
+
+    # SPY
+    spy_hist = yf.Ticker("SPY").history(start=start_str, end=fetch_end, interval="1d")
     spy_hist["spy_ret"] = spy_hist["Close"].pct_change() * 100
     spy_map = {d.date(): float(r) for d, r in spy_hist["spy_ret"].items()}
 
     all_alerts: list[dict] = []
-    errors: list[str] = []
 
     for i, ticker in enumerate(UNIVERSE):
         try:
             tk   = yf.Ticker(ticker)
-            hist = tk.history(start=start, end="2025-06-01", interval="1d")
+            hist = tk.history(start=start_str, end=fetch_end, interval="1d")
             if hist.empty or len(hist) < 60:
                 continue
 
             info = tk.info or {}
-
             hist["rsi"]    = calc_rsi(hist["Close"])
             hist["ret_1d"] = hist["Close"].pct_change() * 100
             roll_max       = hist["Close"].rolling(252, min_periods=30).max()
             hist["ddp"]    = (hist["Close"] - roll_max) / roll_max * 100
 
-            # Fundamentais (snapshot estático do yfinance)
             pe    = safe_float(info.get("trailingPE") or info.get("forwardPE"))
             pb    = safe_float(info.get("priceToBook"))
             mcap  = safe_float(info.get("marketCap"), 0) / 1e9
@@ -193,24 +224,26 @@ def run_backfill(start: str, end: str, dip_thresh: float = -0.04,
             cur   = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"), 1)
             upside = ((tgt - cur) / cur * 100) if tgt and cur else 0.0
 
-            # Detecta dias de dip dentro da janela
             mask = (
-                (hist["ret_1d"] <= dip_thresh * 100) &
+                (hist["ret_1d"] <= -(dip_thresh * 100)) &
                 (hist["rsi"] < 55) &
-                (hist.index >= pd.Timestamp(start)) &
-                (hist.index <= pd.Timestamp(end))
+                (hist.index >= pd.Timestamp(start_str)) &
+                (hist.index <= pd.Timestamp(end.isoformat()))
             )
             dip_days = hist[mask]
             if dip_days.empty:
                 continue
 
-            # Espaça alertas (mínimo 20 dias)
             selected = []
             last_dt = None
             for dt, row in dip_days.iterrows():
-                if last_dt is None or (dt.date() - last_dt).days >= 20:
+                alert_date = dt.date()
+                # Salta se já existe no dataset
+                if (ticker, alert_date.isoformat()) in existing_keys:
+                    continue
+                if last_dt is None or (alert_date - last_dt).days >= 20:
                     selected.append((dt, row))
-                    last_dt = dt.date()
+                    last_dt = alert_date
                 if len(selected) >= max_per_ticker:
                     break
 
@@ -222,8 +255,8 @@ def run_backfill(start: str, end: str, dip_thresh: float = -0.04,
                     continue
 
                 entry = float(row["Close"])
-                p3m   = get_price_near(hist_after, alert_date + timedelta(days=91))
-                p6m   = get_price_near(hist_after, alert_date + timedelta(days=182))
+                p3m = get_price_near(hist_after, alert_date + timedelta(days=91))
+                p6m = get_price_near(hist_after, alert_date + timedelta(days=182))
                 if p3m is None and p6m is None:
                     continue
 
@@ -261,38 +294,65 @@ def run_backfill(start: str, end: str, dip_thresh: float = -0.04,
                 all_alerts.append(feat)
 
             if (i + 1) % 20 == 0:
-                log.info(f"  [{i+1}/{len(UNIVERSE)}] {len(all_alerts)} alertas")
+                log.info(f"  [{i+1}/{len(UNIVERSE)}] {len(all_alerts)} novos alertas")
             time.sleep(0.3)
 
         except Exception as e:
-            errors.append(f"{ticker}: {e}")
             log.warning(f"  ERRO {ticker}: {e}")
 
-    log.info(f"Backfill concluído: {len(all_alerts)} alertas | {len(errors)} erros")
-    df = pd.DataFrame(all_alerts)
-    log.info(f"Distribuição outcomes:\n{df['outcome_label'].value_counts().to_string()}")
-    return df
+    log.info(f"Backfill: {len(all_alerts)} novos alertas encontrados")
+    return pd.DataFrame(all_alerts) if all_alerts else pd.DataFrame()
 
 
-# ── Merge com CSV existente ────────────────────────────────────────────────────
+# ── Janela deslizante: carrega, purga e faz merge ─────────────────────────────
 
-def merge_with_existing(new_df: pd.DataFrame) -> pd.DataFrame:
-    if not CSV_DB.exists():
-        return new_df
-    try:
-        existing = pd.read_csv(CSV_DB)
-        # Remove linhas sem outcome_label do CSV existente (dados de treino ao vivo ainda incompletos)
-        existing = existing[existing.get("outcome_label", pd.Series()).notna()]
-        if existing.empty:
-            return new_df
-        # Combina, remove duplicados por symbol + alert_date
+def load_and_slide(
+    start: date,
+    new_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    1. Carrega o Parquet existente (se existir)
+    2. Remove registos com alert_date < start  (fora da janela de 5 anos)
+    3. Faz merge com os novos registos
+    4. Remove duplicados (symbol + alert_date)
+    5. Guarda e retorna o DataFrame actualizado
+    """
+    start_str = start.isoformat()
+
+    if PARQUET.exists():
+        existing = pd.read_parquet(PARQUET)
+        rows_before = len(existing)
+        # Purga dados fora da janela
+        existing["alert_date"] = existing["alert_date"].astype(str)
+        existing = existing[existing["alert_date"] >= start_str].copy()
+        purged = rows_before - len(existing)
+        if purged > 0:
+            log.info(f"🗑  Purgados {purged} registos fora da janela (< {start_str})")
+    else:
+        existing = pd.DataFrame()
+
+    if new_df.empty and existing.empty:
+        log.error("Sem dados — Parquet vazio e backfill sem resultados.")
+        sys.exit(1)
+
+    if new_df.empty:
+        combined = existing
+    elif existing.empty:
+        combined = new_df
+    else:
         combined = pd.concat([existing, new_df], ignore_index=True)
-        combined.drop_duplicates(subset=["symbol", "alert_date"], keep="last", inplace=True)
-        log.info(f"Merge: {len(existing)} existentes + {len(new_df)} novos = {len(combined)} total")
-        return combined
-    except Exception as e:
-        log.warning(f"Não foi possível fazer merge com CSV existente: {e}")
-        return new_df
+
+    combined["alert_date"] = combined["alert_date"].astype(str)
+    combined.drop_duplicates(subset=["symbol", "alert_date"], keep="last", inplace=True)
+    combined.sort_values("alert_date", inplace=True)
+    combined.reset_index(drop=True, inplace=True)
+
+    combined.to_parquet(PARQUET, index=False)
+    log.info(
+        f"📦 Parquet actualizado: {len(combined)} registos "
+        f"({start_str} → hoje)  →  {PARQUET}"
+    )
+    return combined
 
 
 # ── Treino ─────────────────────────────────────────────────────────────────────
@@ -344,14 +404,12 @@ def train_and_save(df: pd.DataFrame, algo: str = "rf") -> None:
         log.error(f"Dados insuficientes: {len(df2)} linhas, {int(df2['target_s1'].sum())} wins")
         sys.exit(1)
 
-    # Garante todas as colunas
     for col in FEATURE_COLS:
         if col not in df2.columns:
             df2[col] = np.nan
 
-    # Split temporal 80/20
     df2 = df2.sort_values("alert_date").reset_index(drop=True)
-    split = int(len(df2) * 0.80)
+    split    = int(len(df2) * 0.80)
     train_df = df2.iloc[:split]
     test_df  = df2.iloc[split:]
 
@@ -374,8 +432,7 @@ def train_and_save(df: pd.DataFrame, algo: str = "rf") -> None:
     auc_pr = average_precision_score(y_te, probs)
 
     log.info(f"  AUC-PR: {auc_pr:.4f}")
-    log.info("\n" + classification_report(y_te, y_pred,
-             target_names=["NO_WIN", "WIN"], digits=3))
+    log.info("\n" + classification_report(y_te, y_pred, target_names=["NO_WIN", "WIN"], digits=3))
 
     bundle_s1 = {
         "model":           pipe_s1,
@@ -385,29 +442,30 @@ def train_and_save(df: pd.DataFrame, algo: str = "rf") -> None:
         "auc_pr":          round(auc_pr, 4),
         "n_samples":       int(len(X_tr)),
         "train_date":      datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "window_start":    (date.today() - timedelta(days=WINDOW_YEARS * 365)).isoformat(),
+        "window_end":      (date.today() - timedelta(days=1)).isoformat(),
     }
     with open(PKL_S1, "wb") as f:
         pickle.dump(bundle_s1, f, protocol=pickle.HIGHEST_PROTOCOL)
     log.info(f"✅ {PKL_S1}  ({PKL_S1.stat().st_size / 1024:.0f} KB)")
 
-    # Stage 2 — Sommelier
+    # Stage 2
     wins_tr = train_df[train_df["outcome_label"].isin(["WIN_40", "WIN_20"])].copy()
-    wins_te = test_df[test_df["outcome_label"].isin(["WIN_40", "WIN_20"])].copy()
     wins_tr["target_s2"] = (wins_tr["outcome_label"] == "WIN_40").astype(int)
-
     if len(wins_tr) >= 30:
         log.info(f"Stage 2 — {len(wins_tr)} wins de treino")
-        Xw = wins_tr[FEATURE_COLS].values.astype(np.float32)
-        yw = wins_tr["target_s2"].values
         pipe_s2 = _build_pipeline(algo)
-        pipe_s2.fit(Xw, yw)
+        pipe_s2.fit(
+            wins_tr[FEATURE_COLS].values.astype(np.float32),
+            wins_tr["target_s2"].values,
+        )
         bundle_s2 = {
             "model":           pipe_s2,
             "feature_columns": FEATURE_COLS,
             "threshold":       0.55,
             "algorithm":       algo,
             "auc_pr":          0.0,
-            "n_samples":       len(Xw),
+            "n_samples":       len(wins_tr),
             "train_date":      datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         with open(PKL_S2, "wb") as f:
@@ -416,60 +474,99 @@ def train_and_save(df: pd.DataFrame, algo: str = "rf") -> None:
     else:
         log.info(f"Stage 2 saltado ({len(wins_tr)} wins — mínimo: 30)")
 
-    log.info("=" * 50)
+    log.info("=" * 55)
     log.info("TREINO CONCLUÍDO")
+    log.info(f"  Janela   : {bundle_s1['window_start']} → {bundle_s1['window_end']}")
     log.info(f"  Amostras : {len(df2)}")
     log.info(f"  AUC-PR   : {auc_pr:.4f}")
     log.info(f"  Modelo   : {PKL_S1}")
-    log.info("Confirma com /mldata no Telegram.")
-    log.info("=" * 50)
+    log.info("=" * 55)
+
+
+# ── Ponto de entrada público (usado pelo scheduler do bot) ─────────────────────
+
+def run_auto() -> None:
+    """
+    Corre automaticamente pelo scheduler do bot (main.py / asyncio).
+    - Calcula janela deslizante de 5 anos
+    - Só faz backfill incremental (datas ainda não no Parquet)
+    - Purga dados antigos
+    - Retreina
+    """
+    log.info("=" * 55)
+    log.info("AUTO RUN — janela deslizante 5 anos")
+    start, end = _window()
+    log.info(f"  Janela activa: {start} → {end}")
+
+    # Carrega existente (para saber o que já temos)
+    existing = pd.read_parquet(PARQUET) if PARQUET.exists() else pd.DataFrame()
+
+    # Só faz backfill incremental com dados que ainda não existem
+    new_df = run_backfill(start=start, end=end, existing_df=existing)
+
+    # Purga antigos + merge
+    df = load_and_slide(start=start, new_df=new_df)
+
+    # Treina
+    try:
+        import sklearn  # noqa: F401
+        train_and_save(df, algo="rf")
+    except ImportError:
+        log.error("scikit-learn não instalado")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="DipRadar — Bootstrap ML (backfill + treino standalone)"
+        description="DipRadar — Bootstrap ML (janela deslizante 5 anos)"
     )
-    p.add_argument("--start", default="2019-01-01",
-                   help="Data de início do backfill (default: 2019-01-01)")
-    p.add_argument("--end",   default="2024-06-01",
-                   help="Data de fim do backfill (default: 2024-06-01)")
-    p.add_argument("--algo",  choices=["rf", "xgb"], default="rf",
-                   help="Algoritmo: rf | xgb (default: rf)")
+    p.add_argument("--algo", choices=["rf", "xgb"], default="rf")
     p.add_argument("--dip-thresh", type=float, default=0.04,
-                   help="Queda mínima do dia para ser alerta (default: 0.04 = 4%%)")
+                   help="Queda mínima do dia (default: 4%%)")
     p.add_argument("--skip-backfill", action="store_true",
-                   help="Salta o backfill e treina directamente com o CSV existente")
+                   help="Salta o backfill e treina directamente com o Parquet existente")
+    p.add_argument("--force-full", action="store_true",
+                   help="Ignora dados existentes e refaz backfill completo (lento)")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    # Verifica sklearn
     try:
         import sklearn  # noqa: F401
     except ImportError:
         log.error("scikit-learn não instalado")
         sys.exit(1)
 
+    start, end = _window()
+    log.info(f"Janela activa: {start} → {end}")
+
     if args.skip_backfill:
-        if not CSV_DB.exists():
-            log.error(f"CSV não encontrado: {CSV_DB}")
+        if not PARQUET.exists():
+            log.error(f"Parquet não encontrado: {PARQUET}")
             sys.exit(1)
-        log.info(f"A carregar CSV existente: {CSV_DB}")
-        df = pd.read_csv(CSV_DB)
+        log.info(f"A carregar Parquet existente: {PARQUET}")
+        df = pd.read_parquet(PARQUET)
+        # Ainda purga dados fora da janela
+        df["alert_date"] = df["alert_date"].astype(str)
+        before = len(df)
+        df = df[df["alert_date"] >= start.isoformat()].copy()
+        if len(df) < before:
+            log.info(f"🗑  Purgados {before - len(df)} registos fora da janela")
+            df.to_parquet(PARQUET, index=False)
     else:
-        df_new = run_backfill(
-            start=args.start,
-            end=args.end,
-            dip_thresh=args.dip_thresh,
+        existing = pd.DataFrame() if args.force_full else (
+            pd.read_parquet(PARQUET) if PARQUET.exists() else pd.DataFrame()
         )
-        df = merge_with_existing(df_new)
-        # Guarda CSV actualizado
-        df.to_csv(CSV_DB, index=False)
-        log.info(f"CSV guardado: {CSV_DB}  ({len(df)} linhas)")
+        new_df = run_backfill(
+            start=start,
+            end=end,
+            dip_thresh=args.dip_thresh,
+            existing_df=existing,
+        )
+        df = load_and_slide(start=start, new_df=new_df)
 
     train_and_save(df, algo=args.algo)
 
