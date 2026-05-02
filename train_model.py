@@ -16,11 +16,14 @@ CLI:
   python train_model.py --report
   python train_model.py --live-only
   python train_model.py --precision 0.65
+  python train_model.py --exclude-years 2020
+  python train_model.py --exclude-years 2020 2021
 
   # Colab: especificar parquet e output-dir
   python train_model.py \\
-      --parquet /content/drive/MyDrive/DipRadar/ml_training_price.parquet \\
-      --output-dir /content/drive/MyDrive/DipRadar
+      --parquet /content/drive/MyDrive/DipRadar/ml_training_merged.parquet \\
+      --output-dir /content/drive/MyDrive/DipRadar \\
+      --exclude-years 2020
 
 Outputs:
   <output-dir>/dip_model_stage1.pkl
@@ -94,9 +97,47 @@ _SMOTE_THRESHOLD = 200
 
 # ── 1. Preparação de dados ─────────────────────────────────────────────────────
 
+def _apply_exclude_years(df: pd.DataFrame, exclude_years: list[int]) -> pd.DataFrame:
+    """
+    Remove linhas cujo alert_date pertence a qualquer ano em exclude_years.
+    Suporta alert_date como string ISO, datetime, ou date.
+    Loga o número de linhas removidas por ano.
+    """
+    if not exclude_years:
+        return df
+
+    date_col = "alert_date"
+    if date_col not in df.columns:
+        logging.warning(
+            f"[exclude_years] Coluna '{date_col}' não encontrada — filtro ignorado."
+        )
+        return df
+
+    years_parsed = pd.to_datetime(df[date_col], errors="coerce").dt.year
+    mask_exclude = years_parsed.isin(exclude_years)
+    n_removed = int(mask_exclude.sum())
+    n_before  = len(df)
+
+    if n_removed > 0:
+        removed_by_year = years_parsed[mask_exclude].value_counts().sort_index()
+        for yr, cnt in removed_by_year.items():
+            logging.info(f"[exclude_years] {yr}: {cnt} alertas removidos")
+        logging.info(
+            f"[exclude_years] Total removido: {n_removed} / {n_before} linhas "
+            f"({n_removed / n_before * 100:.1f}%) | Restam: {n_before - n_removed}"
+        )
+    else:
+        logging.info(
+            f"[exclude_years] Anos {exclude_years} não encontrados nos dados — nada removido."
+        )
+
+    return df[~mask_exclude].copy()
+
+
 def prepare_ml_data(
     live_only: bool = False,
     parquet_path: Path | None = None,
+    exclude_years: list[int] | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, list[str]]:
     """
     Carrega dados de treino a partir de:
@@ -107,12 +148,16 @@ def prepare_ml_data(
     """
     frames = []
     feature_names: list[str] = []
+    exclude_years = exclude_years or []
 
     # ── Modo Parquet (bootstrap_ml output) ───────────────────────────────────
     if parquet_path and Path(parquet_path).exists():
         logging.info(f"[ml_data] A carregar Parquet: {parquet_path}")
         df = pd.read_parquet(parquet_path)
         logging.info(f"[ml_data] Parquet: {len(df)} registos | colunas: {list(df.columns)}")
+
+        # Filtro de anos excluídos (antes de qualquer outra operação)
+        df = _apply_exclude_years(df, exclude_years)
 
         # Detectar contrato de features disponíveis
         available = [f for f in _FEATURES_BOOTSTRAP if f in df.columns]
@@ -171,6 +216,9 @@ def prepare_ml_data(
 
     df = pd.concat(frames, ignore_index=True)
     logging.info(f"[ml_data] Total bruto: {len(df)} linhas")
+
+    # Filtro de anos excluídos no modo CSV legacy
+    df = _apply_exclude_years(df, exclude_years)
 
     valid_labels = list(_WIN_LABELS | _LOSE_LABELS)
     df = df[df["outcome_label"].isin(valid_labels)].copy()
@@ -605,7 +653,6 @@ def predict_dip(
     result["stage2_proba"] = grade_proba
 
     conf_pct = f"{proba1*100:.0f}%"
-    # Nota: sem backslash em f-strings — usar Unicode directo
     if grade_label == "WIN_40":
         result["ml_verdict"] = (
             f"\U0001f916 ML: \U0001f7e2 WIN_40 \u2014 confianca {conf_pct} "
@@ -654,14 +701,18 @@ def train_all(
     min_precision: float = 0.70,
     parquet_path: Path | None = None,
     output_dir: Path | None = None,
+    exclude_years: list[int] | None = None,
 ) -> dict:
     logging.info("-" * 60)
     logging.info("DipRadar ML - Laboratorio de Treino")
+    if exclude_years:
+        logging.info(f"[train_all] Anos excluídos do treino: {exclude_years}")
     logging.info("-" * 60)
 
     X, y_raw, feature_names = prepare_ml_data(
         live_only=live_only,
         parquet_path=parquet_path,
+        exclude_years=exclude_years,
     )
 
     if dry_run:
@@ -718,6 +769,10 @@ if __name__ == "__main__":
                         help="Caminho para o Parquet do bootstrap_ml (preferido sobre CSVs)")
     parser.add_argument("--output-dir", type=Path, default=None, metavar="DIR",
                         help="Directorio de output para .pkl e ml_report.json")
+    parser.add_argument("--exclude-years", type=int, nargs="+", default=None,
+                        metavar="YEAR",
+                        help="Anos a excluir do treino (ex: --exclude-years 2020 2021). "
+                             "Usa a coluna alert_date para filtrar.")
     args = parser.parse_args()
 
     # Resolver output_dir
@@ -734,4 +789,5 @@ if __name__ == "__main__":
             min_precision=args.precision,
             parquet_path=args.parquet,
             output_dir=out_dir,
+            exclude_years=args.exclude_years,
         )
