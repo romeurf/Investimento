@@ -755,7 +755,7 @@ def backfill_fund(
     tickers: list[str],
     macro_df: pd.DataFrame,
     dip_thresh: float = 0.04,
-    max_per_ticker: int = 8,
+    max_per_ticker: int = 12,
     existing_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
@@ -909,6 +909,23 @@ def backfill_fund(
                 if ref is None:
                     continue
 
+                # ── SPY return para alpha (consistente com backfill_price) ──
+                spy_ref_fund = 0.0
+                spy_entry = spy_close_map.get(alert_date)
+                if spy_entry is None:
+                    for d in range(-3, 6):
+                        spy_entry = spy_close_map.get(alert_date + timedelta(days=d))
+                        if spy_entry:
+                            break
+                if spy_entry:
+                    days_out = 182 if r6m is not None else 91
+                    target_date = alert_date + timedelta(days=days_out)
+                    for d in range(-3, 6):
+                        sp = spy_close_map.get(target_date + timedelta(days=d))
+                        if sp is not None:
+                            spy_ref_fund = (sp - spy_entry) / spy_entry * 100
+                            break
+
                 # ── Lookup macro O(1) ──────────────────────────────────
                 macro = _macro_lookup(macro_df, alert_date)
 
@@ -945,10 +962,10 @@ def backfill_fund(
                     "sector":             sector_str,
                     "market_cap_b":       round(float(mcap), 2),
 
-                    # Labels
-                    "label_win":          label_win_binary(outcome_label(ref)),
+                    # Labels (alpha vs SPY — consistente com backfill_price)
+                    "label_win":          label_win_binary(outcome_label_alpha(ref, spy_ref_fund)),
                     "label_further_drop": None,
-                    "outcome_label":      outcome_label(ref),
+                    "outcome_label":      outcome_label_alpha(ref, spy_ref_fund),
                     "return_3m":          round(r3m, 2) if r3m is not None else None,
                     "return_6m":          round(r6m, 2) if r6m is not None else None,
                 }
@@ -1018,7 +1035,7 @@ def _build_pipeline(algo: str = "rf"):
     steps = [("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
     if algo == "rf":
         clf = RandomForestClassifier(
-            n_estimators=400, max_depth=10, min_samples_leaf=5,
+            n_estimators=400, max_depth=10, min_samples_leaf=3,
             class_weight="balanced", random_state=42, n_jobs=-1,
         )
     elif algo == "xgb":
