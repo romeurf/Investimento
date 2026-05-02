@@ -13,10 +13,17 @@ Funções exportadas:
   add_recovery_position / mark_recovery_alerted / remove_recovery_position
   get_stale_recovery_positions / mark_stale_alerted
   record_dip_day / mark_persistent_alerted / expire_missing_streaks
+
+NOTA DE SEGURANÇA (race condition):
+  _save_json usa escrita atómica via ficheiro temporário + os.replace().
+  Garante que nenhum leitor vê um JSON parcialmente escrito, mesmo que
+  o APScheduler dispare macro_data.py e o Vigilante em simultâneo.
 """
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -44,11 +51,31 @@ def _load_json(filename: str, default):
 
 
 def _save_json(filename: str, data) -> None:
+    """
+    Escrita atómica: serializa para um ficheiro temporário no mesmo
+    directório e depois faz os.replace() (operação atómica no SO).
+    Elimina o risco de corrupção por race condition ou falha a meio.
+    """
     p = _path(filename)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # Ficheiro temporário no mesmo directório → mesmo filesystem → replace atómico
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(p.parent),
+            prefix=f".{p.name}.tmp.",
+            suffix=".json",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, str(p))  # atómico em Linux/macOS/Windows
+        except Exception:
+            # Limpa o temporário se algo correu mal antes do replace
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         logging.error(f"[state] Erro ao gravar {filename}: {e}")
 

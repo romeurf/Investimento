@@ -27,6 +27,14 @@ Error isolation:
   Each ticker is wrapped in try/except. One bad API response never kills
   the loop for the remaining positions. Errors are logged and a fallback
   Telegram message is sent for the failing ticker.
+
+FIX (contract): build_feature_row(ticker, fundamentals) requires a
+  fundamentals dict as second argument. We fetch it via yfinance before
+  calling build_feature_row, falling back to an empty dict on failure so
+  the Vigilante never crashes on a stale fundamentals fetch.
+
+FIX (price): current_price is now fetched via yfinance directly (no
+  MarketClient dependency). MarketClient import removed entirely.
 """
 
 from __future__ import annotations
@@ -36,6 +44,8 @@ import os
 from dataclasses import asdict
 from datetime import datetime, date
 from typing import Optional
+
+import yfinance as yf
 
 import position_db
 from position_db import PositionRecord
@@ -56,6 +66,48 @@ logger = logging.getLogger(__name__)
 DETERIORATION_THRESHOLD = float(os.getenv("DIPR_DETERIORATION_THRESHOLD", "0.15"))
 IMPROVEMENT_THRESHOLD   = float(os.getenv("DIPR_IMPROVEMENT_THRESHOLD",   "0.10"))
 ROUTINE_SILENT_DAYS     = int(os.getenv("DIPR_ROUTINE_SILENT_DAYS",       "2"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_current_price(ticker: str, fallback: float) -> float:
+    """
+    Obtém o preço actual via yfinance (fast_info.last_price).
+    Usa fallback se a chamada falhar ou retornar None.
+    Não depende de MarketClient.
+    """
+    try:
+        info = yf.Ticker(ticker).fast_info
+        price = getattr(info, "last_price", None)
+        if price and float(price) > 0:
+            return float(price)
+    except Exception as e:
+        logger.debug(f"[monitor] fast_info falhou para {ticker}: {e}")
+    return fallback
+
+
+def _fetch_fundamentals_snapshot(ticker: str) -> dict:
+    """
+    Devolve um dict com fundamentais básicos para alimentar build_feature_row.
+    Retorna dict vazio em caso de erro — build_feature_row trata NaNs internamente.
+    """
+    try:
+        tk   = yf.Ticker(ticker)
+        info = tk.info or {}
+        return {
+            "pe":               info.get("trailingPE"),
+            "fcf_yield":        info.get("freeCashflow"),
+            "revenue_growth":   info.get("revenueGrowth"),
+            "gross_margin":     info.get("grossMargins"),
+            "de_ratio":         info.get("debtToEquity"),
+            "analyst_upside":   info.get("targetMeanPrice"),
+            "market_cap":       info.get("marketCap"),
+        }
+    except Exception as e:
+        logger.debug(f"[monitor] Fundamentals snapshot falhou para {ticker}: {e}")
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,25 +312,16 @@ def _monitor_one(
     """
     today_str = date.today().isoformat()
 
-    # ── 1. Fetch today's data ─────────────────────────────────────────────────
-    # build_feature_row fetches market + macro data internally
-    # It raises on failure — caller catches and isolates
-    feature_row_today = build_feature_row(record.ticker)
-    current_price     = float(feature_row_today[bundle["feature_columns"].index("drop_pct_today")])
+    # ── 1. Fetch current price (yfinance directo, sem MarketClient) ────────────
+    current_price = _fetch_current_price(record.ticker, fallback=record.alert_price)
 
-    # build_feature_row returns the feature vector; we need current_price separately
-    # Attempt to get it from market_client if available
-    try:
-        from market_client import MarketClient
-        mc = MarketClient()
-        quote = mc.get_quote(record.ticker)
-        current_price = float(quote.get("price") or quote.get("regularMarketPrice", record.alert_price))
-    except Exception:
-        # Fallback: estimate from alert_price + drop feature
-        drop_idx      = bundle["feature_columns"].index("drop_pct_today")
-        current_price = record.alert_price * (1.0 + feature_row_today[drop_idx] / 100.0)
+    # ── 2. Fetch fundamentals snapshot para alimentar build_feature_row ────────
+    # build_feature_row(ticker, fundamentals_dict) — contrato correcto.
+    # Fallback: dict vazio → build_feature_row imputa NaNs internamente.
+    fundamentals = _fetch_fundamentals_snapshot(record.ticker)
+    feature_row_today = build_feature_row(record.ticker, fundamentals)
 
-    # ── 2. Re-run inference ───────────────────────────────────────────────────
+    # ── 3. Re-run inference ───────────────────────────────────────────────────
     pred = predict_dip(
         feature_row=feature_row_today,
         current_price=current_price,
@@ -289,11 +332,11 @@ def _monitor_one(
     new_sell_target = pred.sell_target
     new_hold_days   = max(record.days_held + pred.hold_days, record.current_hold_days)
 
-    # ── 3. Classify trigger ───────────────────────────────────────────────────
+    # ── 4. Classify trigger ───────────────────────────────────────────────────
     trigger = _classify_trigger(record, current_price, new_win_prob)
     delta   = record.alert_win_prob - new_win_prob
 
-    # ── 4. Update record ─────────────────────────────────────────────────────
+    # ── 5. Update record ─────────────────────────────────────────────────────
     record.last_win_prob      = new_win_prob
     record.last_checked_date  = today_str
     record.thesis_health      = _resolve_thesis_health(trigger, delta)
@@ -313,17 +356,17 @@ def _monitor_one(
     if len(record.history) > 90:
         record.history = record.history[-90:]
 
-    # ── 5. Handle terminal triggers ───────────────────────────────────────────
+    # ── 6. Handle terminal triggers ───────────────────────────────────────────
     if trigger == TRIGGER_TAKE_PROFIT:
         record.status       = "TAKE_PROFIT"
         record.close_reason = "TAKE_PROFIT"
         record.closed_at    = datetime.utcnow().isoformat()
         record.close_price  = current_price
 
-    # ── 6. Persist ────────────────────────────────────────────────────────────
+    # ── 7. Persist ────────────────────────────────────────────────────────────
     position_db.update_record(record)
 
-    # ── 7. Build Telegram message ─────────────────────────────────────────────
+    # ── 8. Build Telegram message ─────────────────────────────────────────────
     msg: Optional[str] = None
 
     if trigger == TRIGGER_TAKE_PROFIT:
@@ -350,10 +393,8 @@ def _monitor_one(
 
     elif trigger == TRIGGER_ROUTINE:
         # Send routine update only every ROUTINE_SILENT_DAYS days
-        # to avoid spamming on quiet days
         if record.days_held % ROUTINE_SILENT_DAYS == 0:
             msg = _build_routine_update(record, current_price, new_win_prob)
-        # else: silent day — no message
 
     logger.info(
         f"[monitor] {record.ticker}  trigger={trigger}  "
@@ -472,7 +513,6 @@ if __name__ == "__main__":
     # Inject a fake ACTIVE position into the DB for testing
     np.random.seed(0)
     fake_features = [float(np.random.uniform(0, 1)) for _ in FEATURE_COLUMNS]
-    # Set a few meaningful values
     fake_features[FEATURE_COLUMNS.index("macro_score")]    = 2.0
     fake_features[FEATURE_COLUMNS.index("rsi_14")]         = 32.0
     fake_features[FEATURE_COLUMNS.index("drop_pct_today")] = -5.0
