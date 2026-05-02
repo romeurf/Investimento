@@ -4,15 +4,20 @@ ml_features.py — Unified Feature Store for DipRadar ML Pipeline.
 Builds the complete feature vector for a single stock at a given moment.
 Used identically during training (with labels) and inference in production (labels=None).
 
-Architecture: 3-stage pipeline
-  Stage 0 — Macro:   macro regime, VIX, SPY/sector drawdown, FRED recession prob
-  Stage 1 — Quality: gross margin, D/E, P/E vs sector fair
-                      analyst upside, ROIC — sourced from score.py hemispheres
-                      (fcf_yield and revenue_growth removed: importance=0.0)
-  Stage 2 — Timing:  drop today, drawdown 52w, RSI, ATR ratio, volume spike
+Architecture: 4-stage pipeline
+  Stage 0 — Macro:    macro regime, VIX, SPY/sector drawdown, FRED recession prob
+  Stage 1 — Quality:  gross margin, D/E, P/E vs sector fair
+                       analyst upside, ROIC — sourced from score.py hemispheres
+                       (fcf_yield and revenue_growth removed: importance=0.0)
+  Stage 2 — Timing:   drop today, drawdown 52w, RSI, ATR ratio, volume spike
+  Stage 3 — Engineered: non-linear interactions (rsi_oversold_strength, etc.)
+  Stage 3b — Momentum: pre-alert price momentum (return_1m, return_3m_pre,
+                        sector_relative, beta_60d)
+                        Factor-investing literature: momentum is the most
+                        predictive single feature for 3–6 month forward returns.
 
 Label schema (training only, None in production):
-  label_win           int   1 if price recovered ≥15% within 60 calendar days
+  label_win           int   1 if price recovered >=15% within 60 calendar days
   label_further_drop  float max additional % drop observed before recovery (Model B target)
 
 NaN contract:
@@ -71,25 +76,33 @@ FEATURE_COLUMNS: list[str] = [
     "volume_spike",         # today's volume / 20-day avg volume (e.g. 2.1)
 
     # ── Stage 3: Engineered / Non-linear interactions (5 features) ────
-    # Captures non-linearities and interactions that flat tree models miss.
-    "rsi_oversold_strength", # max(0, 40 - rsi_14): magnitude of oversold (0 if not oversold)
+    "rsi_oversold_strength", # max(0, 40 - rsi_14): magnitude of oversold
     "vix_regime",            # 0=low (<15), 1=medium (15-25), 2=high (>25)
     "pe_attractive",         # max(0, 1 - pe_vs_fair): magnitude of undervaluation
     "drop_x_drawdown",       # drop_pct_today * drawdown_52w / 100: capitulation pressure
     "vol_x_drop",            # volume_spike * abs(drop_pct_today): capitulation volume
+
+    # ── Stage 3b: Momentum (4 features) ──────────────────────────
+    # Pre-alert price momentum. Literature: momentum is the most predictive
+    # single factor for 3–6 month forward returns in cross-sectional studies.
+    # All computed from price_history BEFORE alert_date (no leakage).
+    "return_1m",            # % price return over 21 trading days before alert
+    "return_3m_pre",        # % price return over 63 trading days before alert
+    "sector_relative",      # return_3m_pre minus sector ETF return over same period
+    "beta_60d",             # rolling beta vs SPY over 60 trading days before alert
 ]
 
 LABEL_COLUMNS: list[str] = [
-    "label_win",            # int: 1 if recovery ≥15% within 60d (Model A target)
+    "label_win",            # int: 1 if recovery >=15% within 60d (Model A target)
     "label_further_drop",   # float: max additional % drop before recovery (Model B target)
 ]
 
 # Total feature count (used as sanity check in training)
-N_FEATURES = len(FEATURE_COLUMNS)  # 19 (14 base + 5 engineered)
+N_FEATURES = len(FEATURE_COLUMNS)  # 23 (14 base + 5 engineered + 4 momentum)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sector fair P/E (mirrors score.py _SECTOR_PE_MEAN for pe_vs_fair calculation)
+# Sector fair P/E
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SECTOR_FAIR_PE: dict[str, float] = {
@@ -109,68 +122,169 @@ _SECTOR_FAIR_PE: dict[str, float] = {
 }
 
 # Global median fallbacks (used when a feature cannot be computed)
-# Values are conservative: neutral, not optimistic
 _FALLBACK: dict[str, float] = {
     "macro_score":        2.0,   # NEUTRAL
     "vix":               20.0,
     "spy_drawdown_5d":    0.0,
     "sector_drawdown_5d": 0.0,
-    "fcf_yield":          0.04,  # 4% — kept for score.py / downstream, not a model column
-    "revenue_growth":     0.05,  # 5% — kept for score.py / downstream, not a model column
+    "fcf_yield":          0.04,  # kept for score.py / downstream, not a model column
+    "revenue_growth":     0.05,  # kept for score.py / downstream, not a model column
     "gross_margin":       0.35,
     "de_ratio":          80.0,
-    "pe_vs_fair":         1.0,   # fairly valued
-    "analyst_upside":     0.10,  # 10%
-    "quality_score":      0.50,  # neutral
-    "drop_pct_today":    -8.0,   # typical tier-1 dip
+    "pe_vs_fair":         1.0,
+    "analyst_upside":     0.10,
+    "quality_score":      0.50,
+    "drop_pct_today":    -8.0,
     "drawdown_52w":      -15.0,
     "rsi_14":            40.0,
     "atr_ratio":          0.02,
-    "volume_spike":       1.0,   # no spike
-    # Engineered fallbacks (derived from neutral defaults above)
-    "rsi_oversold_strength": 0.0,   # max(0, 40 - 40) = 0
-    "vix_regime":            1.0,   # medium (vix=20)
-    "pe_attractive":         0.0,   # max(0, 1 - 1) = 0
-    "drop_x_drawdown":       1.2,   # -8 * -15 / 100 = 1.2
-    "vol_x_drop":            8.0,   # 1.0 * 8 = 8
+    "volume_spike":       1.0,
+    # Stage 3 engineered
+    "rsi_oversold_strength": 0.0,
+    "vix_regime":            1.0,
+    "pe_attractive":         0.0,
+    "drop_x_drawdown":       1.2,
+    "vol_x_drop":            8.0,
+    # Stage 3b momentum — neutral/zero: no pre-alert momentum info
+    "return_1m":         0.0,
+    "return_3m_pre":     0.0,
+    "sector_relative":   0.0,
+    "beta_60d":          1.0,   # market-neutral assumption
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Derived feature engineering — shared between training & inference
+# Stage 3 — Engineered features
 # ─────────────────────────────────────────────────────────────────────────────
 
 def add_derived_features(features: dict) -> dict:
     """
-    Compute the 5 engineered features (Stage 3) from base features.
-
-    All 5 are deterministic functions of base features that are guaranteed
-    to be present (after fallback). Same code is used at training time
-    (over a parquet) and at inference (live feature dict) — guaranteed
-    consistent.
-
-    Mutates and returns the same dict for convenience.
+    Compute the 5 Stage-3 engineered features from base features.
+    Same code used at training time and at inference — guaranteed consistent.
+    Mutates and returns the same dict.
     """
-    rsi    = float(features.get("rsi_14",        _FALLBACK["rsi_14"]))
-    vix    = float(features.get("vix",           _FALLBACK["vix"]))
-    pe_vf  = float(features.get("pe_vs_fair",    _FALLBACK["pe_vs_fair"]))
+    rsi    = float(features.get("rsi_14",         _FALLBACK["rsi_14"]))
+    vix    = float(features.get("vix",            _FALLBACK["vix"]))
+    pe_vf  = float(features.get("pe_vs_fair",     _FALLBACK["pe_vs_fair"]))
     drop   = float(features.get("drop_pct_today", _FALLBACK["drop_pct_today"]))
-    dd52   = float(features.get("drawdown_52w",  _FALLBACK["drawdown_52w"]))
-    volsp  = float(features.get("volume_spike",  _FALLBACK["volume_spike"]))
+    dd52   = float(features.get("drawdown_52w",   _FALLBACK["drawdown_52w"]))
+    volsp  = float(features.get("volume_spike",   _FALLBACK["volume_spike"]))
 
     features["rsi_oversold_strength"] = round(max(0.0, 40.0 - rsi), 4)
-
-    if vix < 15.0:
-        vix_reg = 0.0
-    elif vix < 25.0:
-        vix_reg = 1.0
-    else:
-        vix_reg = 2.0
-    features["vix_regime"] = vix_reg
-
+    features["vix_regime"] = 0.0 if vix < 15.0 else (1.0 if vix < 25.0 else 2.0)
     features["pe_attractive"]   = round(max(0.0, 1.0 - pe_vf), 4)
     features["drop_x_drawdown"] = round(drop * dd52 / 100.0, 4)
     features["vol_x_drop"]      = round(volsp * abs(drop), 4)
+
+    return features
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 3b — Momentum features
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pct_return(prices: np.ndarray, lookback: int) -> float:
+    """
+    % return over the last `lookback` bars.
+    Returns 0.0 if insufficient data or division by zero.
+    Anti-leakage: uses prices[-1] as the last point BEFORE the alert
+    (caller must pass history up to alert_date exclusive).
+    """
+    if len(prices) < lookback + 1:
+        return 0.0
+    p_end   = float(prices[-1])
+    p_start = float(prices[-(lookback + 1)])
+    if p_start <= 0:
+        return 0.0
+    return round((p_end / p_start - 1.0) * 100.0, 4)
+
+
+def add_momentum_features(
+    features: dict,
+    price_history: Optional[pd.DataFrame],
+    sector_history: Optional[pd.DataFrame] = None,
+    spy_history: Optional[pd.DataFrame] = None,
+) -> dict:
+    """
+    Compute 4 momentum features (Stage 3b) and add them to the feature dict.
+
+    Parameters
+    ----------
+    features        : dict  Feature dict (mutated in place)
+    price_history   : DataFrame  OHLCV for the stock, daily, ending at alert_date (exclusive)
+    sector_history  : DataFrame  OHLCV for the sector ETF (same period) — for sector_relative
+    spy_history     : DataFrame  OHLCV for SPY (same period) — for beta_60d
+
+    Anti-leakage guarantee:
+      price_history must contain only rows BEFORE the alert date.
+      In training, the parquet builder slices df.loc[:alert_date - 1 day].
+      In production, yfinance returns data up to yesterday by default.
+
+    Returns the mutated dict.
+    """
+    # ── return_1m: 21 trading days ────────────────────────────────────
+    if price_history is not None and "Close" in price_history.columns:
+        try:
+            closes = price_history["Close"].dropna().values
+            features["return_1m"]    = _pct_return(closes, 21)
+            features["return_3m_pre"] = _pct_return(closes, 63)
+        except Exception as e:
+            logger.debug(f"add_momentum_features: return computation failed: {e}")
+            features["return_1m"]    = _FALLBACK["return_1m"]
+            features["return_3m_pre"] = _FALLBACK["return_3m_pre"]
+    else:
+        features["return_1m"]    = _FALLBACK["return_1m"]
+        features["return_3m_pre"] = _FALLBACK["return_3m_pre"]
+
+    # ── sector_relative: stock return_3m_pre minus sector return_3m_pre ──
+    if sector_history is not None and "Close" in sector_history.columns:
+        try:
+            sec_closes = sector_history["Close"].dropna().values
+            sec_ret3m  = _pct_return(sec_closes, 63)
+            features["sector_relative"] = round(
+                features["return_3m_pre"] - sec_ret3m, 4
+            )
+        except Exception as e:
+            logger.debug(f"add_momentum_features: sector_relative failed: {e}")
+            features["sector_relative"] = _FALLBACK["sector_relative"]
+    else:
+        features["sector_relative"] = _FALLBACK["sector_relative"]
+
+    # ── beta_60d: OLS beta of daily returns vs SPY over 60 trading days ──
+    if (
+        spy_history is not None
+        and price_history is not None
+        and "Close" in price_history.columns
+        and "Close" in spy_history.columns
+    ):
+        try:
+            stock_c = price_history["Close"].dropna()
+            spy_c   = spy_history["Close"].dropna()
+
+            # Align on common dates, take last 60 bars
+            combined = pd.concat(
+                [stock_c.rename("stock"), spy_c.rename("spy")], axis=1
+            ).dropna().tail(61)
+
+            if len(combined) >= 20:  # minimum for a stable beta
+                stock_ret = combined["stock"].pct_change().dropna().values
+                spy_ret   = combined["spy"].pct_change().dropna().values
+                # OLS beta = cov(stock, spy) / var(spy)
+                cov_matrix = np.cov(stock_ret, spy_ret)
+                var_spy    = cov_matrix[1, 1]
+                if var_spy > 0:
+                    beta = round(float(cov_matrix[0, 1] / var_spy), 4)
+                    # Clamp to [-3, 5] to avoid extreme leverage artefacts
+                    features["beta_60d"] = float(np.clip(beta, -3.0, 5.0))
+                else:
+                    features["beta_60d"] = _FALLBACK["beta_60d"]
+            else:
+                features["beta_60d"] = _FALLBACK["beta_60d"]
+        except Exception as e:
+            logger.debug(f"add_momentum_features: beta_60d failed: {e}")
+            features["beta_60d"] = _FALLBACK["beta_60d"]
+    else:
+        features["beta_60d"] = _FALLBACK["beta_60d"]
 
     return features
 
@@ -193,11 +307,7 @@ def _sf(val: Any, key: str) -> float:
 
 
 def _compute_atr_ratio(price_history: Optional[pd.DataFrame], current_price: float) -> float:
-    """
-    ATR(14) / current_price.
-    price_history must have columns: High, Low, Close (daily OHLC).
-    Returns fallback if history is insufficient.
-    """
+    """ATR(14) / current_price."""
     if price_history is None or len(price_history) < 15:
         return _FALLBACK["atr_ratio"]
     try:
@@ -205,7 +315,6 @@ def _compute_atr_ratio(price_history: Optional[pd.DataFrame], current_price: flo
         high  = df["High"].values
         low   = df["Low"].values
         close = df["Close"].values
-
         tr = np.maximum(
             high[1:]  - low[1:],
             np.maximum(
@@ -223,11 +332,7 @@ def _compute_atr_ratio(price_history: Optional[pd.DataFrame], current_price: flo
 
 
 def _compute_volume_spike(price_history: Optional[pd.DataFrame], fund: dict) -> float:
-    """
-    Today's volume / 20-day average volume.
-    Tries price_history first, falls back to fundamentals dict keys.
-    """
-    # Try from OHLCV history
+    """Today's volume / 20-day average volume."""
     if price_history is not None and "Volume" in price_history.columns and len(price_history) >= 5:
         try:
             vols = price_history["Volume"].dropna().values
@@ -239,12 +344,10 @@ def _compute_volume_spike(price_history: Optional[pd.DataFrame], fund: dict) -> 
         except Exception as e:
             logger.debug(f"ml_features: volume_spike from history failed: {e}")
 
-    # Fallback: fundamentals dict
     vol     = _safe_float(fund.get("volume"))
     avg_vol = _safe_float(fund.get("average_volume"))
     if not math.isnan(vol) and not math.isnan(avg_vol) and avg_vol > 0:
         return round(vol / avg_vol, 4)
-
     return _FALLBACK["volume_spike"]
 
 
@@ -261,6 +364,8 @@ def build_features(
     label_win: Optional[int] = None,
     label_further_drop: Optional[float] = None,
     macro_context: Optional[dict] = None,
+    sector_history: Optional[pd.DataFrame] = None,
+    spy_history: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
     Build the complete feature vector for one stock at one point in time.
@@ -268,54 +373,50 @@ def build_features(
     Parameters
     ----------
     ticker          : str       Stock ticker (used only for logging)
-    fundamentals    : dict      Output of market_client.get_fundamentals() or equivalent
-    price_history   : DataFrame Optional OHLCV DataFrame (daily, columns: Open/High/Low/Close/Volume)
-                                Required for ATR computation; volume_spike falls back to fund dict
+    fundamentals    : dict      Output of market_client.get_fundamentals()
+    price_history   : DataFrame Optional OHLCV DataFrame (daily, OHLCV columns)
+                                Required for ATR, volume_spike, and momentum features.
+                                Must contain only rows BEFORE alert_date (no leakage).
     sector          : str       GICS sector string (e.g. "Technology")
     drop_pct_today  : float     % price change that triggered the dip alert (negative)
-                                If None, read from fundamentals.get('change_pct')
-    label_win       : int|None  1 if recovery ≥15% in 60d. None during production inference.
-    label_further_drop: float|None  max additional drop before recovery. None in production.
-    macro_context   : dict|None Pre-computed macro dict (avoids duplicate API call per ticker
-                                when scanning a full universe). If None, fetched automatically.
+    label_win       : int|None  Training label only.
+    label_further_drop: float|None  Training label only.
+    macro_context   : dict|None Pre-computed macro dict.
+    sector_history  : DataFrame Optional OHLCV for the sector ETF (for sector_relative).
+    spy_history     : DataFrame Optional OHLCV for SPY (for beta_60d).
 
     Returns
     -------
-    dict with keys = FEATURE_COLUMNS + LABEL_COLUMNS (+ fcf_yield, revenue_growth for downstream)
-    All feature values are float. Labels are int/float/None.
+    dict with keys = FEATURE_COLUMNS + LABEL_COLUMNS (+ fcf_yield, revenue_growth)
     """
-    fund = fundamentals  # alias for brevity
+    fund = fundamentals
 
-    # ── Stage 0: Macro ────────────────────────────────────────────────
+    # ── Stage 0: Macro ─────────────────────────────────────────────────
     if macro_context is None:
         macro_context = get_macro_context(sector=sector)
 
-    macro_score       = float(macro_context.get("macro_score",       _FALLBACK["macro_score"]))
-    vix               = float(macro_context.get("vix",               _FALLBACK["vix"]))
-    spy_drawdown_5d   = float(macro_context.get("spy_drawdown_5d",   _FALLBACK["spy_drawdown_5d"]))
+    macro_score        = float(macro_context.get("macro_score",        _FALLBACK["macro_score"]))
+    vix                = float(macro_context.get("vix",                _FALLBACK["vix"]))
+    spy_drawdown_5d    = float(macro_context.get("spy_drawdown_5d",    _FALLBACK["spy_drawdown_5d"]))
     sector_drawdown_5d = float(macro_context.get("sector_drawdown_5d", _FALLBACK["sector_drawdown_5d"]))
 
     # ── Stage 1: Quality / Value ─────────────────────────────────────
-    # fcf_yield and revenue_growth are computed but NOT in FEATURE_COLUMNS
-    # (importance=0.0 — kept here for score.py / downstream consumers only)
     fcf_yield      = _sf(fund.get("fcf_yield"),      "fcf_yield")
     revenue_growth = _sf(fund.get("revenue_growth"), "revenue_growth")
     gross_margin   = _sf(fund.get("gross_margin"),   "gross_margin")
     de_ratio       = _sf(fund.get("debt_equity"),    "de_ratio")
     analyst_upside = _sf(fund.get("analyst_upside") or fund.get("upside"), "analyst_upside")
 
-    # P/E vs fair: ratio < 1 = undervalued vs sector, > 1 = overvalued
-    pe_raw   = _safe_float(fund.get("pe"))
-    fair_pe  = _SECTOR_FAIR_PE.get(sector, 22.0)
+    pe_raw  = _safe_float(fund.get("pe"))
+    fair_pe = _SECTOR_FAIR_PE.get(sector, 22.0)
     if not math.isnan(pe_raw) and pe_raw > 0 and fair_pe > 0:
         pe_vs_fair = round(pe_raw / fair_pe, 4)
     else:
         pe_vs_fair = _FALLBACK["pe_vs_fair"]
         logger.debug(f"ml_features [{ticker}]: pe_vs_fair fallback (pe={pe_raw}, fair={fair_pe})")
 
-    # Quality score from score.py (hemisphere A, normalised [0,1])
     try:
-        score_result = score_from_fundamentals(fund)
+        score_result  = score_from_fundamentals(fund)
         quality_score = float(score_result["quality_score"])
         if not math.isfinite(quality_score):
             quality_score = _FALLBACK["quality_score"]
@@ -324,7 +425,6 @@ def build_features(
         quality_score = _FALLBACK["quality_score"]
 
     # ── Stage 2: Timing ────────────────────────────────────────────────
-    # drop_pct_today: prefer explicit argument, fallback to fund dict
     if drop_pct_today is None:
         drop_pct_today = _sf(
             fund.get("change_pct") or fund.get("drop_pct") or fund.get("changePercent"),
@@ -337,15 +437,10 @@ def build_features(
         fund.get("drawdown_from_high") or fund.get("drawdown_52w"),
         "drawdown_52w"
     )
+    rsi_14 = float(np.clip(_sf(fund.get("rsi") or fund.get("rsi_14"), "rsi_14"), 0.0, 100.0))
 
-    rsi_14 = _sf(fund.get("rsi") or fund.get("rsi_14"), "rsi_14")
-    # Clamp RSI to valid range
-    rsi_14 = float(np.clip(rsi_14, 0.0, 100.0))
-
-    # Current price for ATR normalisation
     current_price = _safe_float(fund.get("price") or fund.get("current_price"))
     if math.isnan(current_price) or current_price <= 0:
-        # Try to read from price_history last close
         if price_history is not None and len(price_history) > 0:
             try:
                 current_price = float(price_history["Close"].dropna().iloc[-1])
@@ -357,14 +452,14 @@ def build_features(
     atr_ratio    = _compute_atr_ratio(price_history, current_price)
     volume_spike = _compute_volume_spike(price_history, fund)
 
-    # ── Assemble vector ─────────────────────────────────────────────────
+    # ── Assemble base vector ────────────────────────────────────────────
     feature_vector = {
         # Stage 0
         "macro_score":          macro_score,
         "vix":                  vix,
         "spy_drawdown_5d":      spy_drawdown_5d,
         "sector_drawdown_5d":   sector_drawdown_5d,
-        # Stage 1 (model columns — fcf_yield & revenue_growth excluded)
+        # Stage 1
         "gross_margin":         gross_margin,
         "de_ratio":             de_ratio,
         "pe_vs_fair":           pe_vs_fair,
@@ -376,19 +471,22 @@ def build_features(
         "rsi_14":               rsi_14,
         "atr_ratio":            atr_ratio,
         "volume_spike":         volume_spike,
-        # Downstream-only (not model input columns)
+        # Downstream-only
         "fcf_yield":            fcf_yield,
         "revenue_growth":       revenue_growth,
     }
-    # Stage 3 — engineered/derived features (shared with training pipeline)
+
+    # ── Stage 3: Engineered features ───────────────────────────────────
     add_derived_features(feature_vector)
 
-    # Labels (None in production, int/float during training)
+    # ── Stage 3b: Momentum features ────────────────────────────────────
+    add_momentum_features(feature_vector, price_history, sector_history, spy_history)
+
+    # Labels
     feature_vector["label_win"]          = label_win
     feature_vector["label_further_drop"] = label_further_drop
 
     # ── Sanity check ─────────────────────────────────────────────────
-    # Verify no NaN/Inf leaked into features (labels can be None)
     for col in FEATURE_COLUMNS:
         val = feature_vector[col]
         if not math.isfinite(float(val)):
@@ -403,7 +501,9 @@ def build_features(
         f"macro={macro_context.get('regime')} "
         f"quality={quality_score:.3f} "
         f"rsi={rsi_14:.0f} "
-        f"drop={drop_pct_today:.1f}%"
+        f"drop={drop_pct_today:.1f}% "
+        f"ret1m={feature_vector['return_1m']:.1f}% "
+        f"beta={feature_vector['beta_60d']:.2f}"
     )
 
     return feature_vector
@@ -411,20 +511,15 @@ def build_features(
 
 def build_feature_row(feature_vector: dict) -> list[float]:
     """
-    Extract features in the canonical FEATURE_COLUMNS order as a flat list.
+    Extract features in canonical FEATURE_COLUMNS order as a flat list.
     Used when feeding a single observation to a trained model.
-
-    Labels are excluded — this is the model input only.
     """
     return [float(feature_vector[col]) for col in FEATURE_COLUMNS]
 
 
 def build_feature_df(rows: list[dict]) -> pd.DataFrame:
     """
-    Convert a list of feature vectors (from build_features) into a DataFrame
-    with the correct column order. Includes label columns if present.
-
-    Used in training scripts to build the training matrix.
+    Convert a list of feature vectors into a DataFrame with the correct column order.
     """
     all_cols = FEATURE_COLUMNS + LABEL_COLUMNS
     return pd.DataFrame(rows, columns=all_cols)
@@ -436,12 +531,12 @@ def build_feature_df(rows: list[dict]) -> pd.DataFrame:
 
 if __name__ == "__main__":
     import json
+    import datetime
     logging.basicConfig(level=logging.DEBUG)
 
     print(f"FEATURE_COLUMNS ({N_FEATURES}): {FEATURE_COLUMNS}")
     print()
 
-    # Mock fundamentals (as returned by market_client.get_fundamentals)
     mock_fund = {
         "price":          387.20,
         "fcf_yield":      0.062,
@@ -458,27 +553,41 @@ if __name__ == "__main__":
         "roic":           0.22,
         "fcf_margin":     0.14,
     }
-
-    # Mock macro (avoids live API call in test)
     mock_macro = {
         "regime":              "NEUTRAL",
         "macro_score":         2,
         "vix":                 18.2,
-        "vix_pct_1m":          5.3,
         "spy_drawdown_5d":    -1.2,
         "sector_drawdown_5d": -2.8,
-        "fred_recession_prob": 0.31,
-        "sector_etf":          "XLK",
     }
+
+    # Mock 90-day OHLCV history for momentum features
+    np.random.seed(42)
+    dates  = pd.date_range(end="2026-01-13", periods=90, freq="B")
+    prices = 400.0 * np.cumprod(1 + np.random.normal(0, 0.01, 90))
+    mock_history = pd.DataFrame({
+        "Open":   prices * 0.99,
+        "High":   prices * 1.01,
+        "Low":    prices * 0.98,
+        "Close":  prices,
+        "Volume": np.random.randint(5_000_000, 20_000_000, 90),
+    }, index=dates)
+
+    spy_prices = 500.0 * np.cumprod(1 + np.random.normal(0, 0.008, 90))
+    mock_spy = pd.DataFrame({
+        "Close": spy_prices,
+    }, index=dates)
 
     fv = build_features(
         ticker="MSFT",
         fundamentals=mock_fund,
+        price_history=mock_history,
         sector="Technology",
         drop_pct_today=-8.4,
         macro_context=mock_macro,
         label_win=1,
         label_further_drop=-4.2,
+        spy_history=mock_spy,
     )
 
     print("Feature vector:")
@@ -488,8 +597,5 @@ if __name__ == "__main__":
     print()
     row = build_feature_row(fv)
     print(f"Flat row ({len(row)} values): {row}")
-
-    print()
-    df = build_feature_df([fv, fv])
-    print(f"DataFrame shape: {df.shape}")
-    print(df.dtypes)
+    assert len(row) == N_FEATURES, f"Expected {N_FEATURES}, got {len(row)}"
+    print(f"\nAssert OK — {N_FEATURES} features.")
