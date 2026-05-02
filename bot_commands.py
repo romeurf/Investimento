@@ -722,7 +722,7 @@ def _handle_admin_load_models(parts: list[str]) -> None:
         import shutil
         import tempfile
         import json
-        import pickle
+        import joblib
         import tarfile
         import zipfile
         import urllib.request
@@ -797,8 +797,7 @@ def _handle_admin_load_models(parts: list[str]) -> None:
             stage1_meta: dict = {}
             for stage in (1, 2):
                 fname  = f"dip_model_stage{stage}.pkl"
-                with open(local[fname], "rb") as f:
-                    bundle = pickle.load(f)
+                bundle = joblib.load(local[fname])
                 if not isinstance(bundle, dict):
                     raise ValueError(f"{fname}: pickle não é um dict")
                 missing = REQUIRED_PKL_KEYS - set(bundle.keys())
