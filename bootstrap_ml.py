@@ -787,8 +787,18 @@ def backfill_fund(
 
     all_alerts: list[dict] = []
 
+    EU_SUFFIXES = {
+        ".DE", ".PA", ".L", ".AS", ".SW", ".MC", ".MI",
+        ".ST", ".CO", ".OL", ".HE", ".BR", ".I", ".LS",
+        ".VI", ".WA",
+    }
+
     for i, ticker in enumerate(tickers):
         try:
+            suffix = ("." + ticker.split(".")[-1]) if "." in ticker else ""
+            if suffix and suffix not in EU_SUFFIXES:
+                log.debug(f"[CamadaB] {ticker} sufixo '{suffix}' desconhecido — skip")
+                continue
             tk   = yf.Ticker(ticker)
             hist = tk.history(start=start_str, end=fetch_end, interval="1d")
             hist = _normalize_history_index(hist)
