@@ -1,5 +1,5 @@
 """
-bootstrap_ml.py — Dual-Layer ML: Camada A (preço, 20 anos) + Camada B (fundamentais, 7 anos).
+bootstrap_ml.py — Dual-Layer ML: Camada A (preço, 20 anos) + Camada B (fundamentais, 3 anos).
 
 ARQUITECTURA DE FEATURES — CONTRATO ÚNICO
 ==========================================
