@@ -747,7 +747,7 @@ def backfill_price(
     return pd.DataFrame(all_alerts) if all_alerts else pd.DataFrame()
 
 
-# ── Backfill — Camada B (fundamentais, 7 anos) ────────────────────────────────
+# ── Backfill — Camada B (fundamentais, 3 anos) ────────────────────────────────
 
 def backfill_fund(
     start: date,
