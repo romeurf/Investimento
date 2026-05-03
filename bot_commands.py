@@ -78,6 +78,52 @@ _cb_get_fundamentals = None
 _cb_earnings_days    = None
 _cb_get_db_stats     = None
 _cb_fill_db_outcomes = None
+_cb_clear_alerts     = None
+_cb_allocate_ticker  = None
+
+
+# ── setup() — bootstrap leve usado pelo main.py ───────────────────────────────
+#
+# main.py chama `bot_commands.setup(send_fn=..., analyze_fn=..., ...)` no
+# arranque. Esta função regista os callbacks essenciais e dispara o listener
+# Telegram em thread separada. É um superset minimalista de register_callbacks
+# (que serve outro código legado mais detalhado).
+#
+# Sem esta função, `python main.py` rebenta com AttributeError no boot e o
+# bot fica em crash-loop no Railway.
+
+def setup(
+    send_fn,
+    analyze_fn=None,
+    clear_alerts_fn=None,
+    allocate_fn=None,
+    **extras,
+) -> None:
+    """Regista callbacks essenciais e arranca o listener Telegram.
+
+    Args:
+        send_fn: função send_telegram(text) — usada por todos os _reply().
+        analyze_fn: usada pelo /analisar.
+        clear_alerts_fn: usada por /admin (futuramente).
+        allocate_fn: usada pelo /allocate.
+        **extras: chaves adicionais injectadas em _poll_context
+                  (forward-compat; permite passar context ad-hoc sem
+                  alterar a assinatura).
+    """
+    global _cb_send_telegram, _cb_analyze_ticker
+    global _cb_clear_alerts, _cb_allocate_ticker
+    _cb_send_telegram   = send_fn
+    _cb_analyze_ticker  = analyze_fn
+    _cb_clear_alerts    = clear_alerts_fn
+    _cb_allocate_ticker = allocate_fn
+
+    if extras:
+        _poll_context.update(extras)
+    _poll_context.setdefault("send_fn", send_fn)
+
+    # Arranca o listener em thread (idempotente — se chamado 2x, o segundo
+    # start_bot_listener() faz nada porque a thread anterior continua viva).
+    start_bot_listener()
 
 
 def register_callbacks(
@@ -1089,6 +1135,36 @@ def _handle_watchlist(parts: list[str]) -> None:
 
 # ── /flip handler ─────────────────────────────────────────────────────────────────
 
+# ── /allocate ────────────────────────────────────────────────────────────────
+
+def _handle_allocate(parts: list[str]) -> None:
+    """Sugere alocação read-only para um ticker (Fase 1 — sem execução).
+
+    Usa o callback _cb_allocate_ticker registado pelo main.py via setup().
+    """
+    if len(parts) < 2:
+        _reply(
+            "⚠️ Usa: `/allocate <TICKER>`\n"
+            "_Exemplo: `/allocate NVO`_\n"
+            "_Sugere categoria (ETF Core / Hold Forever / Apartamento /\n"
+            "Growth / Flip) + sizing em €. Não executa nenhuma ordem._"
+        )
+        return
+    symbol = parts[1].upper().strip()
+    fn = _cb_allocate_ticker
+    if fn is None:
+        _reply(
+            "_Allocation engine não disponível neste deployment._\n"
+            "_(verifica que main.py passou `allocate_fn=` ao bot_commands.setup)_"
+        )
+        return
+    _reply(f"_💼 A calcular alocação para *{symbol}*..._")
+    threading.Thread(
+        target=lambda: _reply(fn(symbol)),
+        daemon=True,
+    ).start()
+
+
 def _handle_flip(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "summary"
 
@@ -1529,6 +1605,7 @@ def _handle_command(text: str) -> None:
             "`/sell TICK PREÇO [SHR]`   → Registar venda\n"
             "`/liquidez`               → Ver/ajustar saldo\n"
             "`/portfolio`              → Posições activas\n"
+            "`/allocate <TICK>`         → Sugestão de alocação read-only (categoria + sizing)\n"
             "`/mldata`                  → Stats da base de dados ML\n"
             "`/mldata update`           → Forçar update de outcomes\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
@@ -1704,6 +1781,10 @@ def _handle_command(text: str) -> None:
         if not _check_rate(cmd_key): return
         _handle_portfolio(parts)
 
+    elif cmd == "/allocate":
+        if not _check_rate(cmd_key): return
+        _handle_allocate(parts)
+
     elif cmd == "/mldata":
         if not _check_rate(cmd_key): return
         force = len(parts) > 1 and parts[1].lower() in ("update", "atualizar", "force")
@@ -1757,7 +1838,20 @@ def _poll_loop() -> None:
             time.sleep(10)
 
 
-def start_bot_listener() -> threading.Thread:
-    t = threading.Thread(target=_poll_loop, daemon=True, name="bot-commands")
-    t.start()
-    return t
+_listener_thread: threading.Thread | None = None
+
+
+def start_bot_listener() -> threading.Thread | None:
+    """Arranca o listener Telegram em thread daemon (idempotente).
+
+    Se já existe uma thread viva, devolve-a sem criar uma nova
+    (evita duplicação de getUpdates calls quando setup() ou
+    start_bot_listener() é chamado mais de uma vez).
+    """
+    global _listener_thread
+    if _listener_thread is not None and _listener_thread.is_alive():
+        logging.debug("[bot_commands] listener já a correr — skip.")
+        return _listener_thread
+    _listener_thread = threading.Thread(target=_poll_loop, daemon=True, name="bot-commands")
+    _listener_thread.start()
+    return _listener_thread
