@@ -1,8 +1,8 @@
 # Allocation Engine — Design Document
 
-> **Status**: design only (não codificado). Documento vivo, revisitar à medida que o ML evolui.
+> **Status**: Fase 1 implementada (motor read-only `allocation_engine.py` + comando `/allocate <TICKER>`).
 > **Owner**: pg45861
-> **Última actualização**: 2026-05-02
+> **Última actualização**: 2026-05-02 (Fase 1 implementada)
 
 ## 1. Objectivo
 
@@ -165,9 +165,12 @@ E um sumário Telegram:
 
 **Fase 0 (concluído)**: ML v3 funcional, score baseado em pred_up.
 
-**Fase 1 (próxima)**: motor read-only — só calcula plano e envia para Telegram. Aprovação 100 % manual. Sem execução.
+**Fase 1 (concluído)**: motor read-only — só calcula plano e envia para Telegram. Aprovação 100 % manual. Sem execução.
+- `allocation_engine.py` com `suggest_allocation(ctx) -> AllocationDecision`
+- Comando Telegram `/allocate <TICKER>` que orquestra fundamentals + ML + regime + liquidez
+- 15 testes unitários cobrem todas as branches (ETF, Hold Forever, Apartamento, Growth, Flip, Pass, regime RED/YELLOW, cash cap, floor)
 
-**Fase 2**: log de decisões (qual aprovaste / rejeitaste, com porquê). Permite analisar o teu próprio bias.
+**Fase 2 (próxima)**: log de decisões (qual aprovaste / rejeitaste, com porquê). Permite analisar o teu próprio bias.
 
 **Fase 3**: integração broker (Trading 212 / DEGIRO / IBKR) via API para execução de ordens aprovadas.
 

@@ -1080,6 +1080,119 @@ def analyze_ticker(symbol: str) -> str:
         return f"❌ *Erro ao analisar {symbol}*\n_`{e}`_"
 
 
+# ── Allocation engine (read-only, Fase 1) ─────────────────────────────────────
+#
+# Orquestra fundamentals + dip score + ML + macro regime + liquidez e invoca
+# o motor `allocation_engine.suggest_allocation`. Devolve uma string formatada
+# para Telegram (resposta do /allocate).
+#
+# Esta função é puramente informativa — nenhuma ordem é executada.
+
+def allocate_ticker(symbol: str) -> str:
+    from allocation_engine import (
+        AllocationContext,
+        suggest_allocation,
+        format_allocation_telegram,
+    )
+    from macro_semaphore import get_macro_regime
+    from portfolio import get_liquidity
+
+    symbol = symbol.upper().strip()
+    try:
+        # 1) Fundamentals + dip score (pipeline existente do /analisar)
+        fund = get_fundamentals(symbol, min_market_cap=0)
+        if fund.get("skip"):
+            return (
+                f"⚠️ *{symbol}* — sem dados\n"
+                f"_{fund.get('skip_reason', 'Ticker indisponível')}_"
+            )
+
+        earnings_days = get_earnings_days(symbol)
+        sector_chg    = get_sector_change(fund.get("sector", ""))
+        spy_change    = get_spy_change()
+        score, _      = calculate_dip_score(fund, symbol, earnings_days, sector_change=sector_chg)
+
+        bc_flag       = is_bluechip(fund)
+        category_str  = classify_dip_category(fund, score, bc_flag)
+
+        # 2) Preço actual + change_day_pct (mesma lógica do analyze_ticker)
+        price      = fund.get("price") or 0.0
+        change_pct = 0.0
+        try:
+            import yfinance as yf
+            fi   = yf.Ticker(symbol).fast_info
+            prev = getattr(fi, "previous_close", None)
+            last = getattr(fi, "last_price", None)
+            if prev and last and prev > 0:
+                change_pct = (last - prev) / prev * 100
+                price      = last
+        except Exception:
+            pass
+
+        # 3) ML score
+        ml_features = {
+            **fund,
+            "score":            score,
+            "spy_change":       spy_change,
+            "sector_etf_change": sector_chg,
+            "earnings_days":    earnings_days,
+            "change_day_pct":   change_pct,
+        }
+        ml_result = ml_score(ml_features, symbol=symbol)
+
+        # 4) Macro regime (4 indicadores: SPY, VIX, credit, yield curve)
+        try:
+            regime = get_macro_regime()
+            regime_color = regime.get("color", "GREEN")
+            regime_mult  = float(regime.get("position_multiplier", 1.0))
+        except Exception as e:
+            logging.warning(f"[allocate] regime macro indisponível: {e}")
+            regime_color, regime_mult = "GREEN", 1.0
+
+        # 5) Liquidez disponível
+        try:
+            cash_eur = float(get_liquidity() or 0.0)
+        except Exception:
+            cash_eur = 0.0
+
+        # 6) Drawdown 52w (em fundamentals está em pontos percentuais — converter)
+        dd_pct       = fund.get("drawdown_from_high")
+        drawdown_52w = (float(dd_pct) / 100.0) if dd_pct is not None else None
+
+        # 7) Construir contexto e correr motor
+        ctx = AllocationContext(
+            ticker             = symbol,
+            dip_score          = float(score or 0.0),
+            is_etf             = is_etf(symbol),
+            is_bluechip        = bool(bc_flag),
+            sector             = fund.get("sector", "") or "",
+            drawdown_52w       = drawdown_52w,
+            dividend_yield     = fund.get("dividend_yield"),
+            classify_category  = category_str,
+            pred_up            = ml_result.pred_up if ml_result.model_ready else None,
+            pred_down          = ml_result.pred_down if ml_result.model_ready else None,
+            win_prob           = ml_result.win_prob if ml_result.model_ready else None,
+            ml_label           = ml_result.label,
+            model_ready        = ml_result.model_ready,
+            macro_regime_color = regime_color,
+            macro_multiplier   = regime_mult,
+            cash_available_eur = cash_eur,
+            monthly_budget_eur = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
+        )
+        decision = suggest_allocation(ctx)
+
+        # 8) Formatar resposta Telegram
+        header = (
+            f"💼 *Allocation read-only — {symbol}*\n"
+            f"_Pedido via /allocate — {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_\n\n"
+        )
+        return header + format_allocation_telegram(decision, ctx, current_price=price)
+
+    except Exception as e:
+        logging.error(f"allocate_ticker({symbol}): {e}", exc_info=True)
+        return f"❌ *Erro ao calcular alocação para {symbol}*\n_`{e}`_"
+
+
 # ── Scan principal ────────────────────────────────────────────────────────────
 
 def run_scan() -> None:
@@ -1489,6 +1602,7 @@ def main() -> None:
     bot_commands.setup(
         send_fn=send_telegram,
         analyze_fn=analyze_ticker,
+        allocate_fn=allocate_ticker,
         clear_alerts_fn=lambda: (
             clear_alerts(),
             globals().update(_alerted_today=set()),
