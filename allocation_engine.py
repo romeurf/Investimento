@@ -39,10 +39,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-# ── Orçamento mensal (configurável via env var Railway) ───────────────────────
-# Define MONTHLY_BUDGET_EUR=<valor> no Railway para alterar sem tocar no código.
-# Fallback: 1050.0 (valor histórico).
-_MONTHLY_BUDGET_EUR: float = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050.0"))
+# ── Orçamento mensal (obrigatório via env var Railway) ──────────────────────
+# Define MONTHLY_BUDGET_EUR=<valor> no Railway.
+# Arranque falha imediatamente se a variável não estiver definida.
+_raw_budget = os.environ.get("MONTHLY_BUDGET_EUR")
+if _raw_budget is None:
+    raise EnvironmentError(
+        "MONTHLY_BUDGET_EUR não está definida. "
+        "Adiciona esta variável de ambiente no Railway antes de arrancar."
+    )
+_MONTHLY_BUDGET_EUR: float = float(_raw_budget)
 
 
 # ── Constantes ────────────────────────────────────────────────────────────────
