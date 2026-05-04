@@ -71,6 +71,50 @@ def _load_universe() -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Indicadores técnicos (definidos localmente — não dependem de bootstrap_ml)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """RSI clássico de Wilder."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def calc_atr(hist: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average True Range."""
+    high = hist["High"]
+    low  = hist["Low"]
+    close_prev = hist["Close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - close_prev).abs(),
+        (low  - close_prev).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
+def calc_volume_ratio(hist: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Volume actual / média móvel de 20d."""
+    vol = hist["Volume"].replace(0, np.nan)
+    avg = vol.rolling(window=period, min_periods=5).mean()
+    return (vol / avg.replace(0, np.nan)).fillna(1.0)
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    """Converte valor para float, devolvendo default em caso de falha."""
+    try:
+        f = float(value)
+        return default if (np.isnan(f) or np.isinf(f)) else f
+    except (TypeError, ValueError):
+        return default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Schema do parquet — alinhado com FEATURE_COLUMNS de ml_features
 # (com colunas extra symbol/snapshot_date/price para identificação)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,9 +232,6 @@ def _save_fund_cache(df: pd.DataFrame) -> None:
 def _fetch_live_fundamentals(symbol: str) -> dict:
     """
     Tenta yfinance.Ticker(...).info — fallback gracioso a defaults se falhar.
-
-    Não é point-in-time histórico (isso seria via Camada B do bootstrap_ml);
-    é a foto actual dos fundamentais para alimentar o snapshot.
     """
     out = dict(_FUND_FALLBACK)
     try:
@@ -210,7 +251,6 @@ def _fetch_live_fundamentals(symbol: str) -> dict:
         except (TypeError, ValueError):
             return default
 
-    # Fontes preferidas, com fallbacks. Os defaults são os mesmos do bootstrap.
     free_cf = _get("freeCashflow", None)
     market_cap = _get("marketCap", None)
     if free_cf and market_cap and market_cap > 0:
@@ -221,7 +261,7 @@ def _fetch_live_fundamentals(symbol: str) -> dict:
     out["de_ratio"]       = _get("debtToEquity",  _FUND_FALLBACK["de_ratio"])
 
     pe   = _get("trailingPE", None)
-    fair_pe = _get("forwardPE", pe)  # fallback simples
+    fair_pe = _get("forwardPE", pe)
     if pe and fair_pe and fair_pe > 0:
         out["pe_vs_fair"] = max(0.1, min(5.0, pe / fair_pe))
 
@@ -230,7 +270,6 @@ def _fetch_live_fundamentals(symbol: str) -> dict:
     if target and cur and cur > 0:
         out["analyst_upside"] = max(-0.9, min(2.0, (target - cur) / cur))
 
-    # quality_score: composto simples (gross_margin + revenue_growth + 1 - debt_proxy)
     gm  = out["gross_margin"]
     rg  = out["revenue_growth"]
     de  = out["de_ratio"]
@@ -245,10 +284,6 @@ def _get_fundamentals(symbol: str, today: date,
                       fund_cache: pd.DataFrame) -> tuple[dict, float, pd.DataFrame]:
     """
     Devolve (fund_dict, age_days, updated_cache_df).
-
-    Se cache fresh (< FUND_CACHE_DAYS) → usa cache.
-    Caso contrário → fetch live + actualiza cache.
-    age_days=NaN se fundamentais são fallback (nunca conseguimos buscar).
     """
     cache_row = fund_cache.loc[fund_cache["symbol"] == symbol]
     if not cache_row.empty:
@@ -258,7 +293,6 @@ def _get_fundamentals(symbol: str, today: date,
             cached = {k: float(cache_row[k].iloc[0]) for k in _FUND_FALLBACK.keys()}
             return cached, float(age), fund_cache
 
-    # Refresh
     live = _fetch_live_fundamentals(symbol)
     age_days = 0.0
     new_row = {"symbol": symbol, "last_refresh": today.isoformat(), **live}
@@ -272,12 +306,11 @@ def _get_fundamentals(symbol: str, today: date,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Indicadores técnicos (mesmo código que bootstrap_ml.py — re-export)
+# Cálculo de indicadores técnicos
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _calc_indicators(hist: pd.DataFrame) -> pd.DataFrame:
     """Adiciona rsi, atr, atr_ratio, ddp_52w, vol_ratio, ret_1d ao DataFrame."""
-    from bootstrap_ml import calc_rsi, calc_atr, calc_volume_ratio
     if hist.empty or len(hist) < 20:
         return hist
     hist = hist.copy()
@@ -294,8 +327,6 @@ def _calc_indicators(hist: pd.DataFrame) -> pd.DataFrame:
 def _fetch_history(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
     """
     Tenta data_feed (Tiingo→yf→Stooq), fallback yfinance directo.
-    280d ≈ 400d corridos → garante ≥252d trading days para 52w drawdown.
-    Retorna DataFrame com DatetimeIndex e colunas Title-case (Open, High, Low, Close, Volume).
     """
     end = date.today() + timedelta(days=1)
     start = end - timedelta(days=lookback_days)
@@ -304,18 +335,15 @@ def _fetch_history(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
         from data_feed import get_eod_prices
         df = get_eod_prices(symbol, lookback_days=lookback_days)
         if df is not None and not df.empty:
-            # data_feed devolve `date` como coluna — promover a index
             if "date" in df.columns:
                 df = df.set_index(pd.DatetimeIndex(pd.to_datetime(df["date"])))
                 df = df.drop(columns=["date"])
-            # Garante index DatetimeIndex sem timezone
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.DatetimeIndex(df.index)
             try:
                 df.index = df.index.tz_localize(None)
             except (TypeError, AttributeError):
-                pass  # já naive
-            # Normalizar nomes Yahoo-style — preservar Volume e Adj Close
+                pass
             return df
     except Exception as e:
         log.debug(f"[hist] {symbol}: data_feed falhou ({e}); a tentar yfinance directo.")
@@ -355,14 +383,12 @@ def _build_row(
     last = hist.iloc[-1]
     snapshot_ts = hist.index[-1].date()
 
-    # Se a última candle é mais antiga que snapshot_date - 7d, considera obsoleta
     if (snapshot_date - snapshot_ts).days > 7:
         log.debug(f"[snapshot] {symbol}: última candle {snapshot_ts} muito antiga, skip.")
         return None, fund_cache
 
     fund, age_days, fund_cache = _get_fundamentals(symbol, snapshot_date, fund_cache)
 
-    from bootstrap_ml import safe_float
     row: dict = {
         "symbol":             symbol,
         "snapshot_date":      snapshot_date.isoformat(),
@@ -386,7 +412,7 @@ def _build_row(
         "ingest_ts":          datetime.utcnow().isoformat(timespec="seconds"),
     }
 
-    # Derived features (mesmo código de inferência)
+    # Derived features
     from ml_features import add_derived_features
     add_derived_features(row)
 
@@ -410,8 +436,6 @@ def run_daily_snapshot(
     """
     Itera o universo, computa features e grava em SNAPSHOT_PATH.
     Idempotente: skip de tickers já processados para snapshot_date.
-
-    Returns dict com stats: {processed, skipped, failed, total, elapsed_s, path}.
     """
     snapshot_date = snapshot_date or date.today()
     if tickers is None:
@@ -428,7 +452,6 @@ def run_daily_snapshot(
         return {"processed": 0, "skipped": len(tickers), "failed": 0,
                 "total": len(tickers), "path": str(SNAPSHOT_PATH), "elapsed_s": 0.0}
 
-    # Macro (1× por run) — get_macro_context tem cache interno, mas force fresh aqui
     try:
         from macro_data import get_macro_context
         macro = get_macro_context(force_refresh=True)
@@ -459,7 +482,6 @@ def run_daily_snapshot(
             log.warning(f"[snapshot] {symbol}: erro inesperado ({e})")
             failed += 1
 
-        # Flush a cada 100 tickers para limitar perda em caso de crash
         if not dry_run and len(rows) >= 100:
             _append_rows(rows)
             rows = []
