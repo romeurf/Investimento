@@ -966,7 +966,12 @@ def build_alert(
     except Exception:
         pass
 
-    score_breakdown = build_score_breakdown(fundamentals, symbol, earnings_d, sector_change=sector_chg)
+    ml_label = ml_result.label if (ml_result is not None) else None
+    score_breakdown = build_score_breakdown(
+        fundamentals, symbol, earnings_d,
+        sector_change=sector_chg,
+        ml_label=ml_label,
+    )
 
     _, sizing_str = suggest_position_size(
         score=dip_score,
