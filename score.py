@@ -381,6 +381,103 @@ def _is_value_trap(features: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 8b. Red Flags + Quality Multiplier  (Fase 1 — penalty pós z-score)
+# ---------------------------------------------------------------------------
+#
+# Subtrai pontos a um multiplicador inicial 1.0 conforme detecta sinais
+# negativos vindos directamente dos fundamentals brutos. O multiplicador é
+# aplicado ao final_score e à confidence — não substitui o motor z-score,
+# complementa-o com penalties absolutas que o z-score sectorial dilui demais.
+#
+# Limites:
+#   - PE: yfinance trailingPE; >200 ou <0 sugere distorção (lucro irrelevante)
+#   - debt_equity: yfinance devolve em % (3.0 → 300); >300 = alavancado demais
+#   - revenue_growth: <0.30 + ROE<0 = pre-profit sem crescimento explosivo
+#   - fcf_yield ou fcf_margin: <0 = empresa queima caixa (pre-profit)
+#
+# is_preprofit dispara skip_recommended=True automaticamente.
+
+def _detect_red_flags(features: dict) -> tuple[float, list[str], bool]:
+    """
+    Avalia red flags e devolve (quality_multiplier, red_flags, is_preprofit).
+
+    quality_multiplier ∈ [0.10, 1.00] — clipado para baixo a 0.10.
+    is_preprofit = True quando FCF/FCF_margin negativo (empresa queima caixa).
+    """
+    quality_multiplier = 1.0
+    red_flags: list[str] = []
+    is_preprofit = False
+
+    pe         = features.get("pe")
+    fcf_yield  = features.get("fcf_yield")
+    fcf_margin = features.get("fcf_margin")
+    roe        = features.get("roe")  # opcional — adapter pode não passar
+    rev_growth = features.get("revenue_growth")
+    debt_equity = features.get("debt_equity")
+
+    # FCF negativo (pre-profit) — proxy: yield ou margin negativos
+    fcf = None
+    for cand in (fcf_yield, fcf_margin):
+        if cand is not None:
+            try:
+                v = float(cand)
+                if math.isfinite(v):
+                    fcf = v
+                    break
+            except (TypeError, ValueError):
+                continue
+    if fcf is not None and fcf < 0:
+        quality_multiplier -= 0.20
+        red_flags.append("FCF Negativo")
+        is_preprofit = True
+
+    # PE extremo (>200 ou <0) — lucro distorcido
+    if pe is not None:
+        try:
+            pe_v = float(pe)
+            if math.isfinite(pe_v) and (pe_v > 200 or pe_v < 0):
+                quality_multiplier -= 0.25
+                red_flags.append(f"PE Extremo ({pe_v:.0f}x)")
+        except (TypeError, ValueError):
+            pass
+
+    # ROE negativo sem crescimento forte (revenue_growth < 30%)
+    if roe is not None and rev_growth is not None:
+        try:
+            roe_v = float(roe)
+            rg_v  = float(rev_growth)
+            if (math.isfinite(roe_v) and math.isfinite(rg_v)
+                and roe_v < 0 and rg_v < 0.30):
+                quality_multiplier -= 0.30
+                red_flags.append("ROE Negativo s/ Crescimento Forte")
+        except (TypeError, ValueError):
+            pass
+
+    # Dívida/Capitalização > 300% (yfinance devolve em pontos percentuais)
+    if debt_equity is not None:
+        try:
+            de_v = float(debt_equity)
+            if math.isfinite(de_v) and de_v > 300:
+                quality_multiplier -= 0.20
+                red_flags.append(f"D/E Elevado ({de_v:.0f}%)")
+        except (TypeError, ValueError):
+            pass
+
+    # Combinação Letal — preprofit + PE distorcido alto
+    if is_preprofit and pe is not None:
+        try:
+            pe_v = float(pe)
+            if math.isfinite(pe_v) and pe_v > 100:
+                quality_multiplier -= 0.15
+                red_flags.append("Letal: FCF Neg + PE>100")
+        except (TypeError, ValueError):
+            pass
+
+    quality_multiplier = max(0.10, quality_multiplier)
+    return quality_multiplier, red_flags, is_preprofit
+
+
+# ---------------------------------------------------------------------------
 # 9. Motor principal
 # ---------------------------------------------------------------------------
 
@@ -438,7 +535,7 @@ def calculate_score(
     total_attempted = len(n_total)
     n_missing       = len(missing)
     n_valid         = max(0, total_attempted - n_missing)
-    confidence      = (n_valid / total_attempted) if total_attempted > 0 else 0.0
+    data_coverage   = (n_valid / total_attempted) if total_attempted > 0 else 0.0
 
     # Near-earnings confidence penalty — zona de incerteza pré-relatório
     # earnings_days < 14: −15% na confiança (resultado iminente = risco binário)
@@ -447,38 +544,57 @@ def calculate_score(
         try:
             ed = float(earnings_days)
             if math.isfinite(ed) and ed < 14:
-                confidence *= 0.85
+                data_coverage *= 0.85
                 logging.debug(
-                    f"[score] earnings in {ed:.0f}d — confidence penalised to {confidence:.2f}"
+                    f"[score] earnings in {ed:.0f}d — coverage penalised to {data_coverage:.2f}"
                 )
         except (TypeError, ValueError):
             pass
 
-    skip = confidence < 0.6
+    # Red Flags + Quality Multiplier (Fase 1)
+    quality_multiplier, red_flags, is_preprofit = _detect_red_flags(features)
+    confidence = data_coverage * quality_multiplier
+    if red_flags:
+        logging.debug(
+            f"[score] quality_multiplier={quality_multiplier:.2f} "
+            f"red_flags={red_flags} preprofit={is_preprofit}"
+        )
 
+    # skip_recommended mais agressivo: confiança baixa OU empresa queima caixa
+    skip = (confidence < 0.6) or is_preprofit
     if skip:
         logging.debug(
             f"[score] skip_recommended=True — confidence={confidence:.2f} "
-            f"(missing: {missing})"
+            f"preprofit={is_preprofit} (missing: {missing})"
         )
 
     # ML weight
     ml_weight = 1.0 if ml_prob is None else float(np.clip(ml_prob, 0.0, 1.0))
 
-    # Score final
+    # Score final — multiplica pelo quality_multiplier (penalty pós-zscore)
     base_score  = (0.50 * quality) + (0.30 * value) + (0.20 * timing)
     raw_final   = base_score * ml_weight * confidence * 100.0
     final_score = float(np.clip(raw_final, 0.0, 100.0))
 
+    # Score "puro fundamental" — sem o ml_weight, para o conflict resolver
+    # poder cruzar fundamentais vs. ML sem dupla contagem.
+    raw_fund_only = base_score * confidence * 100.0
+    fund_only_score = float(np.clip(raw_fund_only, 0.0, 100.0))
+
     return {
-        "final_score":      round(final_score, 2),
-        "quality_score":    round(quality,    4),
-        "value_score":      round(value,      4),
-        "timing_score":     round(timing,     4),
-        "confidence":       round(confidence, 4),
-        "is_value_trap":    vt,
-        "skip_recommended": skip,
-        "missing_fields":   missing,
+        "final_score":         round(final_score, 2),
+        "fund_only_score":     round(fund_only_score, 2),
+        "quality_score":       round(quality,    4),
+        "value_score":         round(value,      4),
+        "timing_score":        round(timing,     4),
+        "confidence":          round(confidence, 4),
+        "data_coverage":       round(data_coverage, 4),
+        "quality_multiplier":  round(quality_multiplier, 4),
+        "is_value_trap":       vt,
+        "is_preprofit":        is_preprofit,
+        "red_flags":           red_flags,
+        "skip_recommended":    skip,
+        "missing_fields":      missing,
     }
 
 
@@ -502,6 +618,7 @@ def score_from_fundamentals(
     """
     features = {
         "roic":               fundamentals.get("roic"),
+        "roe":                fundamentals.get("roe"),  # Fase 1 — red flag detection
         "fcf_margin":         fundamentals.get("fcf_margin") or fundamentals.get("gross_margin"),
         "fcf_yield":          fundamentals.get("fcf_yield"),
         "revenue_growth":     fundamentals.get("revenue_growth"),
@@ -523,10 +640,17 @@ def score_from_fundamentals(
 # 11. Formata o breakdown para Telegram
 # ---------------------------------------------------------------------------
 
-def format_score_v2_breakdown(result: dict) -> str:
+def format_score_v2_breakdown(
+    result: dict,
+    conflict_state: object | None = None,
+    conflict_msg: str | None = None,
+) -> str:
     """
     Gera um bloco de texto legível para o Telegram a partir do resultado
     de calculate_score() / score_from_fundamentals().
+
+    Se `conflict_state` (ConflictState) e `conflict_msg` forem passados,
+    inclui um veredicto final cruzando ML × fundamentais (Fase 2).
     """
     fs   = result["final_score"]
     q    = result["quality_score"]
@@ -536,6 +660,8 @@ def format_score_v2_breakdown(result: dict) -> str:
     vt   = result["is_value_trap"]
     skip = result["skip_recommended"]
     miss = result["missing_fields"]
+    red_flags     = result.get("red_flags") or []
+    is_preprofit  = result.get("is_preprofit", False)
 
     badge = "🔥" if fs >= 80 else ("⭐" if fs >= 55 else "📊")
     lines = [
@@ -543,12 +669,35 @@ def format_score_v2_breakdown(result: dict) -> str:
         f"  🏗️  Quality *{q*100:.0f}%*  \u00b7  💰 Value *{v*100:.0f}%*  \u00b7  ⏱️ Timing *{t*100:.0f}%*",
         f"  📊 Confiança: *{conf*100:.0f}%*" + (" — dados insuficientes ⚠️" if skip else ""),
     ]
+
+    # Aviso quando Value é estruturalmente baixo (pre-profit + métricas distorcidas)
+    if v < 0.20 and is_preprofit:
+        lines.append("  ⚠️ _Valorização inaplicável (empresa pre-profit)._")
+
     if vt:
         lines.append("  🔴 *Value Trap detectada* — quality penalizada em 50%")
+
+    if red_flags:
+        lines.append(f"  🔴 *Red Flags:* {', '.join(red_flags)}")
+
+    if is_preprofit:
+        lines.append(
+            "  ℹ️ _Empresa de crescimento pré-lucro. Score baixo estrutural "
+            "(métricas de valor distorcidas)._"
+        )
+
     # Remove volume_spike dos campos em falta (é bonus, não obrigatório)
     reportable_miss = [m for m in miss if m != "volume_spike"]
     if reportable_miss:
         lines.append(f"  _Em falta: {', '.join(reportable_miss)}_")
+
+    # Veredicto final cruzando ML × fundamentais
+    if conflict_state is not None and conflict_msg is not None:
+        verdict_label = getattr(conflict_state, "value", str(conflict_state))
+        lines.append("")
+        lines.append(f"⚖️ *Veredicto:* {verdict_label}")
+        lines.append(f"💡 _{conflict_msg}_")
+
     return "\n".join(lines)
 
 
@@ -650,15 +799,31 @@ def build_score_breakdown(
     sector_change: float | None = None,
     stock_change_pct: float | None = None,
     ml_prob: float | None = None,
+    ml_label: str | None = None,
 ) -> str:
     """
     Shim de compatibilidade. Devolve o bloco Telegram do motor quantitativo.
 
     earnings_days propagado → reflectido na confiança e na breakdown.
     ml_prob propagado       → reflectido no score final da breakdown.
+    ml_label propagado      → quando presente, calcula e injecta o veredicto
+                               cruzado (Fase 2) no fim do bloco.
     """
     result = score_from_fundamentals(fundamentals, ml_prob=ml_prob, earnings_days=earnings_days)
-    return format_score_v2_breakdown(result)
+    state = None
+    msg = None
+    if ml_label is not None:
+        try:
+            from conflict_resolver import resolve_conflict
+            # Usar fund_only_score para o resolver — o final_score já tem ML
+            # baked-in via ml_prob multiplier, o que tornaria CONFLICT_FUND
+            # inalcançável (ML bear afundaria sempre o final_score < 55).
+            fund_score = result.get("fund_only_score", result["final_score"])
+            state, msg = resolve_conflict(fund_score, ml_label)
+        except Exception as exc:
+            logging.warning(f"[score] conflict_resolver error: {exc}")
+            state, msg = None, None
+    return format_score_v2_breakdown(result, conflict_state=state, conflict_msg=msg)
 
 
 # ---------------------------------------------------------------------------
