@@ -18,8 +18,16 @@ Usar ETF_TICKERS para esta exclusão nos outros módulos:
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import date
 from functools import lru_cache
+from pathlib import Path
+
+# Cache em disco — persiste entre reinícios do Railway
+_CACHE_DIR  = Path("/data") if Path("/data").exists() else Path("/tmp")
+_CACHE_FILE = _CACHE_DIR / "ml_universe_cache.json"
+_CACHE_DAYS = 3  # refrescar no máximo a cada 3 dias
 
 # ─────────────────────────────────────────────────────────────────────────
 # ETFs — monitorizar preço/drawdown MAS excluír do pipeline ML
@@ -130,6 +138,43 @@ _FTSE100: list[str] = [
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Cache em disco — persiste entre reinícios do container Railway
+# ─────────────────────────────────────────────────────────────────────────
+
+def _save_universe_cache(tickers: list[str]) -> None:
+    """Grava lista de tickers em /data/ml_universe_cache.json."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"date": date.today().isoformat(), "tickers": tickers}
+        _CACHE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        logging.info(f"[universe] Cache em disco actualizado: {len(tickers)} tickers → {_CACHE_FILE}")
+    except Exception as e:
+        logging.warning(f"[universe] Falha ao gravar cache em disco: {e}")
+
+
+def _load_universe_cache() -> list[str]:
+    """
+    Carrega cache em disco se existir e tiver menos de _CACHE_DAYS dias.
+    Devolve [] se não existir ou estiver expirado.
+    """
+    if not _CACHE_FILE.exists():
+        return []
+    try:
+        payload = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        cached_date = date.fromisoformat(payload["date"])
+        age = (date.today() - cached_date).days
+        tickers = payload.get("tickers", [])
+        if age <= _CACHE_DAYS and len(tickers) > 100:
+            logging.info(f"[universe] Cache em disco válido ({age}d): {len(tickers)} tickers")
+            return tickers
+        logging.info(f"[universe] Cache em disco expirado ({age}d) ou pequeno ({len(tickers)}), a refrescar.")
+        return []
+    except Exception as e:
+        logging.warning(f"[universe] Falha ao ler cache em disco: {e}")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Funções públicas
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -165,12 +210,34 @@ def _fetch_nasdaq100() -> list[str]:
         return _NASDAQ100_FALLBACK
 
 
-@lru_cache(maxsize=1)
+# Cache em memória — invalidado se o resultado for vazio
+_universe_cache: list[str] = []
+
+
 def get_full_universe() -> list[str]:
     """
     Universo completo incluindo ETFs.
     Para scan de watchlist/preço. NÃO usar directamente no pipeline ML.
+
+    Ordem de prioridade:
+      1. Cache em memória (mesmo processo, não vazio)
+      2. Cache em disco (/data/ml_universe_cache.json, <= 3 dias)
+      3. Scraping Wikipedia + fallbacks estáticos
+    Grava em disco sempre que constrói a lista de raiz.
     """
+    global _universe_cache
+
+    # 1. Cache em memória
+    if _universe_cache:
+        return _universe_cache
+
+    # 2. Cache em disco (sobrevive a reinícios do container)
+    disk = _load_universe_cache()
+    if disk:
+        _universe_cache = disk
+        return _universe_cache
+
+    # 3. Construir de raiz
     sp500  = _fetch_sp500()
     ndx100 = _fetch_nasdaq100()
 
@@ -192,7 +259,18 @@ def get_full_universe() -> list[str]:
             unique.append(t)
 
     logging.info(f"[universe] Universo total: {len(unique)} tickers")
-    return unique
+
+    if len(unique) > 100:
+        _universe_cache = unique
+        _save_universe_cache(unique)
+    else:
+        logging.error(f"[universe] Resultado suspeito: apenas {len(unique)} tickers — cache NÃO actualizado")
+        # Último recurso: usar só os fallbacks estáticos
+        _universe_cache = list(dict.fromkeys(
+            USER_PORTFOLIO + USER_WATCHLIST + _SP500_FALLBACK + _NASDAQ100_FALLBACK + _STOXX200 + _FTSE100
+        ))
+
+    return _universe_cache
 
 
 def get_ml_universe() -> list[str]:
@@ -201,7 +279,7 @@ def get_ml_universe() -> list[str]:
     Remove ETFs — sem fundamentais válidos no yfinance.
     Usar em backtest.py, train_model.py, scan diurno.
     """
-    full    = get_full_universe()
+    full     = get_full_universe()
     filtered = [t for t in full if t not in ETF_TICKERS]
     excluded = len(full) - len(filtered)
     logging.info(f"[universe] ML universe: {len(filtered)} tickers ({excluded} ETFs excluídos)")
