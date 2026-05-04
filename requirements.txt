@@ -12,12 +12,15 @@ pytz>=2024.1
 # Machine Learning (Chunk H)
 # scikit-learn pinned: bundle dip_models_v3.pkl foi treinado com 1.6.x;
 # 1.7+ emite InconsistentVersionWarning ao deserializar IsotonicRegression
-# e pode mudar predições ligeiramente. Re-treinar quando subir o pin.
+# e pode mudar predicoes ligeiramente. Re-treinar quando subir o pin.
 scikit-learn>=1.6.0,<1.7.0
 xgboost>=2.0.0
 lightgbm>=4.3.0
 imbalanced-learn>=0.12.0
 joblib>=1.3.0
+
+# Parquet support (required by pd.read_parquet - bootstrap fallback + snapshots)
+pyarrow>=14.0.0
 
 # Google Sheets backend
 gspread>=6.0.0
