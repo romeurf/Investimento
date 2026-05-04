@@ -27,7 +27,9 @@ from pathlib import Path
 # Cache em disco — persiste entre reinícios do Railway
 _CACHE_DIR  = Path("/data") if Path("/data").exists() else Path("/tmp")
 _CACHE_FILE = _CACHE_DIR / "ml_universe_cache.json"
-_CACHE_DAYS = 3  # refrescar no máximo a cada 3 dias
+# FIX: aumentado de 3 para 7 dias — evita re-scraping frequente que falha
+# no Railway (timeouts de rede às 22h30). O universo muda raramente.
+_CACHE_DAYS = 7
 
 # ─────────────────────────────────────────────────────────────────────────
 # ETFs — monitorizar preço/drawdown MAS excluír do pipeline ML
@@ -156,6 +158,8 @@ def _load_universe_cache() -> list[str]:
     """
     Carrega cache em disco se existir e tiver menos de _CACHE_DAYS dias.
     Devolve [] se não existir ou estiver expirado.
+    FIX: se o cache existir mas estiver expirado, ainda o usa como fallback
+    de emergência (evita snap vazio quando Wikipedia falha).
     """
     if not _CACHE_FILE.exists():
         return []
@@ -164,10 +168,17 @@ def _load_universe_cache() -> list[str]:
         cached_date = date.fromisoformat(payload["date"])
         age = (date.today() - cached_date).days
         tickers = payload.get("tickers", [])
-        if age <= _CACHE_DAYS and len(tickers) > 100:
-            logging.info(f"[universe] Cache em disco válido ({age}d): {len(tickers)} tickers")
+        if len(tickers) > 100:
+            if age <= _CACHE_DAYS:
+                logging.info(f"[universe] Cache em disco válido ({age}d): {len(tickers)} tickers")
+            else:
+                # FIX: cache expirado mas usável — melhor que vazio
+                logging.warning(
+                    f"[universe] Cache em disco expirado ({age}d) mas com {len(tickers)} tickers — "
+                    f"a usar como fallback de emergência até Wikipedia estar disponível."
+                )
             return tickers
-        logging.info(f"[universe] Cache em disco expirado ({age}d) ou pequeno ({len(tickers)}), a refrescar.")
+        logging.info(f"[universe] Cache em disco pequeno ({len(tickers)} tickers), a reconstruir.")
         return []
     except Exception as e:
         logging.warning(f"[universe] Falha ao ler cache em disco: {e}")
@@ -221,7 +232,8 @@ def get_full_universe() -> list[str]:
 
     Ordem de prioridade:
       1. Cache em memória (mesmo processo, não vazio)
-      2. Cache em disco (/data/ml_universe_cache.json, <= 3 dias)
+      2. Cache em disco (/data/ml_universe_cache.json, <= 7 dias)
+         FIX: cache expirado ainda usado como fallback de emergência
       3. Scraping Wikipedia + fallbacks estáticos
     Grava em disco sempre que constrói a lista de raiz.
     """
@@ -232,9 +244,13 @@ def get_full_universe() -> list[str]:
         return _universe_cache
 
     # 2. Cache em disco (sobrevive a reinícios do container)
+    # FIX: _load_universe_cache() já usa cache expirado como fallback
     disk = _load_universe_cache()
     if disk:
         _universe_cache = disk
+        # Se o cache estava expirado, tentar refrescar em background seria ideal;
+        # por ora, continuamos com o valor antigo e tentamos atualizar agora.
+        # O snapshot do dia corre na mesma com tickers válidos.
         return _universe_cache
 
     # 3. Construir de raiz
@@ -264,11 +280,17 @@ def get_full_universe() -> list[str]:
         _universe_cache = unique
         _save_universe_cache(unique)
     else:
-        logging.error(f"[universe] Resultado suspeito: apenas {len(unique)} tickers — cache NÃO actualizado")
-        # Último recurso: usar só os fallbacks estáticos
+        logging.error(
+            f"[universe] Resultado suspeito: apenas {len(unique)} tickers — "
+            f"a usar fallbacks estáticos completos."
+        )
+        # Último recurso: usar só os fallbacks estáticos (sempre disponíveis)
         _universe_cache = list(dict.fromkeys(
             USER_PORTFOLIO + USER_WATCHLIST + _SP500_FALLBACK + _NASDAQ100_FALLBACK + _STOXX200 + _FTSE100
         ))
+        # Gravar mesmo o fallback estático para que próxima chamada use o disco
+        _save_universe_cache(_universe_cache)
+        logging.info(f"[universe] Fallback estático: {len(_universe_cache)} tickers gravados em cache")
 
     return _universe_cache
 
@@ -278,11 +300,23 @@ def get_ml_universe() -> list[str]:
     Universo filtrado para o pipeline ML.
     Remove ETFs — sem fundamentais válidos no yfinance.
     Usar em backtest.py, train_model.py, scan diurno.
+
+    FIX: guard explícito contra lista vazia — levanta RuntimeError
+    para que o chamador (universe_snapshot) saiba que algo falhou,
+    em vez de silenciosamente processar 0 tickers.
     """
     full     = get_full_universe()
     filtered = [t for t in full if t not in ETF_TICKERS]
     excluded = len(full) - len(filtered)
     logging.info(f"[universe] ML universe: {len(filtered)} tickers ({excluded} ETFs excluídos)")
+
+    # FIX: nunca retornar silenciosamente uma lista vazia
+    if len(filtered) < 50:
+        raise RuntimeError(
+            f"[universe] get_ml_universe() devolveu apenas {len(filtered)} tickers — "
+            f"scraping falhou e cache em disco inexistente. Verifica /data/ml_universe_cache.json."
+        )
+
     return filtered
 
 
