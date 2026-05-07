@@ -20,6 +20,8 @@ Architecture: 4-stage pipeline
                         de especulação pura (RKLB).
   Stage 3d — Context: sector_alert_count_7d, days_since_52w_high — market
                         breadth and timing context added in v3.2.
+  Stage 3e — Short/Earnings: short_interest_ratio, earnings_surprise_avg —
+                        short squeeze signal + earnings quality (v3.3).
 
 Label schema (training only, None in production):
   label_win           int   1 if price recovered >=15% within 60 calendar days
@@ -110,6 +112,11 @@ FEATURE_COLUMNS: list[str] = [
                               # (0 = stock-specific dip; alto = sector-wide selloff)
     "days_since_52w_high",   # dias desde o máximo de 52 semanas (via price_history)
                               # fallback: 180 (aprox. metade do ano)
+
+    # ── Stage 3e: Short Interest + Earnings Surprise (v3.3) ──────────────
+    # Anti-leakage: shortRatio com lag ~2 semanas (FINRA); earningsHistory = quarters passados.
+    "short_interest_ratio",   # dias para cobrir o short (yfinance shortRatio) — clip [0, 30]
+    "earnings_surprise_avg",  # média dos últimos 2 EPS surprises (%) — clip [-50, 50]
 ]
 
 LABEL_COLUMNS: list[str] = [
@@ -118,7 +125,7 @@ LABEL_COLUMNS: list[str] = [
 ]
 
 # Total feature count (used as sanity check in training)
-N_FEATURES = len(FEATURE_COLUMNS)  # 29
+N_FEATURES = len(FEATURE_COLUMNS)  # 31
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -178,6 +185,9 @@ _FALLBACK: dict[str, float] = {
     # Stage 3d context (v3.2)
     "sector_alert_count_7d": 0.0,  # fallback: sem alertas recentes no sector
     "days_since_52w_high":  180.0,  # fallback: ~6 meses — metade do ano
+    # Stage 3e short/earnings (v3.3)
+    "short_interest_ratio":  3.5,   # neutro: ~3.5 dias é a mediana do mercado
+    "earnings_surprise_avg": 0.0,   # neutro: sem histórico de bater/falhar
 }
 
 
@@ -286,6 +296,61 @@ def add_context_features(
             features["days_since_52w_high"] = _FALLBACK["days_since_52w_high"]
     else:
         features["days_since_52w_high"] = _FALLBACK["days_since_52w_high"]
+
+    return features
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Stage 3e — Short Interest + Earnings Surprise features (v3.3)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def add_short_earnings_features(
+    features: dict,
+    ticker_info: Optional[dict] = None,
+) -> dict:
+    """Stage-3e: short_interest_ratio + earnings_surprise_avg.
+
+    Parâmetros
+    ----------
+    features    : dict  Feature dict (mutado in place)
+    ticker_info : dict|None  yfinance .info dict do ticker.
+                  Se None, usa fallbacks — sem chamada yfinance aqui.
+
+    Fontes:
+      short_interest_ratio : ticker_info["shortRatio"] — dias para cobrir o short
+      earnings_surprise_avg: média de earningsHistory[0..1]["surprisePercent"] * 100
+
+    Anti-leakage:
+      shortRatio reportado com lag ~2 semanas (FINRA twice-monthly).
+      earningsHistory usa apenas quarters passados.
+    """
+    info = ticker_info or {}
+
+    # ── short_interest_ratio ─────────────────────────────────────────
+    sr = _safe_float(info.get("shortRatio"))
+    if math.isfinite(sr) and sr >= 0:
+        features["short_interest_ratio"] = float(min(sr, 30.0))
+    else:
+        features["short_interest_ratio"] = _FALLBACK["short_interest_ratio"]
+
+    # ── earnings_surprise_avg ────────────────────────────────────────
+    try:
+        hist = info.get("earningsHistory", {})
+        if isinstance(hist, dict):
+            hist = hist.get("history", [])
+        surprises = []
+        for entry in (hist or [])[:4]:
+            sp = _safe_float(entry.get("surprisePercent") if isinstance(entry, dict) else None)
+            if math.isfinite(sp):
+                surprises.append(sp * 100.0)
+        if surprises:
+            avg = float(np.mean(surprises[:2]))
+            features["earnings_surprise_avg"] = float(np.clip(avg, -50.0, 50.0))
+        else:
+            features["earnings_surprise_avg"] = _FALLBACK["earnings_surprise_avg"]
+    except Exception as e:
+        logger.debug(f"add_short_earnings_features: earningsHistory failed: {e}")
+        features["earnings_surprise_avg"] = _FALLBACK["earnings_surprise_avg"]
 
     return features
 
@@ -478,6 +543,7 @@ def build_features(
     sector_history: Optional[pd.DataFrame] = None,
     spy_history: Optional[pd.DataFrame] = None,
     sector_alert_count_7d: Optional[float] = None,
+    ticker_info: Optional[dict] = None,
 ) -> dict:
     """
     Build the complete feature vector for one stock at one point in time.
@@ -499,6 +565,8 @@ def build_features(
     spy_history           : DataFrame Optional OHLCV for SPY (for beta_60d).
     sector_alert_count_7d : float|None Number of dip alerts in the same sector in the
                                       past 7 calendar days. Pass from bot/state. Default 0.
+    ticker_info           : dict|None  yfinance .info dict for Stage-3e features
+                                      (short_interest_ratio, earnings_surprise_avg). None=fallbacks.
 
     Returns
     -------
@@ -600,6 +668,9 @@ def build_features(
     # ── Stage 3d: Context features (v3.2) ──────────────────────────────
     add_context_features(feature_vector, price_history, sector_alert_count_7d)
 
+    # ── Stage 3e: Short Interest + Earnings Surprise (v3.3) ──────────────
+    add_short_earnings_features(feature_vector, ticker_info)
+
     # Labels
     feature_vector["label_win"]          = label_win
     feature_vector["label_further_drop"] = label_further_drop
@@ -625,7 +696,9 @@ def build_features(
         f"qd={feature_vector['quality_dislocation']:.3f} "
         f"peg={feature_vector['peg_implicit']:.2f} "
         f"sec_alerts={feature_vector['sector_alert_count_7d']:.0f} "
-        f"d52h={feature_vector['days_since_52w_high']:.0f}d"
+        f"d52h={feature_vector['days_since_52w_high']:.0f}d "
+        f"sir={feature_vector['short_interest_ratio']:.1f} "
+        f"eps={feature_vector['earnings_surprise_avg']:.1f}%"
     )
 
     return feature_vector
@@ -681,6 +754,15 @@ if __name__ == "__main__":
         "spy_drawdown_5d":    -1.2,
         "sector_drawdown_5d": -2.8,
     }
+    mock_info = {
+        "shortRatio": 4.2,
+        "earningsHistory": {
+            "history": [
+                {"surprisePercent": 0.08},
+                {"surprisePercent": 0.05},
+            ]
+        },
+    }
 
     # Mock 90-day OHLCV history for momentum + context features
     np.random.seed(42)
@@ -710,6 +792,7 @@ if __name__ == "__main__":
         label_further_drop=-4.2,
         spy_history=mock_spy,
         sector_alert_count_7d=3.0,
+        ticker_info=mock_info,
     )
 
     print("Feature vector:")
@@ -728,10 +811,14 @@ if __name__ == "__main__":
     assert "month_of_year"          in fv, "month_of_year ausente"
     assert "sector_alert_count_7d"  in fv, "sector_alert_count_7d ausente"
     assert "days_since_52w_high"    in fv, "days_since_52w_high ausente"
-    print(f"\nAssert OK — {N_FEATURES} features (27 base + 2 context v3.2).")
+    assert "short_interest_ratio"   in fv, "short_interest_ratio ausente"
+    assert "earnings_surprise_avg"  in fv, "earnings_surprise_avg ausente"
+    print(f"\nAssert OK — {N_FEATURES} features (27 base + 2 context v3.2 + 2 short/earnings v3.3).")
     print(f"  quality_dislocation   = {fv['quality_dislocation']:.4f}")
     print(f"  peg_implicit          = {fv['peg_implicit']:.4f}")
     print(f"  relative_drop         = {fv['relative_drop']:.4f}")
     print(f"  month_of_year         = {fv['month_of_year']}")
     print(f"  sector_alert_count_7d = {fv['sector_alert_count_7d']}")
     print(f"  days_since_52w_high   = {fv['days_since_52w_high']} dias")
+    print(f"  short_interest_ratio  = {fv['short_interest_ratio']:.1f} dias")
+    print(f"  earnings_surprise_avg = {fv['earnings_surprise_avg']:.1f}%")
