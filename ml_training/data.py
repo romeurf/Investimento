@@ -269,6 +269,7 @@ def build_dataset_v31(
         add_derived_features,
         add_momentum_features,
         add_context_features,
+        add_regime_features,
     )
     from macro_data import get_macro_context_historical
 
@@ -337,6 +338,10 @@ def build_dataset_v31(
                 sector_count_lookup.get((ticker, alert_date), 0)
             ),
         )
+
+        tnx_hist  = combined_macro_cache.get("^TNX")
+        vix_hist  = combined_macro_cache.get("^VIX")
+        add_regime_features(fv, spy_slice, tnx_hist, alert_date, vix_hist)
 
         # Targets
         if "max_return_60d" in row.index and pd.notna(row.get("max_return_60d")):
