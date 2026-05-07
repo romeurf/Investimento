@@ -18,7 +18,7 @@ MACRO_TICKERS: list[str] = ["^VIX", "SPY", "^TNX", "^IRX", "HYG", "LQD", "IYT", 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-load_base_dataset
+# load_base_dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
@@ -37,7 +37,7 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-Helpers inline (antes em experiments.ml_v2.pipeline)
+# Helpers inline (antes em experiments.ml_v2.pipeline)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_targets(
@@ -62,10 +62,9 @@ def _build_targets(
 
 
 def _build_v2_features(row: pd.Series, hist: pd.DataFrame) -> dict:
-    """Features price-based que o parquet v1 não tem (RSI, ATR, volume spike, drawdown).
+    """Features price-based que o parquet v1 não tem.
     Replica build_v2_features() que estava em experiments.ml_v2.pipeline.
-    Já são calculadas por add_derived_features/add_momentum_features de ml_features,
-    mas esta função serve de fallback para campos que porventura faltem no row.
+    Serve de fallback para campos que porventura faltem no row.
     """
     from ml_features import _FALLBACK
     if hist.empty:
@@ -75,8 +74,8 @@ def _build_v2_features(row: pd.Series, hist: pd.DataFrame) -> dict:
     prev_close = float(close.iloc[-2]) if len(close) >= 2 else last_close
     high_52w = float(hist["High"].iloc[-252:].max()) if len(hist) >= 5 else last_close
 
-    drop_today    = (last_close / prev_close - 1.0) if prev_close > 0 else 0.0
-    drawdown_52w  = (last_close / high_52w - 1.0)   if high_52w   > 0 else 0.0
+    drop_today   = (last_close / prev_close - 1.0) if prev_close > 0 else 0.0
+    drawdown_52w = (last_close / high_52w - 1.0)   if high_52w   > 0 else 0.0
 
     # RSI-14
     delta = close.diff().dropna()
@@ -94,7 +93,7 @@ def _build_v2_features(row: pd.Series, hist: pd.DataFrame) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-sector_alert_count_7d
+# compute_sector_alert_count_7d
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_sector_alert_count_7d(
@@ -121,7 +120,7 @@ def compute_sector_alert_count_7d(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-spy_max_return_forward
+# spy_max_return_forward / days_since_52w_high
 # ─────────────────────────────────────────────────────────────────────────────
 
 def spy_max_return_forward(
@@ -159,7 +158,7 @@ def days_since_52w_high(hist: pd.DataFrame, alert_date: pd.Timestamp) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-generate_historical_alerts  (Notebook Célula 3)
+# generate_historical_alerts  (Notebook Célula 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_historical_alerts(
@@ -204,14 +203,13 @@ def generate_historical_alerts(
         dip_dates = pct_change[pct_change <= dip_threshold].index
         sector = sector_fn(ticker)
         for dt in dip_dates:
-            # precisa de histórico suficiente antes do alerta
             hist_before = ohlcv[ohlcv.index <= dt]
             if len(hist_before) < min_history_days:
                 continue
             records.append({
-                "ticker":        ticker,
-                "alert_date":    pd.Timestamp(dt),
-                "sector":        sector,
+                "ticker":         ticker,
+                "alert_date":     pd.Timestamp(dt),
+                "sector":         sector,
                 "drop_pct_today": round(float(pct_change.loc[dt]) * 100, 4),
             })
 
@@ -222,14 +220,12 @@ def generate_historical_alerts(
     df["alert_date"] = pd.to_datetime(df["alert_date"])
     df["year"] = df["alert_date"].dt.year
 
-    # Subsample por anos
     if subsample_years is not None:
         df = df[df["year"].isin(subsample_years)].copy()
 
-    # Subsample máximo por ano
     if max_per_year is not None and max_per_year > 0:
         parts = []
-        for yr, grp in df.groupby("year"):
+        for _yr, grp in df.groupby("year"):
             if len(grp) > max_per_year:
                 parts.append(grp.sample(n=max_per_year, random_state=int(rng.integers(0, 9999))))
             else:
@@ -246,7 +242,7 @@ def generate_historical_alerts(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-build_dataset_v31
+# build_dataset_v31
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_dataset_v31(
@@ -355,7 +351,7 @@ def build_dataset_v31(
             max_ret  = tgt["max_return_60d"]
             max_draw = tgt["max_drawdown_60d"]
 
-        # close_60d: close-to-close (não max-return)
+        # close_60d: close-to-close
         future_close_slice = ohlcv[
             (ohlcv.index > alert_date)
             & (ohlcv.index <= alert_date + pd.Timedelta(days=horizon_days))
@@ -364,14 +360,13 @@ def build_dataset_v31(
         if len(future_close_slice) >= 5 and entry_px > 0:
             close_60d = float(future_close_slice.iloc[-1] / entry_px - 1.0)
         else:
-            close_60d = max_ret  # fallback para max_return se não há dados suficientes
+            close_60d = max_ret
 
         spy_max_ret = spy_max_return_forward(spy_hist, alert_date, horizon_days)
         if math.isnan(spy_max_ret):
             skipped["no_spy_target"] += 1
             continue
 
-        # alpha_60d = close_60d - spy_max_return_forward
         alpha_60d = close_60d - spy_max_ret
 
         rec = {
