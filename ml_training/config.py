@@ -6,11 +6,11 @@ HORIZON_DAYS: int = 60
 WINSOR_PCT: float = 0.005
 WINSOR_ABS_LO: float = -0.50
 WINSOR_ABS_HI: float = 2.00
-HALF_LIFE_DAYS: int = 365 * 3
+HALF_LIFE_DAYS: int = 548
 
 # Walk-forward CV
 N_FOLDS: int = 10
-PURGE_DAYS: int = 21
+PURGE_DAYS: int = 60
 TOPK_FRAC: float = 0.20
 
 # Features v3 (momentum), v3.1 (dislocation) e v3.2 (context)
