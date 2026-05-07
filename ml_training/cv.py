@@ -19,6 +19,10 @@ from ml_training.config import (
     WINSOR_ABS_HI,
 )
 
+# Fraction of training set held out as early-stopping validation
+# (taken from the most recent rows to respect temporal order)
+_ES_VAL_FRAC: float = 0.07
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Folds expanding-window com purga
@@ -155,6 +159,87 @@ def fold_metric_record(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Early-stopping helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _supports_early_stopping(model: object) -> str:
+    """Return 'xgb', 'lgbm', or '' depending on whether the model supports ES.
+
+    Detection is done by inspecting the class name and the presence of
+    early_stopping_rounds in the model's params, so it works without
+    importing xgboost/lightgbm at module level.
+    """
+    cls_name = type(model).__name__
+    # XGBRegressor stores early_stopping_rounds as a constructor kwarg
+    if cls_name == "XGBRegressor":
+        esr = getattr(model, "early_stopping_rounds", None)
+        if esr is not None and esr > 0:
+            return "xgb"
+    # LGBMRegressor: early stopping is passed via callbacks at fit time,
+    # but we signal intent by checking for a custom attribute or n_estimators > 500
+    if cls_name == "LGBMRegressor":
+        # lgbm_es_factory sets n_estimators=800; use that as the heuristic
+        n_est = getattr(model, "n_estimators", 0)
+        if n_est >= 800:
+            return "lgbm"
+    return ""
+
+
+def _fit_with_early_stopping(
+    model: object,
+    es_type: str,
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    w_tr: np.ndarray,
+) -> None:
+    """Fit model with early stopping using the provided validation split.
+
+    Parameters
+    ----------
+    model   : fitted in place
+    es_type : 'xgb' or 'lgbm'
+    X_tr, y_tr, w_tr : training data + sample weights
+    X_val, y_val     : validation set for early stopping signal
+    """
+    if es_type == "xgb":
+        model.fit(
+            X_tr, y_tr,
+            sample_weight=w_tr,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
+    elif es_type == "lgbm":
+        try:
+            from lightgbm import early_stopping as lgbm_early_stopping
+            from lightgbm import log_evaluation as lgbm_log_evaluation
+            callbacks = [
+                lgbm_early_stopping(stopping_rounds=50, verbose=False),
+                lgbm_log_evaluation(period=-1),
+            ]
+        except ImportError:
+            # Older LightGBM API
+            callbacks = None
+
+        fit_kwargs: dict = {
+            "X": X_tr,
+            "y": y_tr,
+            "sample_weight": w_tr,
+            "eval_set": [(X_val, y_val)],
+        }
+        if callbacks is not None:
+            fit_kwargs["callbacks"] = callbacks
+        else:
+            fit_kwargs["early_stopping_rounds"] = 50
+            fit_kwargs["verbose"] = False
+
+        model.fit(**fit_kwargs)
+    else:
+        raise ValueError(f"Unknown es_type: {es_type!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Walk-forward CV — orquestrador principal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -173,6 +258,7 @@ def walk_forward_cv(
 
     Para cada fold e cada modelo:
       1. Treina em train_set (com temporal weights)
+         — modelos ES recebem os últimos 7% do treino como eval_set
       2. Avalia em test_set: IC (Spearman), topk_alpha, hit_rate
       3. Guarda registo com {fold, model, ic, topk_alpha, hit_rate, n_test}
 
@@ -215,11 +301,18 @@ def walk_forward_cv(
         y_train = df_train[target_col].values
         y_test  = df_test[target_col].values
 
-        # Temporal sample weights
+        # Temporal sample weights (calculated on full train before ES split)
         w_train = temporal_weights(df_train[date_col], train_end, half_life_days)
 
+        # ES validation split: last _ES_VAL_FRAC of training rows (temporal order)
+        # Use at least 30 rows for val; fall back to no split if train is tiny.
+        n_val = max(30, int(len(df_train) * _ES_VAL_FRAC))
+        if n_val >= len(df_train) - 20:
+            n_val = max(0, len(df_train) // 10)
+        es_split_available = n_val >= 10
+
         print(f"  Fold {fold_k}/{n_folds}: train={len(df_train):,}  test={len(df_test):,}  "
-              f"[{train_end.date()} → {test_end.date()}]")
+              f"[{train_end.date()} → {test_end.date()}]  es_val={n_val if es_split_available else 'N/A'}")
 
         for name, cfg in model_configs.items():
             feats = feature_cols_map.get(name, cfg.get("feats", []))
@@ -229,31 +322,43 @@ def walk_forward_cv(
             if not feats_ok:
                 continue
 
-            X_train = df_train[feats_ok].values.astype(float)
+            X_train_full = df_train[feats_ok].values.astype(float)
             X_test  = df_test[feats_ok].values.astype(float)
 
-            # Imputar NaN com mediana do treino
-            col_medians = np.nanmedian(X_train, axis=0)
-            for col_i in range(X_train.shape[1]):
-                nan_mask = ~np.isfinite(X_train[:, col_i])
+            # Imputar NaN com mediana do treino (calculada em X_train_full)
+            col_medians = np.nanmedian(X_train_full, axis=0)
+            for col_i in range(X_train_full.shape[1]):
+                nan_mask = ~np.isfinite(X_train_full[:, col_i])
                 if nan_mask.any():
-                    X_train[nan_mask, col_i] = col_medians[col_i]
+                    X_train_full[nan_mask, col_i] = col_medians[col_i]
                 nan_mask_t = ~np.isfinite(X_test[:, col_i])
                 if nan_mask_t.any():
                     X_test[nan_mask_t, col_i] = col_medians[col_i]
 
             # Scaler (Ridge precisa; tree-based é indiferente mas não prejudica)
             scaler = StandardScaler()
-            X_train = scaler.fit_transform(X_train)
+            X_train_full = scaler.fit_transform(X_train_full)
             X_test  = scaler.transform(X_test)
 
             try:
                 model = cfg["factory"]()
-                # Passar sample_weight se o modelo suportar
-                try:
-                    model.fit(X_train, y_train, sample_weight=w_train)
-                except TypeError:
-                    model.fit(X_train, y_train)
+                es_type = _supports_early_stopping(model)
+
+                if es_type and es_split_available:
+                    # Split the most recent n_val rows as ES validation
+                    X_tr  = X_train_full[:-n_val]
+                    y_tr  = y_train[:-n_val]
+                    w_tr  = w_train[:-n_val]
+                    X_val = X_train_full[-n_val:]
+                    y_val = y_train[-n_val:]
+
+                    _fit_with_early_stopping(model, es_type, X_tr, y_tr, X_val, y_val, w_tr)
+                else:
+                    # Standard fit: no early stopping
+                    try:
+                        model.fit(X_train_full, y_train, sample_weight=w_train)
+                    except TypeError:
+                        model.fit(X_train_full, y_train)
 
                 pred = model.predict(X_test).astype(float)
             except Exception as e:
