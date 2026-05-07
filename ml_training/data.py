@@ -381,7 +381,11 @@ def build_dataset_v31(
             skipped["no_spy_target"] += 1
             continue
         
-        alpha_60d = close_60d - spy_close_60d
+        alpha_60d = (
+            math.log1p(close_60d) - math.log1p(spy_close_60d)
+            if (close_60d > -1.0 and spy_close_60d > -1.0)
+            else close_60d - spy_close_60d  # fallback aritmético
+        )
 
         rec = {
             "ticker":     ticker,
