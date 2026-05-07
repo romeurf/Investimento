@@ -1,4 +1,4 @@
-"""Factories e configuração de modelos candidatos — extraído do notebook (cell 22)."""
+"""Factories e configuração de modelos candidatos."""
 
 from __future__ import annotations
 
@@ -54,51 +54,47 @@ def rf_factory() -> "object":
 
 def ridge_factory() -> "object":
     from sklearn.linear_model import Ridge
-    # alpha=10.0: resolve LinAlgWarning e suaviza regime shifts
-    # (vs alpha=1.0 no v3.1 que gerava instabilidade no Fold 10)
     return Ridge(alpha=10.0)
 
 
-# Mapping name → (factory_callable, feats_kind)
-# feats_kind:
-#   "v31"      → FEATURE_COLUMNS_V31 (v2 + momentum + NEW)
-#   "baseline" → FEATURE_COLUMNS_V2 + MOMENTUM_FEATURES (sem as NEW)
+def build_feature_lists() -> tuple[list[str], list[str]]:
+    """Devolve (FEATURE_COLS, FEATURE_COLS_BASELINE).
+
+    FEATURE_COLS      = ml_features.FEATURE_COLUMNS (única source of truth, 29 features).
+    FEATURE_COLS_BASELINE = FEATURE_COLUMNS sem Stage-3c (dislocation) e Stage-3d (context),
+                           i.e. apenas Stage 0-3b (25 features) — usado como modelo de controlo.
+
+    Não depende de experiments.ml_v2.pipeline nem de listas duplicadas.
+    """
+    from ml_features import FEATURE_COLUMNS
+
+    # Features de controlo: excluir Stage-3c e Stage-3d
+    _EXCLUDE_BASELINE = {
+        # Stage-3c dislocation
+        "quality_dislocation",
+        "peg_implicit",
+        "relative_drop",
+        "month_of_year",
+        # Stage-3d context (v3.2)
+        "sector_alert_count_7d",
+        "days_since_52w_high",
+    }
+
+    full = list(FEATURE_COLUMNS)
+    baseline = [c for c in FEATURE_COLUMNS if c not in _EXCLUDE_BASELINE]
+
+    return full, baseline
+
+
 def build_model_configs(
     feature_cols_v31: list[str],
     feature_cols_baseline: list[str],
 ) -> dict[str, dict]:
-    """Constrói o dicionário MODEL_CONFIGS exactamente como no notebook."""
+    """Constrói o dicionário MODEL_CONFIGS."""
     return {
-        "XGB-alpha-v31":      {"factory": xgb_factory,   "feats": feature_cols_v31},
-        "LGBM-alpha-v31":     {"factory": lgbm_factory,  "feats": feature_cols_v31},
-        "RF-alpha-v31":       {"factory": rf_factory,    "feats": feature_cols_v31},
-        "Ridge-alpha-v31":    {"factory": ridge_factory, "feats": feature_cols_v31},
+        "XGB-alpha":          {"factory": xgb_factory,   "feats": feature_cols_v31},
+        "LGBM-alpha":         {"factory": lgbm_factory,  "feats": feature_cols_v31},
+        "RF-alpha":           {"factory": rf_factory,    "feats": feature_cols_v31},
+        "Ridge-alpha":        {"factory": ridge_factory, "feats": feature_cols_v31},
         "XGB-alpha-baseline": {"factory": xgb_factory,   "feats": feature_cols_baseline},
     }
-
-
-def build_feature_lists() -> tuple[list[str], list[str]]:
-    """Devolve (FEATURE_COLUMNS_V31, FEATURE_COLUMNS_BASELINE).
-
-    A definição replica cell 12 do notebook:
-      v31 = unique(FEATURE_COLUMNS_V2 + MOMENTUM_FEATURES + NEW_FEATURES_V31)
-      baseline = FEATURE_COLUMNS_V2 + MOMENTUM_FEATURES (sem as NEW)
-    """
-    from experiments.ml_v2.pipeline import FEATURE_COLUMNS_V2
-    from ml_training.config import MOMENTUM_FEATURES, NEW_FEATURES_V31
-
-    seen: set[str] = set()
-    v31: list[str] = []
-    for c in list(FEATURE_COLUMNS_V2) + list(MOMENTUM_FEATURES) + list(NEW_FEATURES_V31):
-        if c not in seen:
-            seen.add(c)
-            v31.append(c)
-
-    baseline_seen: set[str] = set()
-    baseline: list[str] = []
-    for c in list(FEATURE_COLUMNS_V2) + list(MOMENTUM_FEATURES):
-        if c not in baseline_seen:
-            baseline_seen.add(c)
-            baseline.append(c)
-
-    return v31, baseline
