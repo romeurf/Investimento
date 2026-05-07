@@ -141,24 +141,36 @@ def summarize_results(results: dict[str, list[dict]]) -> pd.DataFrame:
 
 
 def select_champion(summary: pd.DataFrame) -> tuple[str, pd.Series]:
-    """Champion = melhor rho_alpha_mean com topk_pnl_mean > 0 (cell 28).
+    """Champion = melhor score composto (rho_alpha_mean - 0.5 * rho_alpha_std)
+    entre modelos com topk_pnl_mean > 0.
 
-    Fallback: se nenhum passa o filtro PnL, escolhe melhor rho mesmo assim.
+    O score composto penaliza modelos instáveis entre folds — prefere
+    consistência a picos isolados.
+
+    Fallback: se nenhum passa o filtro PnL, escolhe melhor score mesmo assim.
     Devolve (champion_name, champion_row).
     """
     if summary.empty:
         raise ValueError("summary vazio — sem modelos para escolher champion")
 
-    qualifiers = summary[summary["topk_pnl_mean"] > 0].sort_values(
-        "rho_alpha_mean", ascending=False
+    df = summary.copy()
+    df["champion_score"] = df["rho_alpha_mean"] - 0.5 * df["rho_alpha_std"]
+
+    qualifiers = df[df["topk_pnl_mean"] > 0].sort_values(
+        "champion_score", ascending=False
     )
     if len(qualifiers) == 0:
-        log.warning("Nenhum modelo passou no critério topk_pnl > 0 — fallback ao melhor rho")
-        qualifiers = summary.sort_values("rho_alpha_mean", ascending=False)
+        log.warning("Nenhum modelo passou no critério topk_pnl > 0 — fallback ao melhor score")
+        qualifiers = df.sort_values("champion_score", ascending=False)
 
     champion_name = str(qualifiers.iloc[0]["model"])
+    log.info(
+        f"Champion selecionado: {champion_name} "
+        f"(score={qualifiers.iloc[0]['champion_score']:.4f}, "
+        f"rho_alpha_mean={qualifiers.iloc[0]['rho_alpha_mean']:.4f}, "
+        f"rho_alpha_std={qualifiers.iloc[0]['rho_alpha_std']:.4f})"
+    )
     return champion_name, qualifiers.iloc[0]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Calibrator isotónico em OOF (cell 29)
