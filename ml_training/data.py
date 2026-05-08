@@ -149,7 +149,7 @@ def add_cross_sectional_rank(df: pd.DataFrame, target_col: str = "alpha_60d", ra
     return df
 
 
-def build_dataset_v31(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], etf_cache: dict[str, pd.DataFrame], horizon_days: int = HORIZON_DAYS, macro_price_cache: Optional[dict[str, pd.DataFrame]] = None) -> tuple[pd.DataFrame, dict[str, int]]:
+def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], etf_cache: dict[str, pd.DataFrame], horizon_days: int = HORIZON_DAYS, macro_price_cache: Optional[dict[str, pd.DataFrame]] = None) -> tuple[pd.DataFrame, dict[str, int]]:
     from ml_features import FEATURE_COLUMNS, _FALLBACK, add_derived_features, add_momentum_features, add_context_features, add_regime_features, add_short_earnings_features
     from macro_data import get_macro_context_historical
     if FEATURE_COLS != FEATURE_COLUMNS:
@@ -162,7 +162,7 @@ def build_dataset_v31(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame
     if macro_price_cache:
         combined_macro_cache.update(macro_price_cache)
     combined_macro_cache.update(etf_cache)
-    rows_v31: list[dict] = []
+    rows: list[dict] = []
     skipped = {"no_price": 0, "short_history": 0, "no_target": 0, "no_spy_target": 0}
     for _, row in base_df.iterrows():
         ticker = row["ticker"]
@@ -257,8 +257,8 @@ def build_dataset_v31(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame
             "label_upside_10_90d": float(close_90d >= 0.10) if np.isfinite(close_90d) else float("nan"),
             "label_downside_15_20d": float(max_draw_20d <= -0.15) if np.isfinite(max_draw_20d) else float("nan"),
         }
-        rows_v31.append(rec)
-    df_out = pd.DataFrame(rows_v31)
+        rows.append(rec)
+    df_out = pd.DataFrame(rows)
     if not df_out.empty:
         df_out = add_cross_sectional_rank(df_out, target_col="alpha_60d", rank_col="alpha_60d_rank")
         if "alpha_90d" in df_out.columns:
