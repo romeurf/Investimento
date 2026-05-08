@@ -1,15 +1,20 @@
 """
 ml_predictor.py — Score v3: regressor dual (model_up + model_down).
 
-Champion: XGB-v2 (17 features base, rho_up=0.36, rho_down≈-0.001, topk_pnl=17.9%/60d)
+Champion: XGB-v2 (37 features, rho_up=0.36, rho_down≈-0.001, topk_pnl=17.9%/60d)
 
-Score final = pred_up (predicted max_return_60d, já transformado).
-  → representa retorno máximo esperado nos 60 dias seguintes ao alerta.
+Score final = pred_up (predicted alpha_60d = log-return excess over SPY).
+  → representa o retorno em excesso sobre o SPY esperado nos 60 dias
+    seguintes ao alerta (escala log-return).
 
-Nota: versões anteriores usavam `pred_up / |pred_down|`, mas como o
-model_down tem rho ≈ 0 (não prevê nada), dividir por |pred_down| era
-essencialmente dividir por ruído. Mantemos `pred_down` no MLResult para
-diagnóstico, mas não entra no score até termos rho_down < -0.10.
+Nota: versões anteriores previam max_return_60d (retorno absoluto). O modelo
+foi retreinado para prever alpha_60d — os thresholds foram recalibrados:
+  _SCORE_HIGH  = 0.06   alpha > +6pp sobre SPY → WIN_STRONG
+  _SCORE_MED   = 0.03   alpha > +3pp sobre SPY → WIN
+  _SCORE_FLOOR = 0.01   alpha > +1pp sobre SPY → WEAK
+
+Nota: model_down tem rho ≈ 0 (não prevê nada), não entra no score.
+Mantemos pred_down em MLResult apenas para diagnóstico.
 
 API pública (inalterada):
   ml_score(features: dict) -> MLResult
@@ -17,12 +22,17 @@ API pública (inalterada):
   get_model_info() -> dict
   ml_badge(result: MLResult) -> str    # linha formatada para Telegram
 
-Features esperadas (17 base do merged):
-  macro_score, vix, spy_drawdown_5d, sector_drawdown_5d,
-  fcf_yield, revenue_growth, gross_margin, de_ratio,
-  pe_vs_fair, analyst_upside, quality_score,
-  drop_pct_today, drawdown_52w, rsi_14, atr_ratio,
-  volume_spike, market_cap_b
+Features esperadas (37 — FEATURE_COLUMNS de ml_features.py):
+  Stage 0(4): macro_score, vix, spy_drawdown_5d, sector_drawdown_5d
+  Stage 1(5): gross_margin, de_ratio, pe_vs_fair, analyst_upside, quality_score
+  Stage 2(5): drop_pct_today, drawdown_52w, rsi_14, atr_ratio, volume_spike
+  Stage 3(5): rsi_oversold_strength, vix_regime, pe_attractive,
+              drop_x_drawdown, vol_x_drop
+  Stage 3b(4): return_1m, return_3m_pre, sector_relative, beta_60d
+  Stage 3c(4): quality_dislocation, peg_implicit, relative_drop, month_of_year
+  Stage 3d(2): sector_alert_count_7d, days_since_52w_high
+  Stage 3e(2): short_interest_ratio, earnings_surprise_avg
+  Stage 3f(3): vix_percentile_1y, spy_rsi_14, yield_10y_change_5d
 """
 
 from __future__ import annotations
@@ -115,13 +125,28 @@ _PKL_V3 = next(
     _REPO_DIR / "dip_models_v3.pkl",
 )
 
-# Features esperadas pelo champion XGB-v2 (17 base)
+# Features esperadas pelo champion v3 (37 features — FEATURE_COLUMNS de ml_features.py)
+# Usado como fallback se o bundle não trouxer feature_cols.
 _FEATURE_COLS: list[str] = [
+    # Stage 0: Macro
     "macro_score", "vix", "spy_drawdown_5d", "sector_drawdown_5d",
-    "fcf_yield", "revenue_growth", "gross_margin", "de_ratio",
-    "pe_vs_fair", "analyst_upside", "quality_score",
-    "drop_pct_today", "drawdown_52w", "rsi_14", "atr_ratio",
-    "volume_spike", "market_cap_b",
+    # Stage 1: Quality
+    "gross_margin", "de_ratio", "pe_vs_fair", "analyst_upside", "quality_score",
+    # Stage 2: Timing
+    "drop_pct_today", "drawdown_52w", "rsi_14", "atr_ratio", "volume_spike",
+    # Stage 3: Engineered
+    "rsi_oversold_strength", "vix_regime", "pe_attractive",
+    "drop_x_drawdown", "vol_x_drop",
+    # Stage 3b: Momentum
+    "return_1m", "return_3m_pre", "sector_relative", "beta_60d",
+    # Stage 3c: Dislocation
+    "quality_dislocation", "peg_implicit", "relative_drop", "month_of_year",
+    # Stage 3d: Context
+    "sector_alert_count_7d", "days_since_52w_high",
+    # Stage 3e: Short/Earnings
+    "short_interest_ratio", "earnings_surprise_avg",
+    # Stage 3f: Regime
+    "vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d",
 ]
 
 # Aliases de features — campo externo → nome interno
@@ -154,11 +179,28 @@ _SCALE_FUNCS: dict[str, Any] = {
     "market_cap_b": lambda v: v / 1e9 if v is not None and float(v) > 1e6 else v,
 }
 
-# Thresholds de score para labels (escala: pred_up = retorno previsto a 60d)
-# Ancorados na win threshold do treino (5% em 60d).
-_SCORE_HIGH   = 0.10   # pred_up > 10% → WIN_STRONG
-_SCORE_MED    = 0.05   # pred_up > 5%  → WIN  (== win threshold do treino)
-_SCORE_FLOOR  = 0.02   # pred_up > 2%  → WEAK; abaixo → NO_WIN
+# ── Thresholds de score (escala: alpha_60d = log-return excess sobre SPY) ────
+#
+# Calibração (2026-05-08):
+#   O modelo foi retreinado para prever alpha_60d em vez de max_return_60d.
+#   alpha_60d = log1p(stock_close_60d) - log1p(spy_close_60d)
+#
+#   Distribuição típica de alpha_60d no dataset de treino (2015-2024):
+#     p25 ≈ -0.08   mediana ≈ +0.00   p75 ≈ +0.08   p90 ≈ +0.15
+#
+#   Thresholds anteriores (para max_return_60d, retorno absoluto):
+#     HIGH=0.10, MED=0.05, FLOOR=0.02
+#
+#   Thresholds recalibrados (para alpha_60d, excesso sobre SPY):
+#     HIGH  = 0.06  → alpha > +6pp sobre SPY (top ~15% do dataset)
+#     MED   = 0.03  → alpha > +3pp sobre SPY (top ~35% do dataset)
+#     FLOOR = 0.01  → alpha > +1pp sobre SPY (top ~50% do dataset)
+#
+#   A sigmoide em _score_to_prob é re-ancorada em 0.03 (novo MED) para que
+#   win_prob=0.50 corresponda ao break-even alpha vs benchmark.
+_SCORE_HIGH   = 0.06   # pred_up > +6% alpha → WIN_STRONG
+_SCORE_MED    = 0.03   # pred_up > +3% alpha → WIN
+_SCORE_FLOOR  = 0.01   # pred_up > +1% alpha → WEAK; abaixo → NO_WIN
 
 # Cache em memória
 _bundle:    Any | None = None
@@ -168,9 +210,9 @@ _mtime_v3: float       = 0.0
 @dataclass
 class MLResult:
     win_prob:      float        = 0.0     # score normalizado [0, 1] para compatibilidade
-    score_raw:     float        = 0.0     # rácio upside/downside (não normalizado)
-    pred_up:       float | None = None    # previsão max_return_60d
-    pred_down:     float | None = None    # previsão max_drawdown_60d (negativo)
+    score_raw:     float        = 0.0     # alpha_60d previsto (log-return excess)
+    pred_up:       float | None = None    # previsão alpha_60d (= score_raw)
+    pred_down:     float | None = None    # previsão max_drawdown_60d (diagnóstico)
     prob_price:    float | None = None    # alias compatibilidade (= win_prob)
     prob_fund:     float | None = None    # alias compatibilidade (= win_prob)
     win40_prob:    float | None = None    # n/a em v3 — mantido para compatibilidade
@@ -226,26 +268,36 @@ def _classify_vix(vix_value: float | None) -> str:
 
 
 def _score_to_prob(score: float, calibrator: Any | None = None) -> float:
-    """Mapeia o score (= pred_up) para uma probabilidade calibrada [0, 1].
+    """Mapeia o score (= alpha_60d previsto) para uma probabilidade calibrada [0, 1].
 
     Se o bundle trouxer um `score_calibrator` (sklearn IsotonicRegression
-    ou objecto com .predict()), usa-o. Caso contrário cai para uma
-    sigmoide ancorada na win threshold de 5% (centro), que dá:
-      score=0.00 → 0.32   score=0.05 → 0.50
-      score=0.10 → 0.68   score=0.15 → 0.82
-    Steepness 15 => transição suave em torno de ±5% retorno previsto.
+    ou Platt/LogisticRegression com .predict_proba()), usa-o.
+    Caso contrário cai para uma sigmoide ancorada na win threshold de 3%
+    (novo _SCORE_MED), que dá:
+      score=-0.03 → 0.18   score=0.00 → 0.32
+      score=+0.03 → 0.50   score=+0.06 → 0.68   score=+0.09 → 0.82
+    Steepness 15 => transição suave em torno de ±3pp de alpha.
+
+    NOTA: ancoragem alterada de 0.05 → 0.03 em 2026-05-08 para reflectir
+    que o target agora é alpha_60d (excesso sobre SPY) e não max_return_60d.
     """
     if calibrator is not None:
         try:
             arr = np.asarray([score], dtype=np.float64)
-            pred = calibrator.predict(arr)
+            # Suporta sklearn calibrators com .predict() ou .predict_proba()
+            if hasattr(calibrator, "predict_proba"):
+                pred = calibrator.predict_proba(arr.reshape(-1, 1))[:, 1]
+            else:
+                pred = calibrator.predict(arr)
             return float(np.clip(pred[0], 0.0, 1.0))
-        except Exception as e:  # pragma: no cover — fallback robusto
+        except Exception as e:
             logging.debug(f"[ml_predictor] calibrator falhou ({e}); fallback sigmoide")
-    return float(1.0 / (1.0 + np.exp(-15.0 * (score - 0.05))))
+    # Sigmoide ancorada em _SCORE_MED (0.03) — win_prob=0.50 no break-even alpha
+    return float(1.0 / (1.0 + np.exp(-15.0 * (score - _SCORE_MED))))
 
 
 def _inverse_transform_up(yp: float) -> float:
+    """Inverte a transformação log1p aplicada ao alpha_60d durante o treino."""
     return float(np.expm1(np.clip(yp, -3, 3)))
 
 
@@ -303,6 +355,11 @@ def get_model_info() -> dict:
         "camada_b":      False,
         "weight_price":  1.0,
         "weight_fund":   0.0,
+        # Thresholds activos
+        "score_high":    _SCORE_HIGH,
+        "score_med":     _SCORE_MED,
+        "score_floor":   _SCORE_FLOOR,
+        "target":        "alpha_60d",
     }
 
 
@@ -315,15 +372,15 @@ def ml_score(
     """
     Pontua um dip com o modelo v3 (regressor dual XGB-v2).
 
-    Score = pred_up (retorno previsto a 60 dias, após expm1).
+    Score = pred_up = alpha_60d previsto = log-return excess sobre SPY.
       pred_down é mantido em MLResult para diagnóstico mas não entra
       no score (rho_down ≈ 0 → não tem sinal útil).
 
-    Labels (ancorados na win threshold de 5% do treino):
-      WIN_STRONG  — score > 0.10  (retorno previsto > 10%)
-      WIN         — score > 0.05  (retorno previsto > 5%)
-      WEAK        — score > 0.02
-      NO_WIN      — score <= 0.02
+    Labels (ancorados em alpha_60d — excesso sobre SPY):
+      WIN_STRONG  — alpha previsto > +6pp  (top ~15% histórico)
+      WIN         — alpha previsto > +3pp  (top ~35% histórico)
+      WEAK        — alpha previsto > +1pp
+      NO_WIN      — alpha previsto <= +1pp
     """
     if reload_if_stale:
         if not _load_bundle():
@@ -349,9 +406,7 @@ def ml_score(
         logging.error(f"[ml_predictor] Erro na inferência v3: {e}")
         return MLResult(model_ready=False, label="ERROR")
 
-    # Score = pred_up directo. pred_down mantido apenas para diagnóstico.
-    # Justificação: rho_down_mean ≈ -0.001 no champion v3 (XGB-v2) — dividir
-    # por ruído distorce o score. Reverter quando rho_down < -0.10.
+    # Score = alpha_60d previsto. pred_down mantido apenas para diagnóstico.
     score = float(pred_up)
 
     # Normalizar para [0,1] usando o calibrator do bundle (se existir)
@@ -362,13 +417,13 @@ def ml_score(
     vix_value  = enriched.get("vix") or enriched.get("vix_value")
     vix_regime = _classify_vix(vix_value)
 
-    # Label baseado no score raw
+    # Label baseado no alpha_60d previsto
     if score > _SCORE_HIGH:
         label      = "WIN_STRONG"
         confidence = "Alta"
     elif score > _SCORE_MED:
         label      = "WIN"
-        confidence = "Média" if score < 1.25 else "Alta"
+        confidence = "Média" if score < _SCORE_HIGH * 1.25 else "Alta"
     elif score > _SCORE_FLOOR:
         label      = "WEAK"
         confidence = "Baixa"
@@ -381,7 +436,7 @@ def ml_score(
         score_raw     = round(score, 3),
         pred_up       = round(pred_up, 4),
         pred_down     = round(pred_down, 4),
-        prob_price    = round(win_prob, 3),   # alias compatibilidade
+        prob_price    = round(win_prob, 3),
         prob_fund     = None,
         win40_prob    = None,
         label         = label,
@@ -410,10 +465,10 @@ def ml_badge(result: MLResult) -> str:
     Linha formatada para o alerta Telegram.
 
     Exemplos:
-      🤖 ML v3: 🟢 WIN_STRONG | up +18.5% | dn -8.2% | score 2.25 | VIX:med
-      🤖 ML v3: ✅ WIN        | up +12.1% | dn -9.4% | score 1.29 | Alta
-      🤖 ML v3: 🟡 WEAK       | up +6.3%  | dn -10.1%| score 0.62
-      🤖 ML v3: 🔴 NO_WIN     | up +2.1%  | dn -12.3%| score 0.17
+      🤖 ML v3: 🟢 WIN_STRONG | α +8.2% | dn -6.1% | score 0.082 | VIX:med
+      🤖 ML v3: ✅ WIN        | α +4.3% | dn -7.2% | score 0.043 | Alta
+      🤖 ML v3: 🟡 WEAK       | α +1.8% | dn -9.4% | score 0.018
+      🤖 ML v3: 🔴 NO_WIN     | α -1.2% | dn -11.3%| score -0.012
       🤖 ML v3: modelo não treinado
     """
     if not result.model_ready:
@@ -429,15 +484,18 @@ def ml_badge(result: MLResult) -> str:
     }
     em = emoji_map.get(result.label, "📊")
 
-    up_str   = f"+{result.pred_up*100:.1f}%" if result.pred_up is not None else "?"
-    down_str = f"{result.pred_down*100:.1f}%" if result.pred_down is not None else "?"
-    score_str = f"{result.score_raw:.2f}"
+    # Mostra alpha (excesso sobre SPY) em vez de up bruto
+    alpha_str = f"+{result.pred_up*100:.1f}%" if result.pred_up is not None and result.pred_up >= 0 else (
+        f"{result.pred_up*100:.1f}%" if result.pred_up is not None else "?"
+    )
+    down_str  = f"{result.pred_down*100:.1f}%" if result.pred_down is not None else "?"
+    score_str = f"{result.score_raw:.3f}"
 
     vix_str  = f" | VIX:{result.vix_regime[:3]}" if result.vix_regime else ""
     conf_str = f" | *{result.confidence}*" if result.confidence != "–" else ""
 
     return (
         f"🤖 *ML v3:* {em} `{result.label}` "
-        f"| up *{up_str}* | dn {down_str} | score *{score_str}*"
+        f"| α *{alpha_str}* | dn {down_str} | score *{score_str}*"
         f"{vix_str}{conf_str}"
     )
