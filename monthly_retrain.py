@@ -22,7 +22,8 @@ Fluxo:
 
   3. **Gating** baseado em ρ_α (rho_alpha_mean):
      - Promove só se ρ_α candidate ≥ ρ_α produção × `gating_ratio` (default 0.90)
-     - Floor absoluto ρ_α ≥ `FLOOR_RHO_ALPHA` (default 0.20)
+     - Floor absoluto ρ_α ≥ `FLOOR_RHO_ALPHA` (default 0.08; ver
+       FLOOR_RHO_ALPHA_DEFAULT abaixo para histórico)
      - Se candidate cai > 10% mas ainda passa o floor → guarda como
        `dip_models_pending.pkl` para revisão manual (não promove)
 
@@ -90,8 +91,21 @@ LEGACY_PRODUCTION_REPORT = PRODUCTION_DIR / "ml_report_v3.json"
 # Candidate só promove se rho_alpha >= prod * gating_ratio
 DEFAULT_GATING_RATIO = 0.90
 
-# Floor absoluto: candidate <0.20 nunca é promovido
-FLOOR_RHO_ALPHA_DEFAULT = 0.20
+# Floor absoluto: candidate < FLOOR_RHO_ALPHA_DEFAULT nunca é promovido.
+#
+# Histórico:
+#   • 0.334 (PR #13 v3.1)  — baseline original do modelo v3 sem regen.
+#   • 0.20  (initial gate) — usado durante o PR #23 → #28; provou-se
+#                            inatingível com o parquet pós-regen + as
+#                            features actuais (IC profile cai para ~0.1).
+#   • 0.08  (PR #29 actual)— ajustado ao novo ceiling realista pós-Phase A:
+#                            PR #28 entregou ρ_α 0.0982 com 20 features
+#                            limpas. Sinal real, mas abaixo do floor 0.20
+#                            antigo. 0.08 dá margem para promover bundles
+#                            que melhorem sobre o produção sem aceitar
+#                            ruído puro (random IC ≈ 0).
+# Editável em runtime via `/admin_set_floor <value>` (escreve em FLOOR_PATH).
+FLOOR_RHO_ALPHA_DEFAULT = 0.08
 FLOOR_PATH = _DATA_DIR / "ml_floor_rho_alpha.json"
 
 LABEL_HORIZON_DAYS = 182  # 6 meses para resolver outcomes
@@ -417,7 +431,8 @@ def _read_v3_metrics(report_path: Path) -> dict[str, Optional[float]]:
 
 
 def _read_floor_rho_alpha() -> float:
-    """Lê o floor absoluto (cria se não existe). Editável manualmente via JSON."""
+    """Lê o floor absoluto (cria se não existe). Editável manualmente via JSON
+    ou em runtime via :func:`set_floor_rho_alpha` (e.g. ``/admin_set_floor``)."""
     try:
         if FLOOR_PATH.exists():
             data = json.loads(FLOOR_PATH.read_text())
@@ -430,11 +445,35 @@ def _read_floor_rho_alpha() -> float:
         FLOOR_PATH.write_text(json.dumps({
             "floor_rho_alpha": FLOOR_RHO_ALPHA_DEFAULT,
             "set_at":          datetime.utcnow().isoformat() + "Z",
-            "comment":         "Initial floor — baseline ρ_α 0.334 (PR #13 v3.1).",
+            "comment":         f"Initial floor — default {FLOOR_RHO_ALPHA_DEFAULT}.",
         }, indent=2))
     except Exception as e:
         log.debug(f"[gating] Não foi possível persistir floor: {e}")
     return FLOOR_RHO_ALPHA_DEFAULT
+
+
+def set_floor_rho_alpha(value: float, *, comment: Optional[str] = None) -> dict:
+    """Ajusta o floor absoluto em runtime e persiste em :data:`FLOOR_PATH`.
+
+    Lança ``ValueError`` se ``value`` estiver fora de ``[0.0, 0.5]`` (range
+    operacionalmente razoável). Devolve metadata com o valor anterior e novo
+    para feedback ao chamador.
+    """
+    if not isinstance(value, (int, float)) or not (0.0 <= float(value) <= 0.5):
+        raise ValueError(
+            f"floor_rho_alpha fora de range [0.0, 0.5]: {value!r}"
+        )
+    old = _read_floor_rho_alpha()
+    payload = {
+        "floor_rho_alpha": float(value),
+        "set_at":          datetime.utcnow().isoformat() + "Z",
+        "comment":         comment or f"Manual override via set_floor_rho_alpha (prev={old:.4f}).",
+        "previous":        old,
+    }
+    FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FLOOR_PATH.write_text(json.dumps(payload, indent=2))
+    log.info(f"[gating] floor_rho_alpha: {old:.4f} → {value:.4f}")
+    return {"old": old, "new": float(value), "path": str(FLOOR_PATH)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

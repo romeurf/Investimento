@@ -28,6 +28,7 @@ Comandos disponíveis:
   /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
   /admin_load_models <url> → [ADMIN] Descarregar pickles + ml_report do URL para /data/ (atomic)
   /admin_retrain [dry-run] → [ADMIN] Disparar retrain v3 ad-hoc (ou dry-run para validar input)
+  /admin_set_floor <valor> → [ADMIN] Ajustar o floor absoluto de promoção (ρ_α mínimo); ex.: /admin_set_floor 0.08
   /retrigger               → [ADMIN] Alias rápido de /admin_retrain (full, sem dry-run)
   /health                  → Dashboard de observabilidade (RAM, CPU, latências, last scan)
   /health errors           → Log dos últimos erros críticos
@@ -1228,6 +1229,51 @@ def _handle_retrigger() -> None:
     """
     _handle_admin_retrain(["admin_retrain"])
 
+
+# ── /admin_set_floor ────────────────────────────────────────────────────────────
+
+def _handle_admin_set_floor(parts: list[str]) -> None:
+    """
+    /admin_set_floor <valor>   → escreve o novo floor absoluto em FLOOR_PATH.
+
+    Ex.: /admin_set_floor 0.08  baixa o floor para 0.08 (range válido: [0.0, 0.5]).
+    O retrain mensal seguinte usa o novo valor. Mostra valor anterior + novo.
+    """
+    args = [a for a in parts[1:] if a.strip()]
+    if len(args) != 1:
+        _reply(
+            "❌ *Uso incorrecto.*\n\n"
+            "`/admin_set_floor <valor>`\n\n"
+            "Ex.: `/admin_set_floor 0.08`\n"
+            "_Range válido: 0.0 a 0.5._"
+        )
+        return
+    try:
+        new_value = float(args[0])
+    except ValueError:
+        _reply(f"❌ Valor não numérico: `{args[0]}`")
+        return
+
+    try:
+        from monthly_retrain import set_floor_rho_alpha
+        result = set_floor_rho_alpha(new_value, comment="Ajustado via /admin_set_floor.")
+    except ValueError as e:
+        _reply(f"❌ *Valor fora de range:*\n`{_md_safe(e)}`")
+        return
+    except Exception as e:
+        logging.error(f"[admin_set_floor] {e}", exc_info=True)
+        _reply(f"❌ *Falhou:*\n`{_md_safe(e)}`")
+        return
+
+    _reply(
+        "🔧 *Floor ajustado*\n"
+        f"  • anterior : `{result['old']:.4f}`\n"
+        f"  • novo     : `{result['new']:.4f}`\n"
+        f"  • path     : `{result['path']}`\n\n"
+        "_Aplicado no próximo `/admin_retrain` ou cron mensal._"
+    )
+    logging.info(f"[admin_set_floor] {result['old']:.4f} → {result['new']:.4f}")
+
 # ── /health handler ─────────────────────────────────────────────────────────────
 
 def _handle_health(parts: list[str]) -> None:
@@ -2035,7 +2081,10 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_retrain":
         _handle_admin_retrain(parts)
-    
+
+    elif cmd == "/admin_set_floor":
+        _handle_admin_set_floor(parts)
+
     elif cmd == "/retrigger":
         _handle_admin_retrain(["admin_retrain"])
 
