@@ -38,24 +38,13 @@ from score import score_from_fundamentals, _safe_float
 logger = logging.getLogger(__name__)
 
 FEATURE_COLUMNS: list[str] = [
-    "macro_score",
     "vix",
-    "spy_drawdown_5d",
-    "sector_drawdown_5d",
-    "gross_margin",
-    "de_ratio",
-    "pe_vs_fair",
-    "analyst_upside",
-    "quality_score",
     "drop_pct_today",
     "drawdown_52w",
     "rsi_14",
-    "atr_ratio",
-    "volume_spike",
     "bb_width",
     "rsi_oversold_strength",
     "vix_regime",
-    "pe_attractive",
     "drop_x_drawdown",
     "vol_x_drop",
     "return_1m",
@@ -65,17 +54,28 @@ FEATURE_COLUMNS: list[str] = [
     "beta_60d",
     "vol_of_vol",
     "quality_dislocation",
-    "peg_implicit",
-    "relative_drop",
     "month_of_year",
     "sector_alert_count_7d",
-    "days_since_52w_high",
     "vix_percentile_1y",
     "spy_rsi_14",
 ]
-# Veja ml_training/config.py para nota sobre features removidas (4 constantes
-# + 3 ruidosas com IC<0.01). _FALLBACK abaixo retém as 7 entradas para
-# inference compat (cálculos que ainda lêem os keys herdados não rebentam).
+# PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
+#   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
+#       gross_margin, de_ratio, pe_vs_fair, analyst_upside, quality_score,
+#       atr_ratio, volume_spike, pe_attractive, peg_implicit
+#     Razão: bootstrap original do parquet não tinha fontes point-in-time
+#     destas features → todas as 36929 linhas carregam o mesmo _FALLBACK.
+#     A inference live (build_features no position_monitor) continua a
+#     computá-las correctamente — _FALLBACK abaixo é mantido para compat.
+#   • 5 NOISE (|IC| < 0.01 com alpha_60d no parquet completo):
+#       days_since_52w_high (+0.007), sector_drawdown_5d (-0.007),
+#       macro_score (+0.005), spy_drawdown_5d (+0.003), relative_drop (+0.000)
+#     Razão: estas features VARIAM por linha mas não correlacionam com
+#     o target → desperdiçam capacidade do modelo.
+# Net: 34 → 20 features. Smoke test mostrou IC single best 0.1744 → 0.1946 (+11%).
+# Adicionalmente: month_of_year é fixed em load_base_dataset (era constante
+# 5.0 no parquet por bug do bootstrap; agora é computada de alert_date.dt.month).
+# Veja PR #25 para a remoção anterior (7 features ruidosas adicionadas em PR #23).
 
 LABEL_COLUMNS: list[str] = [
     "label_win",
