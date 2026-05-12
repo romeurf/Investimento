@@ -27,6 +27,12 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
         df = df.rename(columns={"symbol": "ticker"})
     if "ticker" not in df.columns:
         raise KeyError(f"parquet sem coluna ticker/symbol: {parquet_path}")
+    # PR #28: o bootstrap original do parquet escreveu month_of_year=5.0
+    # (constante: mês em que o bootstrap correu) para todas as linhas. Recompute
+    # daqui a partir de alert_date para que o modelo possa capturar
+    # sazonalidade real (calendar effects). Override sempre, mesmo que a coluna
+    # já exista — garante consistência cross-version.
+    df["month_of_year"] = df["alert_date"].dt.month.astype(float)
     return df
 
 
