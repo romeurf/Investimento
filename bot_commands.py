@@ -1046,6 +1046,98 @@ def _handle_admin_load_models(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="admin-load-models").start()
 
 
+# ── /admin_regen_parquet ────────────────────────────────────────────────────────
+
+def _handle_admin_regen_parquet(parts: list[str]) -> None:
+    """/admin_regen_parquet [--targets-only] [--fundamentals-only] [--no-fundamentals]
+
+    Reconstrói ml_training_base.parquet com:
+      - Fundamentais point-in-time (SEC EDGAR + yfinance quarterly)
+      - Target alpha_90d (sem fallback para 60d)
+      - Features técnicas corrigidas
+
+    Duração: 45-90 min (1ª execução) | 5-15 min (re-runs com cache)
+
+    Flags:
+      --targets-only       → só adiciona/actualiza alpha_90d (rápido, ~10 min)
+      --fundamentals-only  → só fundamentais PIT (sem re-calcular features)
+      --no-fundamentals    → pula fundamentais (só features + targets)
+    """
+    if _retrain_running:
+        _reply("⚠️ Retrain já em curso — aguarda que termine antes de regenerar.")
+        return
+
+    flags = [p for p in parts[1:] if p.startswith("--")]
+    mode_str = " ".join(flags) if flags else "completo"
+
+    _reply(
+        f"⚙️ *Regeneração de parquet — modo: {mode_str}*\n"
+        f"_A reconstruir ml_training_base.parquet com:_\n"
+        f"  • Fundamentais PIT (Tiingo → EDGAR → yfinance quarterly)\n"
+        f"  • Target alpha\\_90d (horizonte correcto)\n\n"
+        f"_Duração estimada: {'~10 min' if '--targets-only' in flags else '45-90 min (1ª vez)'}_\n"
+        f"_Podes continuar a usar o bot enquanto isto corre._"
+    )
+    logging.info(f"[regen] Iniciando regeneração modo={mode_str}")
+
+    def _run():
+        import subprocess, sys
+        try:
+            script = Path(__file__).parent / "scripts" / "regenerate_training_base.py"
+            args   = [sys.executable, str(script)] + flags
+
+            # Path do parquet (Railway Volume)
+            data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+            pq = data_dir / "ml_training_base.parquet"
+            if not pq.exists():
+                # Tenta o nome legacy
+                for alt in [data_dir / "ml_training_merged.parquet",
+                             Path(__file__).parent / "ml_training_base.parquet"]:
+                    if alt.exists():
+                        pq = alt
+                        break
+
+            if not pq.exists():
+                _reply(
+                    "❌ *Regeneração falhou:* parquet de treino não encontrado.\n"
+                    "_Faz `/admin_retrain dry-run` para verificar os paths._"
+                )
+                return
+
+            args += ["--in", str(pq), "--out", str(pq)]
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=7200  # 2h timeout
+            )
+            if result.returncode == 0:
+                # Verificar se alpha_90d ficou no parquet
+                try:
+                    import pandas as pd
+                    df_check = pd.read_parquet(pq)
+                    n_90d = int(df_check["alpha_90d"].notna().sum()) if "alpha_90d" in df_check.columns else 0
+                    total = len(df_check)
+                    _reply(
+                        f"✅ *Parquet regenerado com sucesso!*\n"
+                        f"  Shape: {df_check.shape[0]:,} × {df_check.shape[1]} colunas\n"
+                        f"  alpha\\_90d resolvido: *{n_90d:,}/{total:,}* ({n_90d/total:.0%})\n\n"
+                        f"_Podes agora fazer `/admin_retrain` para treinar o modelo._"
+                    )
+                except Exception as e:
+                    _reply(f"✅ *Parquet regenerado.* (verificação pós erro: {e})\n_Faz `/admin_retrain`._")
+            else:
+                stderr = result.stderr[-800:] if result.stderr else "sem stderr"
+                _reply(
+                    f"❌ *Regeneração falhou* (exit {result.returncode})\n"
+                    f"`{stderr}`"
+                )
+        except subprocess.TimeoutExpired:
+            _reply("⚠️ *Regeneração excedeu o timeout de 2h.* Verifica os logs do Railway.")
+        except Exception as e:
+            logging.error(f"[regen] {e}", exc_info=True)
+            _reply(f"❌ *Erro na regeneração:*\n`{_md_safe(e)}`")
+
+    threading.Thread(target=_run, daemon=True, name="regen-parquet").start()
+
+
 # ── /admin_retrain ──────────────────────────────────────────────────────────────
 
 def _handle_admin_retrain(parts: list[str]) -> None:
@@ -2069,6 +2161,7 @@ def _handle_command(text: str) -> None:
             "`/themes`                  → Ver temas/trends activos (fotónica, GLP-1, IA...)\n"
             "`/add_theme <k> <l> <T>` → Adicionar tema (key label TICK1,TICK2 [conf])\n"
             "`/remove_theme <key>`      → Remover tema\n"
+            "`/admin_regen_parquet [--targets-only]` → [ADMIN] Regenerar parquet com PIT fundamentais + alpha90d\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain v3 ad-hoc\n"
             "`/retrigger`               → [ADMIN] Alias rápido de /admin_retrain (full)\\n"
@@ -2267,6 +2360,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_load_models":
         _handle_admin_load_models(parts)
+
+    elif cmd in ("/admin_regen_parquet", "/regen_parquet"):
+        _handle_admin_regen_parquet(parts)
 
     elif cmd == "/admin_retrain":
         _handle_admin_retrain(parts)

@@ -1,33 +1,33 @@
-"""regenerate_training_base.py — Recomputa ml_training_base.parquet com features novas.
+"""regenerate_training_base.py — Reconstrói ml_training_base.parquet com dados correctos.
 
-Adiciona ao parquet existente as colunas:
-  - return_6m_pre, return_12m_pre  — multi-window momentum
-  - sector_relative_6m              — sector-relative momentum 6m
-  - vol_of_vol                      — std of rolling vol (20d/5d)
-  - bb_width                        — Bollinger band width (20d)
-  - vix_percentile_1y               — VIX percentil 1 ano
-  - spy_rsi_14                      — RSI 14 do SPY (macro)
-  - yield_10y_change_5d             — variação do ^TNX em 5d
+PROBLEMA QUE ESTE SCRIPT RESOLVE:
+  O parquet original tinha look-ahead bias nos fundamentais (usava dados de
+  hoje para avaliar dips de 2020/2022) e não tinha alpha_90d (target de 90 dias).
+  Este script corrige ambos os problemas.
 
-Não recomputa as 29 features existentes (que já estão correctas no parquet
-actual) — só adiciona as 7 novas em colunas extra.
+O que é adicionado/corrigido:
+  FUNDAMENTAIS POINT-IN-TIME (novas/corrigidas):
+    gross_margin, de_ratio, fcf_yield, revenue_growth, quality_score
+    → via SEC EDGAR XBRL (US tickers) ou yfinance quarterly (não-US)
+    → se TIINGO_API_KEY com Starter: Tiingo é usado (melhor qualidade)
+    Sem look-ahead: usamos o filing mais recente ANTES de alert_date.
 
-Não inclui:
-  - fcf_yield (precisa de fundamentals quarterly — fora do scope)
-  - short_interest_ratio, earnings_surprise_avg, earnings_distance_days
-    (yfinance só fornece valor actual, não histórico — sem signal útil
-     para alertas pré-2025; resolve-se quando houver fonte histórica)
+  TARGETS (novos):
+    alpha_90d = log1p(close_90d/price) - log1p(spy_close_90d/spy_price)
+    → target principal para o modelo (retorno em excesso sobre SPY em 90 dias)
+
+  FEATURES TÉCNICAS (já existiam, mantidas):
+    return_6m_pre, vol_of_vol, bb_width, vix_percentile_1y, spy_rsi_14,
+    volume_zscore_20d, close_in_range_20d, up_days_pct_20d, true_range_pct_20d
 
 Uso:
     python scripts/regenerate_training_base.py [--in PATH] [--out PATH] [--cache DIR]
+    python scripts/regenerate_training_base.py --fundamentals-only  # só fundamentais
+    python scripts/regenerate_training_base.py --targets-only       # só alpha_90d
 
-Estratégia:
-  1. Lê parquet existente (36k linhas)
-  2. Bulk download yfinance: SPY, ^VIX, ^TNX + 12 sector ETFs + 678 tickers
-     com cache local por ticker (resume em re-runs)
-  3. Para cada linha: slice de price history até alert_date → compute
-     features novas via funções já existentes em ml_features.py
-  4. Escreve parquet novo com as 7 colunas adicionadas
+Duração estimada:
+  - Primeira execução: 45-90 min (download de preços + EDGAR para 700+ tickers)
+  - Re-runs: 5-15 min (tudo em cache)
 """
 
 from __future__ import annotations
@@ -93,14 +93,26 @@ NEW_FEATURE_COLS: list[str] = [
     "vix_percentile_1y",
     "spy_rsi_14",
     "yield_10y_change_5d",
-    # PR #30 (Phase B): 4 raw-OHLCV features. Calculadas a partir do mesmo
-    # slice point-in-time já fetchado para os outros features — zero custo
-    # extra de yfinance. Veja scripts/add_ohlcv_features.py para
-    # backfill-only de parquets existentes sem re-rodar tudo.
     "volume_zscore_20d",
     "close_in_range_20d",
     "up_days_pct_20d",
     "true_range_pct_20d",
+]
+
+# Colunas fundamentais corrigidas (PIT) — substituem valores constantes do bootstrap
+FUNDAMENTAL_COLS: list[str] = [
+    "gross_margin",
+    "de_ratio",
+    "fcf_yield",
+    "revenue_growth",
+    "quality_score",
+]
+
+# Targets novos que precisam de ser adicionados ao parquet
+TARGET_COLS: list[str] = [
+    "alpha_90d",
+    "close_90d",
+    "spy_close_90d",
 ]
 
 
@@ -269,13 +281,119 @@ def _compute_row_features(
     return {k: float(fv.get(k, _FALLBACK.get(k, 0.0))) for k in NEW_FEATURE_COLS}
 
 
+def _compute_pit_fundamentals_row(
+    row: pd.Series,
+    cache_dir: Path,
+) -> dict:
+    """Busca fundamentais PIT para uma linha do parquet.
+
+    Usa fundamental_history.get_pit_fundamentals() que tenta Tiingo →
+    SEC EDGAR → yfinance quarterly, por esta ordem.
+    """
+    import sys
+    sys.path.insert(0, str(_REPO_ROOT))
+    from fundamental_history import get_pit_fundamentals
+    from ml_features import _FALLBACK
+
+    ticker     = str(row["ticker"])
+    alert_date = pd.Timestamp(row["alert_date"]).date()
+    price      = float(row.get("price", 0) or 0)
+
+    fund = get_pit_fundamentals(ticker, alert_date, cache_dir)
+
+    result = {col: _FALLBACK.get(col, 0.0) for col in FUNDAMENTAL_COLS}
+
+    if fund:
+        for col in ("gross_margin", "de_ratio", "revenue_growth", "quality_score"):
+            if col in fund and fund[col] is not None:
+                result[col] = float(fund[col])
+
+        # fcf_yield precisa do preço de mercado (fcf / market_cap)
+        fcf_raw = fund.get("_fcf_raw") or fund.get("fcf_raw")
+        if fcf_raw is not None and price > 0:
+            # Estimativa grosseira: market_cap = preço × shares (não temos shares)
+            # Usamos o fcf_yield directamente se disponível do Tiingo
+            if "fcf_yield" in fund and fund["fcf_yield"] is not None:
+                result["fcf_yield"] = float(fund["fcf_yield"])
+            # EDGAR/yfinance: não temos shares outstanding, guardamos fcf_raw
+            # para diagnóstico mas não calculamos yield sem market cap real
+
+    return result
+
+
+def _compute_alpha_targets_row(
+    row: pd.Series,
+    price_cache: dict[str, pd.DataFrame],
+    spy_hist: Optional[pd.DataFrame],
+    horizon_days: int = 90,
+) -> dict:
+    """Computa alpha_90d para uma linha do parquet.
+
+    alpha_90d = log1p(stock_return_90d) - log1p(spy_return_90d)
+    onde os retornos são calculados a partir do preço de entrada até T+90d.
+    """
+    import math
+
+    result = {
+        "alpha_90d":    float("nan"),
+        "close_90d":    float("nan"),
+        "spy_close_90d": float("nan"),
+    }
+
+    ticker     = str(row["ticker"])
+    alert_date = pd.Timestamp(row["alert_date"]).tz_localize(None)
+    price      = float(row.get("price", 0) or 0)
+
+    if price <= 0:
+        return result
+
+    hist = price_cache.get(ticker)
+    if hist is None or hist.empty:
+        return result
+
+    exit_date = alert_date + pd.Timedelta(days=horizon_days)
+
+    # Preço do stock em T+90d (fecha mais próximo dentro da janela)
+    fwd = hist[(hist.index > alert_date) & (hist.index <= exit_date)]
+    if len(fwd) < 5:   # mínimo de 5 dias úteis na janela
+        return result
+
+    close_90d = float(fwd["Close"].iloc[-1])
+    stock_ret = close_90d / price - 1.0
+    if not math.isfinite(stock_ret) or abs(stock_ret) > 2.0:   # cap a ±200%
+        return result
+
+    # SPY no mesmo período
+    if spy_hist is not None and not spy_hist.empty:
+        spy_entry_slice = spy_hist[spy_hist.index <= alert_date]
+        spy_exit_slice  = spy_hist[(spy_hist.index > alert_date) & (spy_hist.index <= exit_date)]
+        if not spy_entry_slice.empty and not spy_exit_slice.empty:
+            spy_price = float(spy_entry_slice["Close"].iloc[-1])
+            spy_close = float(spy_exit_slice["Close"].iloc[-1])
+            if spy_price > 0:
+                spy_ret = spy_close / spy_price - 1.0
+                if math.isfinite(spy_ret) and abs(spy_ret) <= 1.0:
+                    result["alpha_90d"]     = round(math.log1p(stock_ret) - math.log1p(spy_ret), 6)
+                    result["close_90d"]     = round(stock_ret, 6)
+                    result["spy_close_90d"] = round(spy_ret, 6)
+                    return result
+
+    # Sem SPY: guarda só o retorno absoluto (alpha vs SPY não disponível)
+    if math.isfinite(stock_ret):
+        result["close_90d"] = round(stock_ret, 6)
+    return result
+
+
 def regenerate(
     in_path: Path,
     out_path: Path,
     cache_dir: Path,
     start_date: str = "1995-01-01",
+    add_fundamentals: bool = True,
+    add_targets: bool = True,
+    add_features: bool = True,
 ) -> None:
-    """Pipeline principal."""
+    """Pipeline principal de regeneração."""
     if not in_path.exists():
         raise FileNotFoundError(f"input parquet não encontrado: {in_path}")
 
@@ -287,59 +405,107 @@ def regenerate(
 
     # ── Fetch macro + ETFs ──────────────────────────────────────────────────
     log.info("[fetch] macro + sector ETFs...")
-    macro_etf_cache = _fetch_batch(
-        MACRO_TICKERS + SECTOR_ETFS,
-        cache_dir,
-        start=start_date,
-    )
-    macro_cache = {k: v for k, v in macro_etf_cache.items() if k in MACRO_TICKERS}
+    macro_etf_cache = _fetch_batch(MACRO_TICKERS + SECTOR_ETFS, cache_dir, start=start_date)
+    macro_cache      = {k: v for k, v in macro_etf_cache.items() if k in MACRO_TICKERS}
     sector_etf_cache = {k: v for k, v in macro_etf_cache.items() if k in SECTOR_ETFS}
-    # SPY conta como sector_etf fallback
     if "SPY" in macro_cache:
         sector_etf_cache.setdefault("SPY", macro_cache["SPY"])
+    spy_hist = macro_cache.get("SPY")
     log.info(f"[fetch] macro={len(macro_cache)} sector_etfs={len(sector_etf_cache)}")
 
-    # ── Fetch ticker histories ──────────────────────────────────────────────
+    # ── Fetch ticker price histories ──────────────────────────────────────────
     unique_tickers = sorted(df["ticker"].astype(str).unique().tolist())
     log.info(f"[fetch] {len(unique_tickers)} ticker histories...")
     price_cache = _fetch_batch(unique_tickers, cache_dir, start=start_date)
     log.info(f"[fetch] {len(price_cache)}/{len(unique_tickers)} tickers OK")
+    missing_tickers = [t for t in unique_tickers if t not in price_cache]
+    if missing_tickers:
+        log.warning(f"[fetch] {len(missing_tickers)} tickers sem history: {missing_tickers[:10]}...")
 
-    # Tickers sem history vão usar fallbacks (não fica null no parquet)
-    missing = [t for t in unique_tickers if t not in price_cache]
-    if missing:
-        log.warning(f"[fetch] {len(missing)} tickers sem history: {missing[:10]}...")
-
-    # ── Compute features per row ────────────────────────────────────────────
-    log.info("[compute] features por linha...")
     t0 = time.time()
-    results = []
-    for i, (_, row) in enumerate(df.iterrows()):
-        results.append(_compute_row_features(row, price_cache, sector_etf_cache, macro_cache))
-        if (i + 1) % 2000 == 0 or (i + 1) == len(df):
-            elapsed = time.time() - t0
-            log.info(f"  [{i+1:>5}/{len(df)}] {elapsed:.0f}s elapsed")
 
-    new_cols_df = pd.DataFrame(results, index=df.index)
+    # ── 1. Features técnicas ─────────────────────────────────────────────────
+    if add_features:
+        log.info("[compute] features técnicas por linha...")
+        feat_results = []
+        for i, (_, row) in enumerate(df.iterrows()):
+            feat_results.append(_compute_row_features(row, price_cache, sector_etf_cache, macro_cache))
+            if (i + 1) % 2000 == 0 or (i + 1) == len(df):
+                log.info(f"  [features] [{i+1:>5}/{len(df)}] {time.time()-t0:.0f}s")
+        feat_df = pd.DataFrame(feat_results, index=df.index)
+        for col in NEW_FEATURE_COLS:
+            df[col] = feat_df[col].values
+        log.info(f"[compute] features técnicas: OK ({len(NEW_FEATURE_COLS)} colunas)")
 
-    # ── Merge + save ────────────────────────────────────────────────────────
-    for col in NEW_FEATURE_COLS:
-        df[col] = new_cols_df[col].values
+    # ── 2. Fundamentais PIT ───────────────────────────────────────────────────
+    if add_fundamentals:
+        log.info("[compute] fundamentais point-in-time...")
+        log.info("  Camadas: Tiingo → SEC EDGAR XBRL → yfinance quarterly")
+        fund_results = []
+        n_has_data = 0
+        t1 = time.time()
+        for i, (_, row) in enumerate(df.iterrows()):
+            r = _compute_pit_fundamentals_row(row, cache_dir)
+            fund_results.append(r)
+            if any(v != 0.0 for v in r.values()):
+                n_has_data += 1
+            if (i + 1) % 1000 == 0 or (i + 1) == len(df):
+                log.info(
+                    f"  [fund] [{i+1:>5}/{len(df)}] com_dados={n_has_data} "
+                    f"({n_has_data/(i+1):.0%}) {time.time()-t1:.0f}s"
+                )
+        fund_df = pd.DataFrame(fund_results, index=df.index)
+        for col in FUNDAMENTAL_COLS:
+            df[col] = fund_df[col].values
+        log.info(
+            f"[compute] fundamentais PIT: {n_has_data}/{len(df)} linhas com dados "
+            f"({n_has_data/len(df):.0%})"
+        )
 
-    log.info(f"[out] writing {out_path}...")
+    # ── 3. Targets alpha_90d ──────────────────────────────────────────────────
+    if add_targets:
+        log.info("[compute] targets alpha_90d...")
+        target_results = []
+        n_resolved = 0
+        for i, (_, row) in enumerate(df.iterrows()):
+            r = _compute_alpha_targets_row(row, price_cache, spy_hist, horizon_days=90)
+            target_results.append(r)
+            import math
+            if math.isfinite(r.get("alpha_90d", float("nan"))):
+                n_resolved += 1
+            if (i + 1) % 2000 == 0 or (i + 1) == len(df):
+                log.info(
+                    f"  [targets] [{i+1:>5}/{len(df)}] resolved={n_resolved} "
+                    f"({n_resolved/(i+1):.0%}) {time.time()-t0:.0f}s"
+                )
+        target_df = pd.DataFrame(target_results, index=df.index)
+        for col in TARGET_COLS:
+            df[col] = target_df[col].values
+        log.info(
+            f"[compute] alpha_90d: {n_resolved}/{len(df)} linhas resolvidas "
+            f"({n_resolved/len(df):.0%})"
+        )
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    log.info(f"[out] a escrever {out_path}...")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
-    log.info(f"[out] done. shape={df.shape}  size={out_path.stat().st_size/1e6:.1f} MB")
+    elapsed = time.time() - t0
+    log.info(f"[out] CONCLUÍDO em {elapsed:.0f}s. shape={df.shape}  size={out_path.stat().st_size/1e6:.1f} MB")
 
-    # Sanity stats
-    log.info("[stats] new feature summary:")
-    for col in NEW_FEATURE_COLS:
-        s = df[col]
-        log.info(
-            f"  {col:24s} mean={s.mean():>8.4f}  std={s.std():>7.4f}  "
-            f"min={s.min():>8.4f}  max={s.max():>8.4f}  "
-            f"nan={s.isna().sum()}"
-        )
+    # Sanity stats finais
+    log.info("[stats] resumo das colunas novas/corrigidas:")
+    for col in NEW_FEATURE_COLS + FUNDAMENTAL_COLS + TARGET_COLS:
+        if col not in df.columns:
+            continue
+        s = df[col].dropna()
+        if len(s) == 0:
+            log.info(f"  {col:28s} — SEM DADOS")
+        else:
+            log.info(
+                f"  {col:28s} n={len(s):>6} mean={s.mean():>9.4f} "
+                f"std={s.std():>8.4f} nan={df[col].isna().sum()}"
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,11 +513,17 @@ def regenerate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description="Regenera o parquet de treino com PIT fundamentais + alpha_90d")
     p.add_argument("--in",  dest="in_path",  type=Path, default=DEFAULT_IN)
     p.add_argument("--out", dest="out_path", type=Path, default=DEFAULT_OUT)
     p.add_argument("--cache", dest="cache_dir", type=Path, default=DEFAULT_CACHE_DIR)
     p.add_argument("--start", dest="start_date", default="1995-01-01")
+    p.add_argument("--fundamentals-only", action="store_true",
+                   help="Só actualiza fundamentais PIT, mantém features e targets")
+    p.add_argument("--targets-only", action="store_true",
+                   help="Só adiciona/actualiza alpha_90d")
+    p.add_argument("--no-fundamentals", action="store_true",
+                   help="Pula a fase de fundamentais PIT (mais rápido)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -361,7 +533,27 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    regenerate(args.in_path, args.out_path, args.cache_dir, args.start_date)
+    add_fundamentals = not args.no_fundamentals
+    add_features     = not args.fundamentals_only and not args.targets_only
+    add_targets      = not args.fundamentals_only
+
+    if args.fundamentals_only:
+        add_fundamentals = True
+        add_features     = False
+        add_targets      = False
+    if args.targets_only:
+        add_fundamentals = False
+        add_features     = False
+        add_targets      = True
+
+    log.info(f"Modo: features={add_features} fundamentais={add_fundamentals} targets={add_targets}")
+
+    regenerate(
+        args.in_path, args.out_path, args.cache_dir, args.start_date,
+        add_fundamentals=add_fundamentals,
+        add_targets=add_targets,
+        add_features=add_features,
+    )
     return 0
 
 
