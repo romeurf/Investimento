@@ -349,7 +349,7 @@ def _fetch_history(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
     try:
         import yfinance as yf
         df = yf.Ticker(symbol).history(start=start.isoformat(), end=end.isoformat(),
-                                        auto_adjust=True, raise_errors=False)
+                                        auto_adjust=True)
         if df is None or df.empty:
             return pd.DataFrame()
         # tz_localize(None) falha em índices já timezone-aware (common em yfinance ≥0.2).

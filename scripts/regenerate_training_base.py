@@ -155,11 +155,11 @@ def _fetch_one_ticker(
                 start=start,
                 end=end,
                 auto_adjust=True,
-                raise_errors=False,
             )
             if df is not None and not df.empty:
-                # Drop tz para uniformizar com slices
-                df.index = pd.to_datetime(df.index).tz_localize(None)
+                # tz_convert(None) remove timezone de índices UTC-aware (yfinance >= 0.2)
+                idx = pd.DatetimeIndex(df.index)
+                df.index = idx.tz_convert(None) if idx.tz is not None else idx
                 df = df[["Open", "High", "Low", "Close", "Volume"]]
                 df.to_parquet(cache_file)
                 return df
@@ -345,7 +345,8 @@ def _compute_alpha_targets_row(
     }
 
     ticker     = str(row["ticker"])
-    alert_date = pd.Timestamp(row["alert_date"]).tz_localize(None)
+    _ts        = pd.Timestamp(row["alert_date"])
+    alert_date = _ts.tz_convert(None) if _ts.tz is not None else _ts
     price      = float(row.get("price", 0) or 0)
 
     if price <= 0:

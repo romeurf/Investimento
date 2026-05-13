@@ -160,7 +160,7 @@ def _resolve_snapshot_outcomes(snap: pd.DataFrame,
         end   = (mature["alert_date"].max() + pd.Timedelta(days=horizon_days + 10)).date()
         spy_hist = yf.Ticker("SPY").history(
             start=start.isoformat(), end=end.isoformat(),
-            auto_adjust=True, raise_errors=False,
+            auto_adjust=True,
         )
         if spy_hist is not None and not spy_hist.empty:
             spy_close = {
