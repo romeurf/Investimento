@@ -1872,11 +1872,11 @@ def main() -> None:
         next_time = getattr(job, "next_run_time", "Pendente (aguarda arranque do scheduler)")
         logging.info(f"  • {job.name} — próxima execução: {next_time}")
 
+    _now = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
     send_telegram(
-        f"🤖 *DipRadar iniciado*\n"
-        f"_{datetime.now(LISBON_TZ).strftime('%d/%m/%Y %H:%M')}_\n"
-        f"Scans: EU 17h45 | US 21h15\n"
-        f"Backup: 23h30 → /data/backups/"
+        f"\U0001F916 DipRadar iniciado\n"
+        f"{_now}\n"
+        f"Scans: EU 17h45 | US 21h15"
     )
 
     scheduler.start()
