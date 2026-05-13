@@ -18,7 +18,12 @@ CALIBRATOR_THRESHOLD: float = 0.07         # 7% de alpha — ligeiramente mais a
 WINSOR_PCT: float = 0.005
 WINSOR_ABS_LO: float = -0.50
 WINSOR_ABS_HI: float = 2.00
-HALF_LIFE_DAYS: int = 548
+# Half-life do decay temporal dos pesos de treino.
+# 730d (2 anos) → um alerta de 2020 pesa ~25% vs um alerta de hoje.
+# 548d era demasiado agressivo — descartava crashes de 2022 e COVID.
+# Aumento para 730d preserva crises históricas como sinal de treino válido.
+# Formula: weight = 2^(-days_since / HALF_LIFE_DAYS)
+HALF_LIFE_DAYS: int = 730
 
 N_FOLDS: int = 10
 PURGE_DAYS: int = 90

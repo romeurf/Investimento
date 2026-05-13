@@ -1245,6 +1245,28 @@ def _handle_admin_retrain(parts: list[str]) -> None:
                 "",
             ]
 
+        # Comparação detalhada candidato vs produção (para PENDING / KEPT_FLOOR)
+        detail = result.get("comparison_detail") or {}
+        if detail and decision in ("PENDING", "KEPT_FLOOR"):
+            rows = detail.get("rows", [])
+            improved = detail.get("improved", [])
+            worsened = detail.get("worsened", [])
+            rec      = detail.get("recommendation", "")
+            if rows:
+                lines += ["", "*🔍 O que mudou vs modelo actual:*"]
+                for r in rows:
+                    cval = f"{r['cand']}" if r['cand'] is not None else "N/A"
+                    pval = f"{r['prod']}" if r['prod'] is not None else "N/A"
+                    if r.get("delta_pct") is not None:
+                        sign = "+" if r["delta_pct"] >= 0 else ""
+                        delta_str = f"({sign}{r['delta_pct']:.1f}%)"
+                        em = "✓" if r.get("improved") else "❌" if r.get("improved") is False else "—"
+                    else:
+                        delta_str, em = "", "—"
+                    lines.append(f"  {em} *{r['label']}*: {cval} ← {pval} {delta_str}")
+            if rec:
+                lines += ["", f"_💡 {rec}_"]
+
         if decision == "PENDING":
             lines.append("_Bundle guardado como `dip_models_pending.pkl` — revisão manual._")
         elif decision == "PROMOTED":
@@ -1310,6 +1332,55 @@ def _handle_admin_set_floor(parts: list[str]) -> None:
         "_Aplicado no próximo `/admin_retrain` ou cron mensal._"
     )
     logging.info(f"[admin_set_floor] {result['old']:.4f} → {result['new']:.4f}")
+
+# ── /performance ─────────────────────────────────────────────────────────────────
+
+def _handle_performance(parts: list[str]) -> None:
+    """/performance [YYYY-MM-DD] [score_min]
+
+    Simula o portfolio DipRadar e calcula retorno anual, Sharpe e max drawdown.
+
+    Exemplos:
+      /performance               → todo o histórico disponível
+      /performance 2025-01-01    → desde Jan 2025
+      /performance 2024-01-01 65 → desde Jan 2024, score mínimo 65
+    """
+    _reply(
+        "⏳ *A calcular performance do portfolio...*\n"
+        "_Lê o alert\\_db.csv e simula seguir todas as recomendações. Pode demorar 30s._"
+    )
+
+    def _run():
+        try:
+            from portfolio_simulator import run_portfolio_backtest, format_portfolio_result
+
+            period_start = None
+            score_min    = 60.0
+
+            for p in parts[1:]:
+                p = p.strip()
+                try:
+                    float(p)
+                    score_min = float(p)
+                    continue
+                except ValueError:
+                    pass
+                if len(p) == 10 and p[4] == "-":
+                    period_start = p
+
+            result = run_portfolio_backtest(
+                period_start=period_start,
+                score_threshold=score_min,
+            )
+            _reply(format_portfolio_result(result))
+        except RuntimeError as e:
+            _reply(f"⚠️ *Performance:* {e}\n_Certifica-te que o alert\\_db.csv tem outcomes preenchidos. Usa /mldata update._")
+        except Exception as e:
+            logging.error(f"[performance] {e}", exc_info=True)
+            _reply(f"❌ *Erro ao calcular performance:*\n`{_md_safe(e)}`")
+
+    threading.Thread(target=_run, daemon=True, name="performance").start()
+
 
 # ── /themes · /add_theme · /remove_theme ────────────────────────────────────────
 
@@ -1994,6 +2065,7 @@ def _handle_command(text: str) -> None:
             "`/allocate <TICK>`         → Sugestão de alocação read-only (categoria + sizing)\n"
             "`/mldata`                  → Stats da base de dados ML\n"
             "`/mldata update`           → Forçar update de outcomes\n"
+            "`/performance [data] [score]` → Simular portfolio: retorno anual + risco\n"
             "`/themes`                  → Ver temas/trends activos (fotónica, GLP-1, IA...)\n"
             "`/add_theme <k> <l> <T>` → Adicionar tema (key label TICK1,TICK2 [conf])\n"
             "`/remove_theme <key>`      → Remover tema\n"
@@ -2204,6 +2276,10 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/retrigger":
         _handle_admin_retrain(["admin_retrain"])
+
+    elif cmd in ("/performance", "/returns", "/portfolio_performance"):
+        if not _check_rate(cmd_key): return
+        _handle_performance(parts)
 
     elif cmd == "/themes":
         if not _check_rate(cmd_key): return

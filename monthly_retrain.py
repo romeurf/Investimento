@@ -481,6 +481,79 @@ def set_floor_rho_alpha(value: float, *, comment: Optional[str] = None) -> dict:
 # Walk-forward gating + atomic deploy (v3)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _build_comparison_detail(
+    cand: dict[str, Optional[float]],
+    prod: dict[str, Optional[float]],
+) -> dict:
+    """Compara métricas candidato vs produção e produz análise legível.
+
+    Retorna dict com:
+      - rows: lista de (label, cand_val, prod_val, delta_pct, improved)
+      - improved: lista de métricas que melhoraram
+      - worsened: lista de métricas que pioraram
+      - recommendation: texto de aconselhamento
+    """
+    def _pct_change(new, old):
+        if old is None or old == 0 or new is None:
+            return None
+        return (new - old) / abs(old) * 100
+
+    metrics_cfg = [
+        # (key, label, higher_is_better)
+        ("rho_alpha_mean", "Qualidade preditiva (IC)", True),
+        ("topk_pnl_mean",  "Retorno top stocks",       True),
+        ("brier_oof",      "Calibração (Brier)",        False),  # lower is better
+    ]
+
+    rows = []
+    improved, worsened = [], []
+
+    for key, label, higher_better in metrics_cfg:
+        c_val = cand.get(key)
+        p_val = prod.get(key)
+        delta = _pct_change(c_val, p_val)
+
+        if delta is not None:
+            got_better = (delta > 0) if higher_better else (delta < 0)
+            if abs(delta) >= 3:   # ignorar variações < 3%
+                (improved if got_better else worsened).append(label)
+        else:
+            got_better = None
+
+        rows.append({
+            "label":       label,
+            "cand":        round(c_val, 4) if c_val is not None else None,
+            "prod":        round(p_val, 4) if p_val is not None else None,
+            "delta_pct":   round(delta, 1) if delta is not None else None,
+            "improved":    got_better,
+        })
+
+    # Conselho baseado na análise
+    if not worsened:
+        rec = "Todas as métricas mantiveram-se ou melhoraram. Considera baixar o floor."
+    elif not improved:
+        rec = "Todas as métricas pioraram. Aguardar mais dados de treino."
+    elif "Qualidade preditiva (IC)" in worsened:
+        rec = (
+            "IC piorou — o modelo é menos preciso a ordenar oportunidades. "
+            "Aguardar próximo mês. Se persistir, revê a qualidade dos dados."
+        )
+    elif "Calibração (Brier)" in improved:
+        rec = (
+            "IC ligeiramente pior mas calibração melhorou. O modelo é mais conservador "
+            "mas as probabilidades são mais fiáveis. Considera baixar o threshold de gating."
+        )
+    else:
+        rec = "Resultado misto. Analisa o candidato manualmente antes de promover."
+
+    return {
+        "rows":           rows,
+        "improved":       improved,
+        "worsened":       worsened,
+        "recommendation": rec,
+    }
+
+
 def gate_and_promote_v3(
     cand_metrics: dict[str, Optional[float]],
     prod_metrics: dict[str, Optional[float]],
@@ -532,6 +605,7 @@ def gate_and_promote_v3(
             **base_result,
             "decision": "KEPT_FLOOR",
             "reason":   f"candidate ρ_α {cand_rho:.4f} < floor {floor:.4f}",
+            "comparison_detail": _build_comparison_detail(cand_metrics, prod_metrics),
         }
 
     if prod_rho is None:
@@ -561,6 +635,7 @@ def gate_and_promote_v3(
             f"candidate ρ_α {cand_rho:.4f} < {prod_rho:.4f} × {gating_ratio} "
             f"= {threshold:.4f}; guardado como pending para revisão manual"
         ),
+        "comparison_detail": _build_comparison_detail(cand_metrics, prod_metrics),
     })
 
 
