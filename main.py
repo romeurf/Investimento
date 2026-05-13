@@ -1040,6 +1040,20 @@ def build_alert(
     if ml_result is not None:
         ml_line = f"\n{ml_badge(ml_result)}"
 
+    # Tema/trend (Chunk 7) — identifica se o stock está num sector em trend
+    theme_line = ""
+    try:
+        from themes import get_stock_themes, format_theme_tag
+        matched_themes = get_stock_themes(
+            ticker=symbol,
+            sector=sector,
+            company_name=name,
+        )
+        if matched_themes:
+            theme_line = f"\n{format_theme_tag(matched_themes)}"
+    except Exception:
+        pass
+
     # ── Resumo em linguagem simples (1-2 frases no topo) ─────────────────────
     plain_summary = _build_plain_summary(
         name=name, symbol=symbol, change=change,
@@ -1056,6 +1070,7 @@ def build_alert(
         f"{valuation_block}"
         f"\n*Categoria:* {category}\n"
         f"{score_line}"
+        f"{theme_line}"
         f"{ml_line}\n"
         f"{score_breakdown}\n"
         f"\n*Estratégia:* {strategy}"

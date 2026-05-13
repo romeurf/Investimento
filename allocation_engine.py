@@ -137,6 +137,7 @@ class AllocationContext:
     is_etf:                bool                 = False
     is_bluechip:           bool                 = False    # is_bluechip(fund) — derivado
     sector:                str                  = ""
+    company_name:          str                  = ""       # para match de temas por keyword
     drawdown_52w:          float | None         = None     # negativo (-0.35) ou None
     dividend_yield:        float | None         = None     # 0.025 = 2.5%
     classify_category:     str | None           = None     # legado — output de classify_dip_category
@@ -406,7 +407,18 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
         amount *= _SECTOR_BONUS
         notes.append(f"Sector premium ×{_SECTOR_BONUS:.2f}")
 
-    # 5) Concentration cap (% do portfolio actual) — não aplica a CORE
+    # 5) Bonus de tema/trend (ex: fotónica, GLP-1, IA) — não aplica a CORE
+    if category != CAT_CORE:
+        try:
+            from themes import get_theme_bonus
+            theme_mult = get_theme_bonus(ctx.ticker, ctx.sector, ctx.company_name)
+            if theme_mult > 1.0:
+                amount *= theme_mult
+                notes.append(f"Tema em trend x{theme_mult:.2f}")
+        except Exception:
+            pass  # themes.py opcional — nunca bloqueia
+
+    # 6) Concentration cap (% do portfolio actual) — não aplica a CORE
     if category != CAT_CORE:
         cap_pct = _CAP_PCT_HIGH_CONVICTION if category == CAT_HIGH_CONVICTION else _CAP_PCT_DEFAULT
         if ctx.existing_position_pct >= cap_pct:
