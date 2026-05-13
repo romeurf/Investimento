@@ -1070,12 +1070,16 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
     flags = [p for p in parts[1:] if p.startswith("--")]
     mode_str = " ".join(flags) if flags else "completo"
 
+    _targets_only = "--targets-only" in flags
+    _dur = "~10-20 min" if _targets_only else "3-5h (1ª vez) | ~30 min (re-run com cache)"
     _reply(
         f"⚙️ *Regeneração de parquet — modo: {mode_str}*\n"
-        f"_A reconstruir ml_training_base.parquet com:_\n"
-        f"  • Fundamentais PIT (Tiingo → EDGAR → yfinance quarterly)\n"
-        f"  • Target alpha\\_90d (horizonte correcto)\n\n"
-        f"_Duração estimada: {'~10 min' if '--targets-only' in flags else '45-90 min (1ª vez)'}_\n"
+        f"_A reconstruir ml\\_training\\_base.parquet com:_\n"
+        + ("  • Target alpha\\_90d\n" if _targets_only else
+           "  • Fundamentais PIT (EDGAR → yfinance quarterly)\n"
+           "  • Target alpha\\_90d (horizonte correcto)\n")
+        + f"\n_Cache persistido em /data/price\\_cache — retoma onde parou se interrompido._\n"
+        f"_Duração estimada: {_dur}_\n"
         f"_Podes continuar a usar o bot enquanto isto corre._"
     )
     logging.info(f"[regen] Iniciando regeneração modo={mode_str}")
@@ -1106,32 +1110,45 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
                 return
 
             args += ["--in", str(pq), "--out", str(pq)]
+            # Cache em /data/ (persistido no Railway Volume) para não perder
+            # o progresso em restarts. /tmp seria apagado e obrigaria re-download.
+            cache_dir = data_dir / "price_cache"
+            args += ["--cache", str(cache_dir)]
+
+            # Timeout generoso: full regen com EDGAR + 700 tickers demora 3-5h
+            # na 1ª execução; com cache (re-runs) demora ~20-30 min.
+            _TIMEOUT = 6 * 3600  # 6 horas
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=7200  # 2h timeout
+                args, capture_output=True, text=True, timeout=_TIMEOUT
             )
             if result.returncode == 0:
-                # Verificar se alpha_90d ficou no parquet
                 try:
                     import pandas as pd
                     df_check = pd.read_parquet(pq)
-                    n_90d = int(df_check["alpha_90d"].notna().sum()) if "alpha_90d" in df_check.columns else 0
-                    total = len(df_check)
+                    n_90d  = int(df_check["alpha_90d"].notna().sum()) if "alpha_90d" in df_check.columns else 0
+                    n_fund = int((df_check.get("gross_margin", pd.Series()) != 0.35).sum()) if "gross_margin" in df_check.columns else 0
+                    total  = len(df_check)
                     _reply(
                         f"✅ *Parquet regenerado com sucesso!*\n"
                         f"  Shape: {df_check.shape[0]:,} × {df_check.shape[1]} colunas\n"
-                        f"  alpha\\_90d resolvido: *{n_90d:,}/{total:,}* ({n_90d/total:.0%})\n\n"
+                        f"  alpha\\_90d resolvido: *{n_90d:,}/{total:,}* ({n_90d/total:.0%})\n"
+                        f"  Fundamentais PIT: *{n_fund:,}/{total:,}* linhas com dados reais\n\n"
                         f"_Podes agora fazer `/admin_retrain` para treinar o modelo._"
                     )
                 except Exception as e:
-                    _reply(f"✅ *Parquet regenerado.* (verificação pós erro: {e})\n_Faz `/admin_retrain`._")
+                    _reply(f"✅ *Parquet regenerado.* (verificação: {e})\n_Faz `/admin_retrain`._")
             else:
-                stderr = result.stderr[-800:] if result.stderr else "sem stderr"
+                stderr = (result.stderr or "")[-800:]
                 _reply(
                     f"❌ *Regeneração falhou* (exit {result.returncode})\n"
                     f"`{stderr}`"
                 )
         except subprocess.TimeoutExpired:
-            _reply("⚠️ *Regeneração excedeu o timeout de 2h.* Verifica os logs do Railway.")
+            _reply(
+                "⚠️ *Regeneração excedeu 6h.* O Railway pode ter reiniciado o container.\n"
+                "_O progresso já descarregado está em cache — tenta novamente com `/admin_regen_parquet`._\n"
+                "_Para uma opção mais rápida: `/admin_regen_parquet --targets-only` (~10 min)._"
+            )
         except Exception as e:
             logging.error(f"[regen] {e}", exc_info=True)
             _reply(f"❌ *Erro na regeneração:*\n`{_md_safe(e)}`")

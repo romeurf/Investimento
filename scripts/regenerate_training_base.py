@@ -58,9 +58,13 @@ log = logging.getLogger("regen")
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_IN  = Path("ml_training_base.parquet")
-DEFAULT_OUT = Path("ml_training_base.parquet")
-DEFAULT_CACHE_DIR = Path("/tmp/yf_cache_v2")
+_DATA_VOL = Path("/data") if Path("/data").exists() else Path("/tmp")
+
+DEFAULT_IN  = _DATA_VOL / "ml_training_base.parquet"
+DEFAULT_OUT = _DATA_VOL / "ml_training_base.parquet"
+# Cache em /data/ (Railway Volume persistido) para não re-descarregar em cada restart.
+# /tmp seria apagado em cada container restart, obrigando a re-download completo.
+DEFAULT_CACHE_DIR = _DATA_VOL / "price_cache"
 
 MACRO_TICKERS: list[str] = ["SPY", "^VIX", "^TNX"]
 SECTOR_ETFS: list[str] = [
