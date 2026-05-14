@@ -371,20 +371,24 @@ def _build_watchlist_alert(
     # Aviso de payout ratio elevado (paga mais dividendos do que ganha)
     payout_ratio  = float(data.get("payout_ratio") or 0)
     div_yield_val = float(data.get("div_yield") or 0)
+    sector_str    = (data.get("sector") or "").lower()
+    # REITs (Real Estate) e algumas Utilities são legalmente obrigados a distribuir
+    # 90%+ dos lucros. O payout ratio GAAP > 100% é NORMAL — usam FFO/AFFO como
+    # métrica real (ex: Realty Income tem AFFO payout ~73%, que é saudável).
+    # Não mostrar aviso para estes sectores.
+    is_reit_like  = any(s in sector_str for s in ("real estate", "mortgage", "utilities"))
     payout_warn   = ""
-    if div_yield_val > 0 and payout_ratio > 1.0:
+    if div_yield_val > 0 and payout_ratio > 1.0 and not is_reit_like:
         payout_pct = payout_ratio * 100
         if payout_ratio > 1.5:
             payout_warn = (
                 f"\n⛔ *ATENÇÃO — Payout ratio {payout_pct:.0f}%!*\n"
-                f"_Esta empresa paga {payout_pct:.0f}% dos lucros em dividendos — "
-                f"claramente insustentável. O dividendo está em risco de corte._"
+                f"_Esta empresa paga {payout_pct:.0f}% dos lucros — insustentável. Dividendo em risco de corte._"
             )
         else:
             payout_warn = (
                 f"\n⚠️ *Payout ratio {payout_pct:.0f}%*\n"
-                f"_Paga mais de 100% dos lucros em dividendos. "
-                f"Verifica se é FCF-based (REITs usam FFO) ou se está a ser financiado por dívida._"
+                f"_Paga mais de 100% dos lucros GAAP. Verifica se FCF cobre o dividendo._"
             )
 
     lines = [
@@ -501,7 +505,13 @@ def build_watchlist_morning_summary(direct_tickers: set | list) -> str:
             f"  {slot_e} *{symbol}*{port_tag}{hit_tag}{cat_tag} — "
             f"${data['price']:.2f} | 52w \u2193{data['drawdown']:.0f}% | "
             f"Yield {data.get('div_yield', 0):.1f}%"
-            + (" \u26a0\ufe0fPay>100%" if (data.get("payout_ratio") or 0) > 1.0 else "")
+            + (
+                " (FFO)" if (data.get("payout_ratio") or 0) > 1.0 and any(
+                    s in (data.get("sector") or "").lower()
+                    for s in ("real estate", "mortgage", "utilities")
+                )
+                else (" \u26a0\ufe0fPay>100%" if (data.get("payout_ratio") or 0) > 1.0 else "")
+            )
         )
     lines.append(f"\n_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)

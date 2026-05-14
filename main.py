@@ -1018,10 +1018,13 @@ def build_alert(
     rsi_part = f" | RSI: {rsi_str}" if rsi_str else ""
 
     # Aviso de payout ratio insustentável (quando empresa paga dividendos)
-    _div_yield  = float(fundamentals.get("dividend_yield") or 0)
-    _payout_raw = float(fundamentals.get("payoutRatio") or fundamentals.get("payout_ratio") or 0)
+    # REITs e Utilities: payout GAAP > 100% é NORMAL (usam FFO/AFFO). Não avisar.
+    _div_yield    = float(fundamentals.get("dividend_yield") or 0)
+    _payout_raw   = float(fundamentals.get("payoutRatio") or fundamentals.get("payout_ratio") or 0)
+    _sector_lower = (sector or "").lower()
+    _is_reit_like = any(s in _sector_lower for s in ("real estate", "mortgage", "utilities"))
     payout_warn = ""
-    if _div_yield > 0 and _payout_raw > 1.0:
+    if _div_yield > 0 and _payout_raw > 1.0 and not _is_reit_like:
         _pr_pct = _payout_raw * 100
         if _payout_raw > 1.5:
             payout_warn = (
@@ -1030,8 +1033,8 @@ def build_alert(
             )
         else:
             payout_warn = (
-                f"\n⚠️ *Payout ratio {_pr_pct:.0f}%* — acima de 100% dos lucros. "
-                f"Verifica se é FCF-based (REITs usam FFO) ou financiado por dívida."
+                f"\n⚠️ *Payout ratio {_pr_pct:.0f}%* — acima de 100% dos lucros GAAP. "
+                f"Verifica se o FCF cobre o dividendo."
             )
 
     # FIX: pass sector as third argument (required by format_valuation_block)
