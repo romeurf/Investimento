@@ -213,6 +213,29 @@ def send_telegram(message: str, retries: int = 2) -> bool:
                 r.raise_for_status()
                 sent = True
                 break
+            except requests.exceptions.HTTPError as e:
+                # 400 = Markdown inválido → retry sem parse_mode (plain text)
+                # garante que a mensagem chega mesmo com chars especiais
+                if e.response is not None and e.response.status_code == 400:
+                    logging.warning(
+                        f"Telegram Markdown 400 (tentativa {attempt+1}) — "
+                        f"a reenviar como plain text. Primeiros 120 chars: "
+                        f"{chunk[:120]!r}"
+                    )
+                    try:
+                        r2 = requests.post(url, json={
+                            "chat_id": TELEGRAM_CHAT_ID, "text": chunk,
+                            "disable_web_page_preview": True,
+                        }, timeout=10)
+                        r2.raise_for_status()
+                        sent = True
+                        break
+                    except Exception as e2:
+                        logging.error(f"Telegram plain-text fallback falhou: {e2}")
+                else:
+                    logging.error(f"Telegram (tentativa {attempt+1}/{retries+1}): {e}")
+                if attempt < retries:
+                    time.sleep(3)
             except Exception as e:
                 logging.error(f"Telegram (tentativa {attempt+1}/{retries+1}): {e}")
                 if attempt < retries: time.sleep(3)

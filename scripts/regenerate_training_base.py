@@ -347,13 +347,19 @@ def _compute_alpha_targets_row(
     ticker     = str(row["ticker"])
     _ts        = pd.Timestamp(row["alert_date"])
     alert_date = _ts.tz_convert(None) if _ts.tz is not None else _ts
-    price      = float(row.get("price", 0) or 0)
-
-    if price <= 0:
-        return result
 
     hist = price_cache.get(ticker)
     if hist is None or hist.empty:
+        return result
+
+    # Entry price: closing price on or just before alert_date.
+    # O parquet de treino não tem coluna "price" — calculamos directamente
+    # da price history. Mais correcto (PIT) do que confiar no campo do parquet.
+    entry_slice = hist[hist.index <= alert_date]
+    if entry_slice.empty:
+        return result
+    price = float(entry_slice["Close"].iloc[-1])
+    if price <= 0 or not math.isfinite(price):
         return result
 
     exit_date = alert_date + pd.Timedelta(days=horizon_days)

@@ -957,7 +957,7 @@ def build_score_breakdown(
             # baked-in via ml_prob multiplier, o que tornaria CONFLICT_FUND
             # inalcançável (ML bear afundaria sempre o final_score < 55).
             fund_score = result.get("fund_only_score", result["final_score"])
-            state, msg = resolve_conflict(fund_score, ml_label)
+            state, msg, _emoji, _sizing = resolve_conflict(fund_score, ml_label)
         except Exception as exc:
             logging.warning(f"[score] conflict_resolver error: {exc}")
             state, msg = None, None
