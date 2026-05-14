@@ -540,39 +540,27 @@ def _monitor_one(
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_daily_check(bot, chat_id: int) -> dict:
-    """
-    Daily surveillance loop. Called by APScheduler in main.py.
+def run_daily_check(send_fn) -> dict:
+    """Vigilância diária de posições activas. Chamado pelo APScheduler em main.py.
 
     Parameters
     ----------
-    bot     : telegram.Bot   Telegram bot instance
-    chat_id : int            Chat ID to send alerts to
-
-    Returns
-    -------
-    dict with summary stats:
-      { n_active, n_take_profit, n_deterioration, n_time_decay,
-        n_improvement, n_routine, n_errors }
+    send_fn : callable
+        Função send_telegram(text) — mesma que o resto do bot usa.
+        Não usa async/await para ser compatível com APScheduler síncrono.
     """
     active = position_db.get_active()
     if not active:
-        logger.info("[monitor] No active positions — daily check skipped")
+        logger.info("[monitor] Sem posições activas — check ignorado")
         return {"n_active": 0}
 
-    logger.info(f"[monitor] Starting daily check — {len(active)} active positions")
+    logger.info(f"[monitor] A verificar {len(active)} posições activas")
 
-    # Load the model bundle once (cached after first load)
     try:
         bundle = load_predictor()
     except FileNotFoundError:
-        logger.error("[monitor] Model bundle not found — aborting daily check")
-        await bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ *Monitor diário falhou*: modelo ML não encontrado. "
-                 "Executa o treino primeiro.",
-            parse_mode="Markdown",
-        )
+        logger.error("[monitor] Bundle ML não encontrado — a abortar check diário")
+        send_fn("Monitor diário falhou: modelo ML não encontrado. Faz /admin_retrain.")
         return {"error": "model_not_found"}
 
     stats = {
@@ -588,43 +576,28 @@ async def run_daily_check(bot, chat_id: int) -> dict:
     for record in active:
         try:
             trigger, msg = _monitor_one(record, bundle)
-
             stats[f"n_{trigger.lower()}"] = stats.get(f"n_{trigger.lower()}", 0) + 1
-
             if msg:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=msg,
-                    parse_mode="Markdown",
-                )
-
+                send_fn(msg)
         except Exception as exc:
             stats["n_errors"] += 1
-            logger.exception(f"[monitor] Error processing {record.ticker}: {exc}")
+            logger.exception(f"[monitor] Erro em {record.ticker}: {exc}")
             try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"⚠️ *Monitor — {record.ticker}*\n"
-                        f"Erro ao processar posição: `{type(exc).__name__}: {exc}`\n"
-                        "_A monitorização dos restantes tickers continua._"
-                    ),
-                    parse_mode="Markdown",
+                send_fn(
+                    f"Monitor {record.ticker}: erro {type(exc).__name__}: {exc}\n"
+                    "Os restantes tickers continuam a ser verificados."
                 )
             except Exception:
-                pass  # Don't let Telegram errors cascade
+                pass
 
     summary = (
-        f"📡 *Vigilante — resumo diário*\n"
-        f"  Activas: {stats['n_active']}  "
-        f"| ✅ TP: {stats['n_take_profit']}  "
-        f"| 🔴 Det: {stats['n_deterioration']}  "
-        f"| ⏰ TD: {stats['n_time_decay']}  "
-        f"| 📈 Imp: {stats['n_improvement']}  "
-        f"| ⚠️ Err: {stats['n_errors']}"
+        f"📡 Vigilante — resumo\n"
+        f"  Activas: {stats['n_active']} | TP: {stats['n_take_profit']} "
+        f"| Det: {stats['n_deterioration']} | TD: {stats['n_time_decay']} "
+        f"| Imp: {stats['n_improvement']} | Err: {stats['n_errors']}"
     )
-    logger.info(f"[monitor] Daily check complete — {summary}")
-    await bot.send_message(chat_id=chat_id, text=summary, parse_mode="Markdown")
+    logger.info(f"[monitor] Check concluído — {summary}")
+    send_fn(summary)
 
     return stats
 

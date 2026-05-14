@@ -75,17 +75,42 @@ def _cache_valid() -> bool:
     return (datetime.utcnow() - _macro_cache_ts).total_seconds() < _CACHE_TTL_SECONDS
 
 
+def _scalar(series, pos: int = -1) -> float:
+    """Extrai um valor escalar de uma pandas Series por posição inteira.
+
+    `.iat[pos]` garante retorno de scalar (não Series), independentemente
+    do tipo de índice ou versão de pandas. Alternativa correta a
+    `float(series.iloc[pos])` que gera FutureWarning em pandas >= 2.x.
+    """
+    return float(series.iat[pos])
+
+
+def _closes(ticker: str, period: str) -> "pd.Series | None":
+    """Descarrega e devolve a série de closes ajustados para um ticker.
+
+    Trata o MultiIndex que yfinance >= 0.2.x retorna para alguns tickers
+    (quando `auto_adjust=True` o Close já está ajustado).
+    Devolve None se insuficiente.
+    """
+    data = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
+    if data is None or data.empty:
+        return None
+    col = data["Close"] if "Close" in data.columns else data.iloc[:, 0]
+    if hasattr(col.columns if hasattr(col, "columns") else col, "get_level_values"):
+        # MultiIndex — tomar a primeira sub-coluna
+        col = col.iloc[:, 0]
+    s = col.dropna()
+    return s if len(s) >= 2 else None
+
+
 def _fetch_pct_change_5d(ticker: str) -> float:
     """% change do ticker nos últimos 5 dias de trading. Negativo = queda."""
     try:
-        data = yf.download(ticker, period="10d", interval="1d", progress=False, auto_adjust=True)
-        if data is None or len(data) < 2:
-            return 0.0
-        closes = data["Close"].dropna()
-        if len(closes) < 2:
+        closes = _closes(ticker, "10d")
+        if closes is None:
             return 0.0
         n = min(5, len(closes) - 1)
-        pct = (float(closes.iloc[-1]) / float(closes.iloc[-(n + 1)]) - 1) * 100
+        pct = (_scalar(closes) / _scalar(closes, -(n + 1)) - 1) * 100
         return round(pct, 4)
     except Exception as e:
         logger.warning(f"_fetch_pct_change_5d({ticker}): {e}")
@@ -95,13 +120,12 @@ def _fetch_pct_change_5d(ticker: str) -> float:
 def _fetch_vix() -> tuple[float, float]:
     """Devolve (vix_actual, vix_pct_1m)."""
     try:
-        data = yf.download("^VIX", period="35d", interval="1d", progress=False, auto_adjust=True)
-        if data is None or len(data) < 2:
+        closes = _closes("^VIX", "35d")
+        if closes is None:
             return 20.0, 0.0
-        closes = data["Close"].dropna()
-        vix_now    = float(closes.iloc[-1])
+        vix_now    = _scalar(closes)
         n          = min(21, len(closes) - 1)
-        vix_1m_ago = float(closes.iloc[-(n + 1)])
+        vix_1m_ago = _scalar(closes, -(n + 1))
         vix_pct_1m = round((vix_now / vix_1m_ago - 1) * 100, 2) if vix_1m_ago > 0 else 0.0
         return round(vix_now, 2), vix_pct_1m
     except Exception as e:
@@ -147,8 +171,10 @@ def _fetch_fred_recession_prob() -> float:
         t10 = yf.download("^TNX", period="5d", interval="1d", progress=False, auto_adjust=True)
         t3m = yf.download("^IRX", period="5d", interval="1d", progress=False, auto_adjust=True)
         if len(t10) > 0 and len(t3m) > 0:
-            y10    = float(t10["Close"].dropna().iloc[-1])
-            y3m_r  = float(t3m["Close"].dropna().iloc[-1])
+            c10 = _closes("^TNX", "5d") or t10["Close"].dropna()
+            c3m = _closes("^IRX", "5d") or t3m["Close"].dropna()
+            y10    = _scalar(c10)
+            y3m_r  = _scalar(c3m)
             y3m    = y3m_r / 100.0 if y3m_r > 10 else y3m_r
             spread = (y10 - y3m) / 100.0
             prob   = 1 / (1 + math.exp(2.5 * spread * 100))
@@ -163,7 +189,10 @@ def _fetch_earnings_yield_spread() -> float:
         t10 = yf.download("^TNX", period="5d", interval="1d", progress=False, auto_adjust=True)
         if len(t10) == 0:
             return 0.0
-        yield_10y = float(t10["Close"].dropna().iloc[-1]) / 100.0
+        c10 = _closes("^TNX", "5d")
+        if c10 is None:
+            return 0.0
+        yield_10y = _scalar(c10) / 100.0
         spy_info = yf.Ticker("SPY").info or {}
         pe = spy_info.get("trailingPE") or spy_info.get("forwardPE")
         if pe and float(pe) > 0:
@@ -179,13 +208,15 @@ def _fetch_earnings_yield_spread() -> float:
 
 def _fetch_credit_spread() -> float:
     try:
-        hyg = yf.download("HYG", period="30d", interval="1d", progress=False, auto_adjust=True)["Close"].dropna()
-        lqd = yf.download("LQD", period="30d", interval="1d", progress=False, auto_adjust=True)["Close"].dropna()
-        if len(hyg) < 5 or len(lqd) < 5:
+        hyg = _closes("HYG", "30d")
+        lqd = _closes("LQD", "30d")
+        if hyg is None or lqd is None or len(hyg) < 5 or len(lqd) < 5:
             return 0.0
-        ratio     = (hyg / lqd).dropna()
-        n         = min(20, len(ratio) - 1)
-        pct_chg   = (float(ratio.iloc[-1]) / float(ratio.iloc[-(n + 1)]) - 1) * 100
+        ratio = (hyg / lqd).dropna()
+        if len(ratio) < 2:
+            return 0.0
+        n       = min(20, len(ratio) - 1)
+        pct_chg = (_scalar(ratio) / _scalar(ratio, -(n + 1)) - 1) * 100
         return round(pct_chg, 4)
     except Exception as e:
         logger.warning(f"_fetch_credit_spread: {e}")
@@ -196,12 +227,11 @@ def _fetch_pmi_proxy() -> float:
     try:
         scores = []
         for etf in ["IYT", "XLI"]:
-            data = yf.download(etf, period="35d", interval="1d", progress=False, auto_adjust=True)
-            if len(data) < 5:
+            closes = _closes(etf, "35d")
+            if closes is None or len(closes) < 5:
                 continue
-            closes = data["Close"].dropna()
             n = min(20, len(closes) - 1)
-            pct = (float(closes.iloc[-1]) / float(closes.iloc[-(n + 1)]) - 1) * 100
+            pct = (_scalar(closes) / _scalar(closes, -(n + 1)) - 1) * 100
             scores.append(pct)
         return round(sum(scores) / len(scores), 4) if scores else 0.0
     except Exception as e:
@@ -277,7 +307,7 @@ def _hist_pct_change_5d(
         if len(past) < 2:
             return 0.0
         n = min(5, len(past) - 1)
-        pct = (float(past.iloc[-1]) / float(past.iloc[-(n + 1)]) - 1) * 100
+        pct = (_scalar(past) / _scalar(past, -(n + 1)) - 1) * 100
         return round(pct, 4)
     except Exception as e:
         logger.debug(f"_hist_pct_change_5d: {e}")
@@ -292,9 +322,9 @@ def _hist_vix(vix_hist: Optional[pd.DataFrame], as_of: pd.Timestamp) -> tuple[fl
         past = vix_hist[vix_hist.index < as_of]["Close"].dropna()
         if len(past) < 2:
             return 20.0, 0.0
-        vix_now = float(past.iloc[-1])
+        vix_now = _scalar(past)
         n = min(21, len(past) - 1)
-        vix_1m_ago = float(past.iloc[-(n + 1)])
+        vix_1m_ago = _scalar(past, -(n + 1))
         vix_pct_1m = round((vix_now / vix_1m_ago - 1) * 100, 2) if vix_1m_ago > 0 else 0.0
         return round(vix_now, 2), vix_pct_1m
     except Exception as e:
@@ -313,8 +343,8 @@ def _hist_recession_prob(
             y10_s = tnx_hist[tnx_hist.index < as_of]["Close"].dropna()
             y3m_s = irx_hist[irx_hist.index < as_of]["Close"].dropna()
             if len(y10_s) > 0 and len(y3m_s) > 0:
-                y10 = float(y10_s.iloc[-1])
-                y3m_r = float(y3m_s.iloc[-1])
+                y10 = _scalar(y10_s)
+                y3m_r = _scalar(y3m_s)
                 y3m = y3m_r / 100.0 if y3m_r > 10 else y3m_r
                 spread = (y10 - y3m) / 100.0
                 return round(1 / (1 + math.exp(2.5 * spread * 100)), 4)
@@ -336,7 +366,7 @@ def _hist_credit_spread(
             if len(hyg) >= 5 and len(lqd) >= 5:
                 ratio = (hyg / lqd).dropna()
                 n = min(20, len(ratio) - 1)
-                pct = (float(ratio.iloc[-1]) / float(ratio.iloc[-(n + 1)]) - 1) * 100
+                pct = (_scalar(ratio) / _scalar(ratio, -(n + 1)) - 1) * 100
                 return round(pct, 4)
     except Exception as e:
         logger.debug(f"_hist_credit_spread: {e}")
@@ -393,7 +423,7 @@ def get_macro_context_historical(
         if spy_hist is not None and tnx_hist is not None:
             tnx_past = tnx_hist[tnx_hist.index < as_of]["Close"].dropna()
             if len(tnx_past) > 0:
-                yield_10y = float(tnx_past.iloc[-1]) / 100.0
+                yield_10y = _scalar(tnx_past) / 100.0
                 earnings_yield = 1.0 / 20.0  # fallback P/E=20 histórico
                 earnings_yield_spread = round(earnings_yield - yield_10y, 5)
     except Exception as e:

@@ -116,9 +116,23 @@ def _tiingo_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
         params = {"startDate": start_date, "endDate": end_date, "resampleFreq": "daily"}
 
         r = requests.get(url, headers=TIINGO_HEADERS, params=params, timeout=10)
+
         if r.status_code == 404:
-            log.debug(f"[data_feed] Tiingo 404 para {ticker} (ticker não coberto)")
+            log.debug(f"[data_feed] Tiingo 404 para {ticker} (não coberto)")
             return pd.DataFrame()
+
+        if r.status_code == 429:
+            # Rate limit atingido — marcar Tiingo como indisponível para esta
+            # sessão. Sem este flag, TODOS os tickers subsequentes continuam
+            # a tentar Tiingo e a gerar warnings até o limite ser reposto.
+            global _tiingo_rate_limited
+            _tiingo_rate_limited = True
+            log.warning(
+                f"[data_feed] Tiingo 429 rate-limit em {ticker}. "
+                f"A desactivar Tiingo para o resto desta sessão — fallback yfinance."
+            )
+            return pd.DataFrame()
+
         r.raise_for_status()
         data = r.json()
         if not data:
@@ -301,7 +315,10 @@ def get_eod_prices(
     NUNCA lança excepção — devolve DataFrame vazio se todas as fontes falharem.
     """
     try:
-        if not force_yfinance and TIINGO_API_KEY and ticker not in TIINGO_UNSUPPORTED:
+        if (not force_yfinance
+                and TIINGO_API_KEY
+                and not _tiingo_rate_limited
+                and ticker not in TIINGO_UNSUPPORTED):
             df = _tiingo_fetch(ticker, lookback_days)
             if not df.empty:
                 return df
