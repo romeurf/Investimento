@@ -1212,7 +1212,7 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
             if result.returncode == 0:
                 try:
                     import pandas as pd
-                    df_check = pd.read_parquet(pq)
+                    df_check = pd.read_parquet(out_pq)
                     n_90d  = int(df_check["alpha_90d"].notna().sum()) if "alpha_90d" in df_check.columns else 0
                     n_fund = int((df_check.get("gross_margin", pd.Series()) != 0.35).sum()) if "gross_margin" in df_check.columns else 0
                     total  = len(df_check)
