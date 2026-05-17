@@ -1605,6 +1605,46 @@ def run_scan() -> None:
                 _alerted_today.add(sym)
                 save_alerts(_alerted_today)
 
+                # ── Paper trading: regista posição simulada para cada COMPRAR ──
+                # O bot investe "em papel" para medir se bate o mercado sozinho.
+                if verdict == "COMPRAR":
+                    try:
+                        from paper_trading import record_paper_buy
+                        from portfolio import FLIP_FUND_EUR
+                        # Sizing: usa a sugestão do allocation engine ou fallback
+                        paper_amount = float(
+                            decision.amount_eur
+                            if "decision" in dir() and hasattr(decision, "amount_eur") and decision.amount_eur > 0
+                            else FLIP_FUND_EUR * (score / 100.0) * 0.5
+                        )
+                        if paper_amount > 5:
+                            _, strat = calculate_flip_target(
+                                fund, score,
+                                earnings_date=get_earnings_date(sym),
+                                catalyst=None,
+                                spy_change=spy_change,
+                                category=category,
+                            )
+                            # Extrair preço target da estratégia
+                            import re as _re
+                            _m = _re.search(r'\$([0-9.]+)', strat or "")
+                            sell_tgt = float(_m.group(1)) if _m else (fund.get("price", 0) * 1.15 or 0)
+                            _price   = float(fund.get("price", 0) or 0)
+                            _wp      = ml_result.win_prob if ml_result.model_ready else 0.0
+                            if sell_tgt > _price > 0:
+                                record_paper_buy(
+                                    ticker=sym,
+                                    open_price=_price,
+                                    amount_eur=paper_amount,
+                                    sell_target=sell_tgt,
+                                    hold_days=90,
+                                    score_v2=score,
+                                    ml_win_prob=_wp,
+                                    usd_eur=get_usdeur(),
+                                )
+                    except Exception as _pe:
+                        logging.debug(f"[paper] {sym}: {_pe}")
+
                 if verdict == "COMPRAR":
                     comprar_syms.add(sym)
                     add_recovery_position(
@@ -2024,6 +2064,38 @@ def main() -> None:
         run_monthly_retrain,
         CronTrigger(day=1, hour=6, minute=0, timezone=LISBON_TZ),
         id="monthly_retrain", name="Monthly ML Retrain",
+    )
+
+    # ── Paper Trading: update diário de posições abertas (22:50 Lisboa) ───────
+    # Fecha posições que atingiram o target ou esgotaram o hold_days.
+    def _run_paper_update():
+        try:
+            from paper_trading import update_open_positions
+            stats = update_open_positions()
+            if stats.get("updated", 0) > 0:
+                logging.info(f"[paper] Update: {stats}")
+        except Exception as e:
+            logging.warning(f"[paper] Update falhou: {e}")
+
+    scheduler.add_job(
+        _run_paper_update,
+        CronTrigger(day_of_week="mon-fri", hour=22, minute=50, timezone=LISBON_TZ),
+        id="paper_update", name="Paper Trading Update",
+    )
+
+    # ── Paper Performance: relatório mensal (dia 1, 07:00 Lisboa) ─────────────
+    def _run_paper_report():
+        try:
+            from paper_trading import get_monthly_performance, format_performance_report
+            perf = get_monthly_performance(months_back=3)
+            send_telegram(f"📊 Paper Trading — Relatório Mensal\n\n{format_performance_report(perf)}")
+        except Exception as e:
+            logging.warning(f"[paper] Report falhou: {e}")
+
+    scheduler.add_job(
+        _run_paper_report,
+        CronTrigger(day=1, hour=7, minute=0, timezone=LISBON_TZ),
+        id="paper_report", name="Paper Trading Report Mensal",
     )
 
     logging.info("Scheduler iniciado. Jobs activos:")

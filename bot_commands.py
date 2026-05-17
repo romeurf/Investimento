@@ -1749,6 +1749,66 @@ def _handle_admin_set_floor(parts: list[str]) -> None:
     )
     logging.info(f"[admin_set_floor] {result['old']:.4f} → {result['new']:.4f}")
 
+# ── /paper_portfolio ─────────────────────────────────────────────────────────────
+
+def _handle_paper_performance(parts: list[str]) -> None:
+    """/paper_portfolio [meses]
+
+    Mostra a performance do paper trading automatico do bot.
+    O bot simula as suas proprias recomendacoes COMPRAR e mede se bate o SPY.
+
+    Uso:
+      /paper_portfolio        → ultimos 3 meses
+      /paper_portfolio 6      → ultimos 6 meses
+      /paper_portfolio open   → posicoes abertas actuais
+    """
+    def _run():
+        try:
+            from paper_trading import (
+                get_monthly_performance, format_performance_report, _load
+            )
+
+            if len(parts) > 1 and parts[1].lower() == "open":
+                trades  = _load()
+                open_ps = [t for t in trades if t.get("status") == "OPEN"]
+                if not open_ps:
+                    _reply("Sem posicoes de paper trading abertas.")
+                    return
+                lines = [f"Paper portfolio — {len(open_ps)} posicoes abertas:", ""]
+                for t in sorted(open_ps, key=lambda x: x["open_date"], reverse=True)[:15]:
+                    from datetime import date
+                    days = (date.today() - date.fromisoformat(t["open_date"])).days
+                    lines.append(
+                        f"  {t['ticker']}: aberto {t['open_date']} "
+                        f"({days}d) @ {t['open_price']:.2f} "
+                        f"| target {t['sell_target']:.2f} | €{t['amount_eur']:.0f}"
+                    )
+                _reply("\n".join(lines))
+                return
+
+            months = 3
+            if len(parts) > 1:
+                try:
+                    months = int(parts[1])
+                except ValueError:
+                    pass
+
+            perf   = get_monthly_performance(months_back=months)
+            report = format_performance_report(perf)
+            _reply(f"Paper Trading — Bot vs Mercado\n\n{report}")
+
+            # Lista detalhada de trades por mês
+            from paper_trading import format_monthly_trade_list
+            trade_list = format_monthly_trade_list(months_back=months)
+            if trade_list and trade_list != "Sem trades fechados no periodo.":
+                _reply(f"Trades por mes:\n{trade_list}")
+        except Exception as e:
+            logging.error(f"[paper_performance] {e}", exc_info=True)
+            _reply(f"Erro ao calcular paper performance: {e}")
+
+    threading.Thread(target=_run, daemon=True, name="paper-perf").start()
+
+
 # ── /performance ─────────────────────────────────────────────────────────────────
 
 def _handle_performance(parts: list[str]) -> None:
@@ -2712,6 +2772,10 @@ def _handle_command(text: str) -> None:
     elif cmd in ("/performance", "/returns", "/portfolio_performance"):
         if not _check_rate(cmd_key): return
         _handle_performance(parts)
+
+    elif cmd in ("/paper_portfolio", "/paper", "/paper_performance"):
+        if not _check_rate(cmd_key): return
+        _handle_paper_performance(parts)
 
     elif cmd == "/themes":
         if not _check_rate(cmd_key): return
