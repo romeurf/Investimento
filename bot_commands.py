@@ -1,38 +1,60 @@
 """
-bot_commands.py — Comandos Telegram para o DipRadar.
+bot_commands.py — Todos os comandos Telegram do DipRadar.
 
-Comandos disponíveis:
-  /status                  → Estado do bot
-  /carteira                → Snapshot instantâneo da carteira
-  /scan                    → Força scan imediato (só horas de mercado)
-  /analisar <TICK>         → Análise completa de qualquer ticker a pedido
-  /comparar <T1> <T2> ...  → Comparar scores de 2-5 tickers lado-a-lado
+━━━ MERCADO E ANÁLISE ━━━
+  /scan                    → Forçar scan imediato (só horas de mercado)
+  /analisar <TICK>         → Análise completa: score, ML, valuation, sizing
+  /comparar T1 T2 ...      → Comparar scores de 2-5 tickers
   /historico <TICK>        → Histórico de scores registados para um ticker
-  /backtest                → Resumo do backtest de alertas
-  /rejeitados              → Log de rejeitados de hoje
-  /tier3                   → Gems Raras do último resumo de fecho (score ≥80)
-  /watchlist               → Ver watchlist dinâmica actual
-  /watchlist add TICK      → Adicionar ticker à watchlist (suporta IEMA.L, IS3N.AS, ALV.DE, etc.)
-  /watchlist rm TICK       → Remover ticker da watchlist
-  /watchlist clear         → Limpar toda a watchlist dinâmica
-  /flip                    → Ver log e P&L do Flip Fund
-  /flip add TICK ENTRY SHARES [NOTA]   → Registar entrada num trade
-  /flip close ID EXIT                  → Fechar trade pelo ID com preço de saída
-  /flip del ID                         → Apagar trade pelo ID
-  /buy <TICK> <PREÇO> <SHARES> [SCORE] → Registar compra na carteira activa
-  /sell <TICK> <PREÇO> [SHARES]        → Registar venda (parcial ou total)
-  /liquidez [+|-]<VALOR>               → Ver / ajustar saldo disponível
-  /portfolio                           → Resumo das posições activas
-  /mldata                  → Estatísticas da base de dados ML + forçar update de outcomes
-  /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
-  /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
-  /admin_load_models <url> → [ADMIN] Descarregar pickles + ml_report do URL para /data/ (atomic)
-  /admin_retrain [dry-run] → [ADMIN] Disparar retrain ad-hoc (ou dry-run para validar input)
-  /admin_set_floor <valor> → [ADMIN] Ajustar o floor absoluto de promoção (ρ_α mínimo); ex.: /admin_set_floor 0.08
-  /retrigger               → [ADMIN] Alias rápido de /admin_retrain (full, sem dry-run)
-  /health                  → Dashboard de observabilidade (RAM, CPU, latências, last scan)
-  /health errors           → Log dos últimos erros críticos
-  /help                    → Lista de comandos
+  /performance [data][score]→ Retorno anual + risco seguindo o bot
+  /backtest                → Resumo do backtest de alertas recentes
+  /rejeitados              → Stocks analisados e rejeitados hoje
+  /tier3                   → Gems do último resumo de fecho
+
+━━━ TEMAS / TRENDS ━━━
+  /themes                  → Ver temas em trend (fotónica, GLP-1, IA...)
+  /add_theme k l T1,T2 [c] → Adicionar tema (key label TICKERS [confiança])
+  /remove_theme <key>      → Remover tema
+
+━━━ CARTEIRA E POSIÇÕES ━━━
+  /carteira                → Snapshot da carteira em tempo real
+  /portfolio               → Posições activas com P&L
+  /sync_portfolio          → Sincronizar carteira actual via Telegram
+  /buy TICK PREÇO SHARES   → Registar compra
+  /sell TICK PREÇO [SHARES]→ Registar venda (parcial ou total)
+  /liquidez [+|-VALOR]     → Ver / ajustar saldo disponível
+  /allocate <TICKER>       → Sugestão de alocação com sizing e sector check
+
+━━━ FLIP FUND ━━━
+  /flip                    → Log e P&L do Flip Fund
+  /flip add T E S [NOTA]   → Registar entrada (ticker, entry, shares)
+  /flip close ID EXIT      → Fechar trade com preço de saída
+  /flip del ID             → Apagar trade
+
+━━━ WATCHLIST ━━━
+  /watchlist               → Estado da watchlist pessoal
+  /watchlist add TICKER    → Adicionar ticker
+  /watchlist rm TICKER     → Remover ticker
+  /watchlist clear         → Limpar watchlist dinâmica
+
+━━━ ML E RETREINO ━━━
+  /mldata                  → Estatísticas da base de dados ML
+  /mldata update           → Forçar update de outcomes
+  /ml_accuracy             → Precisão real do modelo vs outcomes reais
+  /admin_retrain [dry-run] → Disparar retreino ad-hoc
+  /retrigger               → Alias de /admin_retrain (sem flags)
+  /admin_regen_parquet [--targets-only] → Regenerar parquet (EDGAR PIT + alpha_90d)
+  /admin_set_floor <valor> → Ajustar floor de IC mínimo para promoção (ex: 0.08)
+  /admin_backfill_ml       → Semear histórico de dips (5 anos) no training set
+  /admin_load_models <url> → Carregar bundle ML de URL externo
+
+━━━ SISTEMA E DIAGNÓSTICO ━━━
+  /status                  → Estado do bot + mercado + modelo
+  /health                  → Dashboard: RAM, CPU, APIs, drift
+  /health errors           → Últimos erros críticos
+  /admin_check_config      → Verificar env vars críticas em falta
+  /admin_test_feed TICKER  → Testar pipeline de dados para um ticker
+  /help                    → Lista completa de comandos
 """
 
 import os
@@ -1132,6 +1154,116 @@ def _handle_admin_test_feed(parts: list[str]) -> None:
         _reply("\n".join(lines))
 
     threading.Thread(target=_run, daemon=True, name="test-feed").start()
+
+
+# ── /sync_portfolio ──────────────────────────────────────────────────────────────
+
+def _handle_sync_portfolio(parts: list[str]) -> None:
+    """/sync_portfolio — sincroniza a carteira actual via Telegram.
+
+    Uso:
+      /sync_portfolio                         → ver estado actual
+      /sync_portfolio AAPL:10:150 MSFT:5:300  → substituir carteira
+      /sync_portfolio clear                   → limpar override (volta a usar env vars)
+
+    Formato: TICKER:shares:preco_medio_usd
+      Exemplo: /sync_portfolio NVO:25:85.50 ADBE:8:420 CRWD:5:280
+
+    Os dados ficam em /data/portfolio_override.json (persistido no Railway Volume).
+    As env vars HOLDING_* continuam como backup se o override for limpo.
+    """
+    from pathlib import Path
+    import json
+
+    _OVERRIDE_PATH = Path("/data/portfolio_override.json") if Path("/data").exists() \
+        else Path("/tmp/portfolio_override.json")
+
+    # Sem argumentos → mostrar estado actual
+    if len(parts) < 2:
+        if _OVERRIDE_PATH.exists():
+            try:
+                data = json.loads(_OVERRIDE_PATH.read_text(encoding="utf-8"))
+                holdings = data.get("holdings", {})
+                lines = ["Carteira actual (override activo):"]
+                for ticker, pos in sorted(holdings.items()):
+                    lines.append(
+                        f"  {ticker}: {pos['shares']} shares @ ${pos['avg_cost']:.2f}"
+                    )
+                lines.append("")
+                lines.append("Para actualizar: /sync_portfolio TICK:shares:preco ...")
+                lines.append("Para limpar: /sync_portfolio clear")
+                _reply("\n".join(lines))
+            except Exception as e:
+                _reply(f"Erro a ler override: {e}")
+        else:
+            _reply(
+                "Sem override activo — a usar env vars HOLDING_* do Railway.\n\n"
+                "Para sincronizar a tua carteira actual:\n"
+                "/sync_portfolio NVO:25:85.50 ADBE:8:420 CRWD:5:280\n"
+                "(formato: TICKER:shares:preco_medio_usd)"
+            )
+        return
+
+    # Limpar override
+    if parts[1].lower() == "clear":
+        if _OVERRIDE_PATH.exists():
+            _OVERRIDE_PATH.unlink()
+            _reply("Override limpo. A usar env vars HOLDING_* do Railway.")
+        else:
+            _reply("Sem override activo.")
+        return
+
+    # Parsear nova carteira
+    holdings: dict = {}
+    errors: list[str] = []
+    for entry in parts[1:]:
+        try:
+            parts_entry = entry.split(":")
+            if len(parts_entry) < 2:
+                errors.append(f"Formato inválido: {entry} (usa TICKER:shares ou TICKER:shares:preco)")
+                continue
+            ticker     = parts_entry[0].upper().strip()
+            shares     = float(parts_entry[1])
+            avg_cost   = float(parts_entry[2]) if len(parts_entry) > 2 else 0.0
+            holdings[ticker] = {"shares": shares, "avg_cost": avg_cost}
+        except (ValueError, IndexError):
+            errors.append(f"Erro a parsear: {entry}")
+
+    if errors:
+        _reply("Erros:\n" + "\n".join(errors))
+        return
+
+    if not holdings:
+        _reply("Nenhuma posição válida. Formato: TICKER:shares:preco_medio_usd")
+        return
+
+    # Guardar override
+    try:
+        _OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "holdings":   holdings,
+            "updated_at": datetime.now().isoformat(),
+            "updated_by": "telegram_sync",
+        }
+        _OVERRIDE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        lines = ["Carteira actualizada:"]
+        for ticker, pos in sorted(holdings.items()):
+            lines.append(f"  {ticker}: {pos['shares']} shares @ ${pos['avg_cost']:.2f}")
+        lines.append("")
+        lines.append(f"Guardado em {_OVERRIDE_PATH}")
+        lines.append("Activo a partir de agora. Para limpar: /sync_portfolio clear")
+        _reply("\n".join(lines))
+
+        # Recarregar a carteira em portfolio.py (se suportado)
+        try:
+            import portfolio as _pf
+            _pf._reload_from_override(_OVERRIDE_PATH)
+        except Exception:
+            pass  # reload opcional
+
+    except Exception as e:
+        _reply(f"Erro ao guardar override: {e}")
 
 
 # ── /ml_accuracy ─────────────────────────────────────────────────────────────────
@@ -2555,6 +2687,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd in ("/admin_test_feed", "/test_feed"):
         _handle_admin_test_feed(parts)
+
+    elif cmd in ("/sync_portfolio", "/sync"):
+        _handle_sync_portfolio(parts)
 
     elif cmd in ("/admin_check_config", "/check_config"):
         _handle_admin_check_config()

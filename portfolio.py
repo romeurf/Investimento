@@ -79,7 +79,44 @@ FLIP_FUND_EUR: float = (
 )
 
 # ─────────────────────────────────────────────────────────────────────────
-# HOLDINGS — lê env vars com o padrão HOLDING_<TICKER>=shares,avg_cost
+# Portfolio override — /sync_portfolio persiste aqui, tem precedência sobre env vars
+# ─────────────────────────────────────────────────────────────────────────
+
+_OVERRIDE_PATH = (
+    Path("/data/portfolio_override.json")
+    if Path("/data").exists()
+    else Path("/tmp/portfolio_override.json")
+)
+_override_holdings: list[tuple[str, float, float]] = []  # cache em memória
+
+
+def _load_override() -> list[tuple[str, float, float]]:
+    """Lê o override de carteira gerado por /sync_portfolio."""
+    if not _OVERRIDE_PATH.exists():
+        return []
+    try:
+        import json
+        data = json.loads(_OVERRIDE_PATH.read_text(encoding="utf-8"))
+        result = []
+        for ticker, pos in data.get("holdings", {}).items():
+            result.append((ticker, float(pos.get("shares", 0)), float(pos.get("avg_cost", 0))))
+        return result
+    except Exception as e:
+        log.warning(f"[portfolio] Erro a ler override: {e}")
+        return []
+
+
+def _reload_from_override(path=None) -> None:
+    """Chamado por /sync_portfolio para actualizar a cache em memória sem restart."""
+    global _override_holdings, HOLDINGS
+    _override_holdings = _load_override()
+    if _override_holdings:
+        HOLDINGS = _override_holdings
+        log.info(f"[portfolio] Override activo: {len(HOLDINGS)} posições")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# HOLDINGS — override (/sync_portfolio) tem precedência sobre env vars
 # ─────────────────────────────────────────────────────────────────────────
 
 def _parse_holdings_env() -> list[tuple[str, float, float]]:
@@ -107,7 +144,11 @@ def _parse_holdings_env() -> list[tuple[str, float, float]]:
 
 
 # Variáveis públicas exigidas pelo main.py
-HOLDINGS: list[tuple[str, float, float]] = _parse_holdings_env()
+# Override de /sync_portfolio tem precedência sobre env vars HOLDING_*
+_override_holdings = _load_override()
+HOLDINGS: list[tuple[str, float, float]] = _override_holdings if _override_holdings else _parse_holdings_env()
+if _override_holdings:
+    log.info(f"[portfolio] Override /sync_portfolio activo: {len(HOLDINGS)} posicoes")
 PPR_SHARES   = _float_env("PPR_SHARES")
 PPR_AVG_COST = _float_env("PPR_AVG_COST")
 
