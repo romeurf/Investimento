@@ -70,7 +70,7 @@ from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCH
 from alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
 from position_monitor import run_daily_check
-from momentum_scanner import scan_momentum_universe, format_momentum_alert
+from momentum_scanner import scan_momentum_universe, format_momentum_alert, clear_sector_cache
 
 # Chunk 3a — data feed
 from data_feed import get_eod_prices, get_latest_price, is_tiingo_available
@@ -1991,13 +1991,18 @@ def run_momentum_scan() -> None:
     """Corre o scanner de momentum e envia alertas ao Telegram.
 
     Separado do scan de dips: procura stocks em subida forte com confirmação
-    de volume (Micron, NOW, SanDisk, etc.). Corre às 21h30 após fecho US.
+    de volume (Micron, NOW, SanDisk, etc.).
+
+    Schedule (registado no APScheduler):
+      17h50 Lisboa — janela EU (após fecho europeu 17h30)
+      21h30 Lisboa — janela US (após fecho americano ~22h inverno/21h verão)
     """
     try:
         from paper_trading import (
             record_momentum_paper_buy, allocate_capital_unified,
             _get_monthly_budget, _capital_used_this_month,
         )
+        clear_sector_cache()  # reset entre scans EU e US para evitar dados stale
         logging.info("[momentum] A iniciar scan de momentum...")
         candidates = scan_momentum_universe(min_score=62.0, max_results=5)
         if not candidates:
@@ -2194,11 +2199,17 @@ def main() -> None:
         id="scan_us", name="Scan US 21h15",
     )
 
-    # ── Momentum scan: 21h30 Lisboa, seg-sex (após fecho US) ─────────────────
+    # ── Momentum scan EU: 17h50 Lisboa (após fecho europeu 17h30) ────────────
+    scheduler.add_job(
+        run_momentum_scan,
+        CronTrigger(day_of_week="mon-fri", hour=17, minute=50, timezone=LISBON_TZ),
+        id="momentum_scan_eu", name="Momentum Scan EU 17h50",
+    )
+    # ── Momentum scan US: 21h30 Lisboa (após fecho americano) ────────────────
     scheduler.add_job(
         run_momentum_scan,
         CronTrigger(day_of_week="mon-fri", hour=21, minute=30, timezone=LISBON_TZ),
-        id="momentum_scan", name="Momentum Scan 21h30",
+        id="momentum_scan_us", name="Momentum Scan US 21h30",
     )
 
     # ── Stress check: cada 30 min, 14h30-22h30 Lisboa, seg-sex ────────────────

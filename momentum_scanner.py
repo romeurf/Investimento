@@ -107,21 +107,41 @@ def _calc_momentum_signals(hist: pd.DataFrame) -> dict:
     }
 
 
-def _sector_return_20d(sector: str, macro_cache: dict | None = None) -> float:
-    """Retorno do ETF sectorial nos últimos 20 dias."""
+# Cache por sector para o scan completo: sem cache, cada candidato que passa os filtros
+# faz uma chamada API ao ETF do seu sector — 50 candidatos em 5 sectores = 50 chamadas
+# em vez de 5. O cache é por instância de scan (dict mutável como default arg é intencional).
+_SECTOR_ETF_CACHE: dict[str, float] = {}
+
+
+def _sector_return_20d(sector: str, _cache: dict = _SECTOR_ETF_CACHE) -> float:
+    """Retorno do ETF sectorial nos últimos 20 dias.
+
+    Cache de sessão: cada ETF é descarregado apenas uma vez por scan completo.
+    11 sectores = máximo 11 chamadas, independentemente do número de candidatos.
+    """
+    if sector in _cache:
+        return _cache[sector]
+
     from ml_training.config import SECTOR_ETF
     from data_feed import get_eod_prices
     etf = SECTOR_ETF.get(sector, "SPY")
+    result = 0.0
     try:
         df = get_eod_prices(etf, lookback_days=30)
-        if df is None or df.empty or "Close" not in df.columns:
-            return 0.0
-        close = df.set_index(pd.to_datetime(df["date"]))["Close"].sort_index() if "date" in df.columns else df["Close"]
-        if len(close) >= 21:
-            return float(close.iloc[-1] / close.iloc[-21] - 1)
-    except Exception:
-        pass
-    return 0.0
+        if df is not None and not df.empty and "Close" in df.columns:
+            close = df.set_index(pd.to_datetime(df["date"]))["Close"].sort_index() if "date" in df.columns else df["Close"]
+            if len(close) >= 21:
+                result = float(close.iloc[-1] / close.iloc[-21] - 1)
+    except Exception as e:
+        log.debug(f"[momentum] sector ETF {etf} falhou: {e}")
+
+    _cache[sector] = result
+    return result
+
+
+def clear_sector_cache() -> None:
+    """Limpa o cache de ETFs sectoriais. Chamar entre scans se necessário."""
+    _SECTOR_ETF_CACHE.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

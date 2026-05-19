@@ -300,8 +300,10 @@ def _classify_trigger(
         record.trailing_high = _trailing_high
 
         if _trailing_high > 0 and record.days_held >= 3:
-            # Calcular ATR-based stop via price_history
-            _atr_stop_pct = float(os.getenv("MOMENTUM_TRAILING_STOP_PCT", "0.12"))  # fallback
+            # ATR-based trailing stop: adapta-se à volatilidade real do stock.
+            _fallback_pct = float(os.getenv("MOMENTUM_TRAILING_STOP_PCT", "0.12"))
+            _atr_stop_pct = None  # None = ATR não calculado ainda
+            _atr_source   = "fallback"
             try:
                 import yfinance as _yf
                 import pandas as _pd
@@ -314,9 +316,19 @@ def _classify_trigger(
                     _atr = float(_tr.iloc[-14:].mean())
                     _price = float(_hist_m["Close"].iloc[-1])
                     if _price > 0 and _atr > 0:
-                        _atr_stop_pct = max(2.5 * _atr / _price, 0.08)  # 2.5×ATR, min 8%
-            except Exception:
-                pass
+                        _atr_stop_pct = max(2.5 * _atr / _price, 0.08)
+                        _atr_source   = f"ATR({_atr:.2f}/{_price:.2f}={_atr/_price*100:.1f}%)"
+            except Exception as _atr_err:
+                logger.warning(
+                    f"[monitor] {record.ticker}: ATR não calculável ({_atr_err}) "
+                    f"— trailing stop usa FALLBACK {_fallback_pct*100:.0f}% "
+                    f"(env MOMENTUM_TRAILING_STOP_PCT). Verifica yfinance."
+                )
+
+            if _atr_stop_pct is None:
+                _atr_stop_pct = _fallback_pct  # aplicar fallback SÓ após log explícito
+
+            logger.debug(f"[monitor] {record.ticker} trailing stop: {_atr_source} → {_atr_stop_pct*100:.1f}% (high={_trailing_high:.2f})")
 
             _stop_price = _trailing_high * (1 - _atr_stop_pct)
             if current_price < _stop_price:
