@@ -108,26 +108,19 @@ def migrate_schema() -> bool:
             f"A arquivar e recriar limpo."
         )
 
-        # Recuperar linhas de QUALQUER schema anterior.
-        # Estratégia tolerante: para cada linha, tentar mapear campos pelo nome
-        # (usando o header que estava no CSV quando foi escrita). Se a linha
-        # tem mais campos que o header, truncar. Se tem menos, preencher com "".
-        # Isto lida com corrupção onde linhas têm campo counts inconsistentes.
+        # Recuperar apenas linhas que correspondem ao schema actual.
+        # Linhas com campo count diferente (corrupção, schema antigo) são descartadas.
+        # Dados velhos ou corrompidos não têm lugar no pipeline — limpar é a política correcta.
         recovered: list[dict] = []
+        discarded  = 0
         for row in all_rows:
-            if len(row) == n_target and not current_header:
+            if len(row) == n_target:
                 recovered.append(dict(zip(_FIELDS, row)))
-            elif current_header:
-                # Usar o header conhecido para mapear, depois projectar em _FIELDS
-                # Truncar linhas com campos extra (evita IndexError no zip)
-                row_trimmed = row[:len(current_header)]
-                row_padded  = row_trimmed + [""] * (len(current_header) - len(row_trimmed))
-                old_dict    = dict(zip(current_header, row_padded))
-                new_dict    = {f: old_dict.get(f, "") for f in _FIELDS}
-                recovered.append(new_dict)
-            elif len(row) >= n_target:
-                # Sem header mas linha suficientemente longa — tentar recuperar directa
-                recovered.append(dict(zip(_FIELDS, row[:n_target])))
+            else:
+                discarded += 1
+
+        if discarded:
+            logging.info(f"[alert_db] {discarded} linhas descartadas (schema incompatível)")
 
         # Recriar CSV limpo com schema correcto
         with _DB_PATH.open("w", newline="", encoding="utf-8") as f:

@@ -70,8 +70,36 @@ def _header_fields() -> list[str]:
     return _HEADER_FIELDS_CACHE
 
 
+def _validate_or_reset() -> None:
+    """Verifica se o ficheiro tem o schema correcto. Se não, apaga e recria limpo.
+
+    Ficheiros com schema antigo ou corrompidos são removidos.
+    Diagnósticos de produção recomeçam do zero — dados inválidos não têm valor.
+    """
+    if not PREDICTIONS_PATH.exists():
+        return
+    try:
+        with PREDICTIONS_PATH.open("r", encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f), [])
+        expected = _header_fields()
+        if header == expected:
+            return  # schema correcto — nada a fazer
+        log.warning(
+            f"[prediction_log] Schema desactualizado "
+            f"({len(header)} campos vs {len(expected)} esperados) — a apagar e recriar."
+        )
+        PREDICTIONS_PATH.unlink()
+    except Exception as e:
+        log.warning(f"[prediction_log] Falha ao validar schema: {e} — a apagar.")
+        try:
+            PREDICTIONS_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _ensure_header() -> None:
-    """Cria o ficheiro com cabeçalho se não existir."""
+    """Valida schema e cria o ficheiro com cabeçalho se não existir."""
+    _validate_or_reset()
     if PREDICTIONS_PATH.exists():
         return
     try:
@@ -79,6 +107,7 @@ def _ensure_header() -> None:
         with PREDICTIONS_PATH.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=_header_fields())
             writer.writeheader()
+        log.info(f"[prediction_log] Criado: {PREDICTIONS_PATH}")
     except Exception as e:
         log.warning(f"[prediction_log] init falhou: {e}")
 
@@ -152,7 +181,7 @@ def compute_ml_accuracy() -> dict:
         return {"skipped": True, "reason": "predictions log nao encontrado"}
     try:
         import pandas as pd
-        df = pd.read_csv(PREDICTIONS_PATH, on_bad_lines="skip")
+        df = pd.read_csv(PREDICTIONS_PATH)
         required = ["win_prob", "outcome_label"]
         if not all(c in df.columns for c in required):
             return {"skipped": True, "reason": "colunas em falta"}
@@ -165,8 +194,7 @@ def compute_ml_accuracy() -> dict:
         if len(resolved) < 10:
             return {"skipped": True, "reason": f"apenas {len(resolved)} outcomes resolvidos (min 10)"}
 
-        # Mapear outcome_label → binário (suporta labels antigos e novos)
-        _WIN_LABELS = {"WIN_40", "WIN_20", "WIN_STRONG", "WIN"}
+        _WIN_LABELS = {"WIN_STRONG", "WIN"}
         resolved["actual_win"] = resolved["outcome_label"].isin(_WIN_LABELS).astype(int)
         resolved["predicted_win"] = (resolved["win_prob"].astype(float) > 0.55).astype(int)
 
