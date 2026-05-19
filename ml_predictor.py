@@ -495,19 +495,18 @@ def ml_score(
         logging.error(f"[ml_predictor] Erro na inferência v3: {e}")
         return MLResult(model_ready=False, label="ERROR")
 
-    # Sector model blend: se o bundle tiver modelos sectoriais, blendamos
-    # 70% global + 30% sector. O sector model especializa-se na dinâmica
-    # do seu grupo (ex: RSI + FCF dominam em Tech, macro domina em Financials).
+    # Sector model: se existir modelo treinado para este sector, usa-o
+    # exclusivamente. O modelo global serve de fallback para sectores sem
+    # dados suficientes (< 150 rows históricos) ou sector "Unknown".
     _sector_models = (_bundle.get("sector_models") or {}) if _bundle else {}
     _stock_sector  = str(features.get("sector") or "Unknown")
     _sector_entry  = _sector_models.get(_stock_sector)
     if _sector_entry is not None:
         try:
-            _sector_pred = float(_sector_entry["model"].predict(X)[0])
-            _sector_pred = _inverse_transform_up(_sector_pred)
-            pred_up = 0.70 * pred_up + 0.30 * _sector_pred
+            _sector_raw  = float(_sector_entry["model"].predict(X)[0])
+            pred_up      = _inverse_transform_up(_sector_raw)
         except Exception as _se:
-            logging.debug(f"[ml_predictor] sector model '{_stock_sector}' falhou: {_se}")
+            logging.debug(f"[ml_predictor] sector model '{_stock_sector}' falhou, a usar global: {_se}")
 
     # Score = alpha_90d previsto (log-return excess sobre SPY).
     score = float(pred_up)

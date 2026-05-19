@@ -324,10 +324,7 @@ def build_sector_model_configs(
     """
     from ml_training.config import SECTOR_ETF
     return {
-        sector: {
-            "factory": ridge_factory,
-            "feats":   feature_cols,
-        }
+        sector: {"factory": ridge_factory}
         for sector in SECTOR_ETF
         if sector != "Unknown"
     }

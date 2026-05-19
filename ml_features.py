@@ -106,13 +106,6 @@ FEATURE_COLUMNS: list[str] = [
 # 5.0 no parquet por bug do bootstrap; agora é computada de alert_date.dt.month).
 # Veja PR #25 para a remoção anterior (7 features ruidosas adicionadas em PR #23).
 
-LABEL_COLUMNS: list[str] = [
-    "label_win",
-    "label_further_drop",
-    "label_upside_10_90d",
-    "label_downside_15_20d",
-]
-
 N_FEATURES = len(FEATURE_COLUMNS)
 
 _SECTOR_FAIR_PE: dict[str, float] = {
