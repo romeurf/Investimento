@@ -494,3 +494,332 @@ def format_performance_report(perf: dict) -> str:
         lines.append(f"\n{n_open} posicoes ainda abertas a aguardar fecho.")
 
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Momentum Paper Trading
+# ─────────────────────────────────────────────────────────────────────────────
+# Usa o mesmo _TRADES_FILE mas com trade_type="MOMENTUM".
+# Exit por trailing stop (não target fixo).
+
+_MOMENTUM_TRAILING_STOP = float(os.environ.get("MOMENTUM_TRAILING_STOP_PCT", "0.12"))
+_MOMENTUM_HOLD_DAYS     = 60   # momentum fades faster than dips
+
+
+def record_momentum_paper_buy(
+    ticker:       str,
+    open_price:   float,
+    amount_eur:   float,
+    momentum_score: float = 0.0,
+    usd_eur:      float   = _USD_EUR_DEFAULT,
+) -> str:
+    """Regista posição simulada de momentum quando o scanner gera alerta.
+
+    A saída é por trailing stop (-12% do máximo), não por target fixo.
+    O capital é partilhado com os dip trades — usa o mesmo orçamento mensal.
+    """
+    if open_price <= 0 or amount_eur <= 0:
+        return ""
+
+    monthly_budget = _get_monthly_budget()
+    capital_used   = _capital_used_this_month()
+    remaining      = monthly_budget - capital_used
+
+    if remaining <= 20:
+        log.info(f"[paper_m] SKIP {ticker} — orçamento esgotado (usado €{capital_used:.0f}/{monthly_budget:.0f})")
+        return ""
+
+    amount_eur = min(amount_eur, remaining)
+    trade_id   = str(uuid.uuid4())[:8]
+    shares     = amount_eur / max(open_price * usd_eur, 0.01)
+
+    trade = {
+        "id":             trade_id,
+        "trade_type":     "MOMENTUM",
+        "ticker":         ticker.upper(),
+        "open_date":      date.today().isoformat(),
+        "open_price":     round(open_price, 4),
+        "amount_eur":     round(amount_eur, 2),
+        "shares":         round(shares, 6),
+        "sell_target":    0.0,            # momentum: sem target fixo
+        "trailing_high":  round(open_price, 4),  # inicializa no preço de entrada
+        "hold_days":      _MOMENTUM_HOLD_DAYS,
+        "status":         "OPEN",
+        "close_date":     None,
+        "close_price":    None,
+        "return_pct":     None,
+        "spy_return_pct": None,
+        "alpha_pct":      None,
+        "momentum_score": round(momentum_score, 1),
+        "budget_used_at_open": round(capital_used + amount_eur, 2),
+        "budget_total":        round(monthly_budget, 2),
+    }
+    trades = _load()
+    trades.append(trade)
+    _save(trades)
+    log.info(f"[paper_m] OPEN {ticker} MOMENTUM €{amount_eur:.0f} @ {open_price:.2f} score={momentum_score:.0f}")
+    return trade_id
+
+
+def update_momentum_positions() -> dict:
+    """Actualiza posições MOMENTUM abertas: trailing stop + timeout.
+
+    Chamado pelo mesmo scheduler que update_open_positions().
+    """
+    trades  = _load()
+    today   = date.today()
+    updated = 0
+
+    for t in trades:
+        if t.get("status") != "OPEN" or t.get("trade_type") != "MOMENTUM":
+            continue
+
+        open_date = date.fromisoformat(t["open_date"])
+        days_held = (today - open_date).days
+
+        if days_held < 3:
+            continue
+
+        current_price = _fetch_close(t["ticker"], today)
+        if current_price is None:
+            continue
+
+        # Actualizar trailing high
+        trailing_high = max(float(t.get("trailing_high") or t["open_price"]), current_price)
+        t["trailing_high"] = round(trailing_high, 4)
+
+        # Trailing stop: fechar se cair >12% do máximo
+        trailing_stop_price = trailing_high * (1 - _MOMENTUM_TRAILING_STOP)
+        hit_trailing = current_price < trailing_stop_price
+        time_up      = days_held >= t["hold_days"]
+
+        if not hit_trailing and not time_up:
+            # Actualizar trailing_high no ficheiro mesmo sem fechar
+            continue
+
+        ret_pct = round((current_price / t["open_price"] - 1) * 100, 3)
+        spy_ret = _fetch_spy_return(open_date, today)
+        alpha   = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
+
+        t["status"]        = "CLOSED_TRAILING_STOP" if hit_trailing else "CLOSED_TIME"
+        t["close_date"]    = today.isoformat()
+        t["close_price"]   = round(current_price, 4)
+        t["return_pct"]    = ret_pct
+        t["spy_return_pct"]= spy_ret
+        t["alpha_pct"]     = alpha
+        updated += 1
+        log.info(
+            f"[paper_m] CLOSED {t['ticker']} {t['status']} "
+            f"ret={ret_pct:.1f}% high={trailing_high:.2f} stop={trailing_stop_price:.2f}"
+        )
+
+    _save(trades)
+    return {"updated": updated}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Relatório Unificado (DipRadar vs MomentumRadar)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REPORTS_FILE = _DATA_DIR / "monthly_reports.json"
+
+
+def _save_monthly_report_snapshot(report: dict) -> None:
+    """Persiste snapshot mensal para consulta histórica comparativa."""
+    try:
+        existing = []
+        if _REPORTS_FILE.exists():
+            existing = json.loads(_REPORTS_FILE.read_text(encoding="utf-8"))
+        month_key = date.today().strftime("%Y-%m")
+        existing = [r for r in existing if r.get("month") != month_key]
+        existing.append({"month": month_key, **report})
+        tmp = _REPORTS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(existing, indent=2, default=str), encoding="utf-8")
+        tmp.replace(_REPORTS_FILE)
+    except Exception as e:
+        log.error(f"[paper] Erro ao guardar report mensal: {e}")
+
+
+def get_unified_monthly_report(months_back: int = 3) -> dict:
+    """Relatório unificado: DipRadar vs MomentumRadar vs SPY.
+
+    Compara alpha gerado por cada módulo para validação contínua.
+    Persiste automaticamente para histórico consultável.
+    """
+    trades  = _load()
+    today   = date.today()
+    cutoff  = today - timedelta(days=months_back * 30)
+
+    closed = [
+        t for t in trades
+        if t.get("status", "").startswith("CLOSED")
+        and t.get("close_date")
+        and date.fromisoformat(t["close_date"]) >= cutoff
+        and t.get("return_pct") is not None
+    ]
+
+    def _stats(subset: list[dict]) -> dict:
+        if not subset:
+            return {"n": 0, "avg_return": 0.0, "avg_spy": 0.0, "avg_alpha": 0.0, "win_rate": 0.0}
+        rets   = [t["return_pct"] for t in subset]
+        spys   = [t["spy_return_pct"] or 0 for t in subset]
+        alphas = [t["alpha_pct"] or 0 for t in subset]
+        wins   = sum(1 for r in rets if r > 0)
+        return {
+            "n":           len(subset),
+            "avg_return":  round(sum(rets) / len(rets), 2),
+            "avg_spy":     round(sum(spys) / len(spys), 2),
+            "avg_alpha":   round(sum(alphas) / len(alphas), 2),
+            "win_rate":    round(wins / len(subset), 3),
+        }
+
+    dip_trades      = [t for t in closed if t.get("trade_type", "DIP") == "DIP"]
+    momentum_trades = [t for t in closed if t.get("trade_type") == "MOMENTUM"]
+
+    report = {
+        "generated_at":  today.isoformat(),
+        "months_back":   months_back,
+        "dip":           _stats(dip_trades),
+        "momentum":      _stats(momentum_trades),
+        "combined":      _stats(closed),
+        "open_dip":      sum(1 for t in trades if t.get("status") == "OPEN" and t.get("trade_type", "DIP") == "DIP"),
+        "open_momentum": sum(1 for t in trades if t.get("status") == "OPEN" and t.get("trade_type") == "MOMENTUM"),
+    }
+    _save_monthly_report_snapshot(report)
+    return report
+
+
+def format_unified_report(months_back: int = 3) -> str:
+    """Formata o relatório comparativo DipRadar vs MomentumRadar para Telegram."""
+    r = get_unified_monthly_report(months_back)
+    dip = r["dip"]
+    mom = r["momentum"]
+    comb = r["combined"]
+
+    def _verdict(alpha: float) -> str:
+        if alpha > 3:   return "BATE O MERCADO"
+        if alpha > 0:   return "ligeiramente acima"
+        if alpha > -3:  return "abaixo do mercado"
+        return "ABAIXO DO MERCADO"
+
+    lines = [
+        f"*Relatório Unificado — últimos {months_back} meses*",
+        "",
+        f"*DipRadar* ({dip['n']} trades | {r['open_dip']} abertas)",
+        f"  Retorno médio : {dip['avg_return']:+.1f}%",
+        f"  SPY período   : {dip['avg_spy']:+.1f}%",
+        f"  Alpha         : {dip['avg_alpha']:+.1f}pp  [{_verdict(dip['avg_alpha'])}]",
+        f"  Win rate      : {dip['win_rate']:.0%}",
+        "",
+        f"*MomentumRadar* ({mom['n']} trades | {r['open_momentum']} abertas)",
+        f"  Retorno médio : {mom['avg_return']:+.1f}%",
+        f"  SPY período   : {mom['avg_spy']:+.1f}%",
+        f"  Alpha         : {mom['avg_alpha']:+.1f}pp  [{_verdict(mom['avg_alpha'])}]",
+        f"  Win rate      : {mom['win_rate']:.0%}",
+        "",
+        f"*Combinado* ({comb['n']} trades)",
+        f"  Alpha total   : {comb['avg_alpha']:+.1f}pp",
+        f"  Win rate      : {comb['win_rate']:.0%}",
+    ]
+
+    # Histórico de reports mensais
+    try:
+        if _REPORTS_FILE.exists():
+            history = json.loads(_REPORTS_FILE.read_text(encoding="utf-8"))
+            if len(history) > 1:
+                lines.append("")
+                lines.append("*Histórico mensal (alpha):*")
+                for snap in sorted(history, key=lambda x: x.get("month", ""))[-6:]:
+                    d = snap.get("dip", {})
+                    m_snap = snap.get("momentum", {})
+                    lines.append(
+                        f"  {snap.get('month','')}:  Dip {d.get('avg_alpha', 0):+.1f}pp  "
+                        f"Mom {m_snap.get('avg_alpha', 0):+.1f}pp"
+                    )
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Capital Arbiter — ranking unificado por alpha_per_day
+# ─────────────────────────────────────────────────────────────────────────────
+
+def score_capital_efficiency(
+    trade_type:   str,     # "DIP" | "MOMENTUM"
+    expected_ret: float,   # pred_up para DIP, estimate para MOMENTUM
+    horizon_days: int,     # 90 para DIP, 30 para MOMENTUM
+    win_prob:     float,   # P(win) do modelo ou estimado do score
+) -> float:
+    """Calcula alpha_per_day esperado para comparar oportunidades DIP vs MOMENTUM.
+
+    Fórmula: win_prob × expected_ret / horizon_days
+    Esta métrica responde: "Quanto alpha esperado por dia de capital alocado?"
+
+    Exemplo:
+      DIP NVDA:  win_prob=0.65, pred_up=0.22, horizon=90 → 0.65×0.22/90 = 0.00159/dia
+      MOM NOW:   win_prob=0.65, expected=0.20, horizon=30 → 0.65×0.20/30 = 0.00433/dia
+      → MOM NOW tem prioridade
+    """
+    if horizon_days <= 0 or expected_ret <= 0:
+        return 0.0
+    return round(win_prob * expected_ret / horizon_days, 6)
+
+
+def rank_opportunities(opportunities: list[dict]) -> list[dict]:
+    """Ordena oportunidades por capital_efficiency (alpha_per_day) descendente.
+
+    Cada oportunidade deve ter:
+      trade_type:   "DIP" | "MOMENTUM"
+      expected_ret: float (pred_up ou estimado do momentum score)
+      horizon_days: int
+      win_prob:     float
+      amount_eur:   float (capital solicitado)
+      ticker:       str
+      + outros campos específicos do tipo
+
+    Retorna a lista ordenada — quem vem primeiro ganha o capital disponível.
+    """
+    for opp in opportunities:
+        opp["alpha_per_day"] = score_capital_efficiency(
+            trade_type   = opp.get("trade_type", "DIP"),
+            expected_ret = float(opp.get("expected_ret", 0)),
+            horizon_days = int(opp.get("horizon_days", 90)),
+            win_prob     = float(opp.get("win_prob", 0.5)),
+        )
+    return sorted(opportunities, key=lambda x: x["alpha_per_day"], reverse=True)
+
+
+def allocate_capital_unified(
+    opportunities: list[dict],
+    available_eur: float,
+    min_position_eur: float = 50.0,
+) -> list[dict]:
+    """Dado um conjunto de oportunidades (DIP + MOMENTUM), aloca capital na ordem óptima.
+
+    Garante que o capital não excede o budget disponível e que posições
+    pequenas demais não são abertas (min_position_eur).
+
+    Retorna lista das oportunidades aprovadas com amount_eur final.
+    """
+    ranked   = rank_opportunities(opportunities)
+    approved = []
+    remaining = available_eur
+
+    for opp in ranked:
+        requested = float(opp.get("amount_eur", 0))
+        if requested <= 0 or remaining < min_position_eur:
+            break
+        allocated = min(requested, remaining)
+        if allocated < min_position_eur:
+            break
+        approved.append({**opp, "amount_eur": round(allocated, 2)})
+        remaining -= allocated
+        log.info(
+            f"[arbiter] {opp['trade_type']} {opp['ticker']} "
+            f"alpha/day={opp['alpha_per_day']:.5f} "
+            f"→ €{allocated:.0f} alocado (restam €{remaining:.0f})"
+        )
+
+    return approved

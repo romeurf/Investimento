@@ -1994,20 +1994,65 @@ def run_momentum_scan() -> None:
     de volume (Micron, NOW, SanDisk, etc.). Corre às 21h30 após fecho US.
     """
     try:
+        from paper_trading import (
+            record_momentum_paper_buy, allocate_capital_unified,
+            _get_monthly_budget, _capital_used_this_month,
+        )
         logging.info("[momentum] A iniciar scan de momentum...")
         candidates = scan_momentum_universe(min_score=62.0, max_results=5)
         if not candidates:
             logging.info("[momentum] Nenhum candidato de momentum hoje.")
             return
+
         header = f"🚀 *Momentum Scanner — {len(candidates)} oportunidade{'s' if len(candidates) > 1 else ''}*\n"
         send_telegram(header)
+
+        # Capital arbiter: dimensionar cada candidato e verificar budget disponível
+        available = _get_monthly_budget() - _capital_used_this_month()
+        opps = []
+        for c in candidates:
+            # Estimar expected_ret a partir do score (score 80 → ~20% em 30d)
+            _exp_ret = min(c["score"] / 100 * 0.30, 0.50)
+            _win_prob = min(0.40 + c["score"] / 100 * 0.35, 0.80)  # score 60→61%, 90→71%
+            opps.append({
+                "trade_type":   "MOMENTUM",
+                "ticker":       c["ticker"],
+                "expected_ret": _exp_ret,
+                "horizon_days": 30,
+                "win_prob":     _win_prob,
+                "amount_eur":   available / max(len(candidates), 1),
+                "_candidate":   c,
+            })
+
+        approved = allocate_capital_unified(opps, available)
+        approved_tickers = {a["ticker"] for a in approved}
+
         for c in candidates:
             try:
                 msg = format_momentum_alert(c)
+                # Indicar se foi aprovado pelo arbiter
+                if c["ticker"] in approved_tickers:
+                    msg += "\n\n_Capital alocado pelo arbiter._"
                 send_telegram(msg)
             except Exception as e:
                 logging.warning(f"[momentum] Erro ao enviar alerta {c.get('ticker')}: {e}")
-        logging.info(f"[momentum] {len(candidates)} alertas enviados.")
+
+        # Paper trading para aprovados
+        usd_eur = get_usdeur() if "get_usdeur" in dir() else 0.92
+        for a in approved:
+            c = a["_candidate"]
+            try:
+                record_momentum_paper_buy(
+                    ticker        = c["ticker"],
+                    open_price    = c["price"],
+                    amount_eur    = a["amount_eur"],
+                    momentum_score= c["score"],
+                    usd_eur       = usd_eur,
+                )
+            except Exception as e:
+                logging.warning(f"[momentum] Paper trade {c['ticker']}: {e}")
+
+        logging.info(f"[momentum] {len(candidates)} alertas enviados, {len(approved)} com capital alocado.")
     except Exception as e:
         logging.error(f"[momentum] Scan falhou: {e}", exc_info=True)
 
@@ -2220,10 +2265,11 @@ def main() -> None:
     # Fecha posições que atingiram o target ou esgotaram o hold_days.
     def _run_paper_update():
         try:
-            from paper_trading import update_open_positions
-            stats = update_open_positions()
-            if stats.get("updated", 0) > 0:
-                logging.info(f"[paper] Update: {stats}")
+            from paper_trading import update_open_positions, update_momentum_positions
+            stats  = update_open_positions()
+            stats2 = update_momentum_positions()
+            if stats.get("updated", 0) + stats2.get("updated", 0) > 0:
+                logging.info(f"[paper] Update dip={stats} momentum={stats2}")
         except Exception as e:
             logging.warning(f"[paper] Update falhou: {e}")
 

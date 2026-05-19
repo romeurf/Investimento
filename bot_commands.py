@@ -2641,6 +2641,15 @@ def _handle_command(text: str) -> None:
         if run_scan_fn:
             threading.Thread(target=run_scan_fn, daemon=True).start()
 
+    elif cmd == "/relatorio":
+        if not _check_rate(cmd_key): return
+        months = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
+        try:
+            from paper_trading import format_unified_report
+            _reply(format_unified_report(months_back=months))
+        except Exception as e:
+            _reply(f"_Erro ao gerar relatório: {e}_")
+
     elif cmd == "/momentum":
         if not _check_rate(cmd_key): return
         _reply("_🚀 A procurar momentum plays... (pode demorar 2-3 min)_")
