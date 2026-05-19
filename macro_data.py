@@ -95,9 +95,16 @@ def _closes(ticker: str, period: str) -> "pd.Series | None":
     data = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
     if data is None or data.empty:
         return None
+    # yfinance ≥0.2.x pode retornar MultiIndex — normalizar para Series de Close
+    if isinstance(data.columns, pd.MultiIndex):
+        price_types = {"Open", "High", "Low", "Close", "Volume"}
+        for lvl in range(data.columns.nlevels):
+            if set(data.columns.get_level_values(lvl)) & price_types:
+                data.columns = data.columns.get_level_values(lvl)
+                break
     col = data["Close"] if "Close" in data.columns else data.iloc[:, 0]
-    if hasattr(col.columns if hasattr(col, "columns") else col, "get_level_values"):
-        # MultiIndex — tomar a primeira sub-coluna
+    # Se ainda for DataFrame (MultiIndex não totalmente colapsado), pegar primeira coluna
+    if isinstance(col, pd.DataFrame):
         col = col.iloc[:, 0]
     s = col.dropna()
     return s if len(s) >= 2 else None

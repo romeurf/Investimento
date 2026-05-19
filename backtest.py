@@ -72,9 +72,9 @@ def _get_price_n_days_ago(symbol: str, n_business_days: int) -> float | None:
     try:
         time.sleep(3)
         hist = yf.Ticker(symbol).history(period="60d", interval="1d")["Close"].dropna()
-        if len(hist) < n_business_days + 1:
+        if len(hist) < n_business_days:
             return None
-        return float(hist.iloc[-(n_business_days + 1)])
+        return float(hist.iloc[-n_business_days])
     except Exception as e:
         logging.warning(f"Backtest price {symbol} -{n_business_days}d: {e}")
         return None

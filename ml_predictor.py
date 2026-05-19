@@ -540,7 +540,7 @@ def ml_score(
 
     # Classificação de stock e sizing — requerem market_cap e quality_score
     # das features (se disponíveis; fallback neutro se não estiverem).
-    mkt_cap_b    = float(enriched.get("market_cap", 0.0) or 0.0) / 1e9
+    mkt_cap_b    = float(min(enriched.get("market_cap", 0.0) or 0.0, 1e13)) / 1e9  # cap 10T para dados corrompidos
     quality_sc   = float(enriched.get("quality_score", 0.0) or 0.0)
     stock_type   = classify_stock_type(mkt_cap_b, quality_sc)
     hold_period  = recommend_hold_period(stock_type, score)

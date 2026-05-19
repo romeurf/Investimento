@@ -587,6 +587,9 @@ def build_training_input(include_snapshot: bool = True,
     # Usa "ticker" como chave canónica (data.py renomeia symbol→ticker)
     dedup_col = "ticker" if "ticker" in merged.columns else "symbol"
     priority = {"bootstrap": 0, "alert_db": 1, "snapshot": 2}
+    _unknown_sources = set(merged["_source"].unique()) - set(priority.keys())
+    if _unknown_sources:
+        log.warning(f"[input] Fontes desconhecidas na prioridade de dedup: {_unknown_sources} — tratadas como bootstrap (0)")
     merged["_prio"] = merged["_source"].map(priority).fillna(0)
     merged = merged.sort_values("_prio").drop_duplicates(
         subset=[dedup_col, "alert_date"], keep="last"

@@ -719,9 +719,12 @@ def run_training(
     log.info(f"[run_training] Target '{_active_target}' resolvido: {len(df)}/{n_pre}")
 
     if "max_drawdown_60d" not in df.columns:
-        # Para compat antiga: cria coluna com NaN (depois é winsorizada)
-        log.warning("[run_training] coluna max_drawdown_60d ausente — usar zeros")
-        df["max_drawdown_60d"] = 0.0
+        # Zeros no target de risco inverte o modelo (aprende que nunca há perdas).
+        # O parquet deve ser regenerado com /admin_regen_parquet antes do retrain.
+        raise ValueError(
+            "Coluna 'max_drawdown_60d' ausente no parquet. "
+            "Corre /admin_regen_parquet para reconstruir o dataset com targets correctos."
+        )
 
     # Robustness: target rank cross-section + sector-neutral
     df = _maybe_apply_rank_target(df, enable=use_rank_target, raw_col=_active_target)

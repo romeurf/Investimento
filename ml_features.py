@@ -420,11 +420,18 @@ def build_features(
             alert_date=alert_date,
         )
         for key, val in signals.items():
-            if key in FEATURE_COLUMNS:
-                features[key] = float(val) if math.isfinite(float(val)) else float("nan")
+            if key not in FEATURE_COLUMNS:
+                continue
+            try:
+                vf = float(val)
+                if math.isfinite(vf):
+                    features[key] = vf
+                # Se NaN: mantém o fallback existente em features[] em vez de substituir por NaN
+                # (o modelo foi treinado em fallbacks, não em NaN)
+            except (TypeError, ValueError):
+                pass
     except Exception as e:
         logger.error(f"build_features[{ticker}]: fundamental_signals falhou: {e}")
-        # Não preencher com fallback — o modelo vê NaN e sabe que faltam dados
 
     return features
 

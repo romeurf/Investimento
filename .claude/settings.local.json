@@ -5,7 +5,9 @@
       "Bash(python -c ' *)",
       "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Romeu\\\\OneDrive\\\\Documentos\\\\GitHub\\\\DipRadar\" -Recurse -Filter \"*.py\")",
       "Bash(Select-Object -ExpandProperty FullName)",
-      "Bash(find \"c:\\\\\\\\Users\\\\\\\\Romeu\\\\\\\\OneDrive\\\\\\\\Documentos\\\\\\\\GitHub\\\\\\\\DipRadar\" -name \"*.py\" -type f)"
+      "Bash(find \"c:\\\\\\\\Users\\\\\\\\Romeu\\\\\\\\OneDrive\\\\\\\\Documentos\\\\\\\\GitHub\\\\\\\\DipRadar\" -name \"*.py\" -type f)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Romeu\\\\OneDrive\\\\Documentos\\\\GitHub\\\\DipRadar\" -Filter \"*.py\" -File)",
+      "Bash(Select-Object FullName)"
     ]
   }
 }

@@ -42,7 +42,9 @@ _MIN_VOLUME_RATIO = 1.40   # 40% acima da média — confirmação institucional
 _RSI_MIN          = 52.0   # acima de 50 = momentum positivo
 _RSI_MAX          = 78.0   # abaixo de 80 = não sobrecomprado
 _MIN_QUALITY      = 0.55   # filtra pumps especulativos
-_MAX_DRAWDOWN_20D = -0.10  # não pode estar a cair (máx -10% em 20d)
+# NOTA: sem restrição de drawdown — o scanner cobre TODOS os stocks com momentum,
+# incluindo aqueles que nunca estiveram em dip (Sandisk, Micron na subida inicial).
+# Stocks em dip E em momentum (recuperação rápida) são capturados para transição DIP→MOMENTUM.
 _MIN_MARKET_CAP_B = 2.0    # em billions USD — liquidez mínima
 
 
@@ -238,18 +240,20 @@ def scan_momentum_universe(
             if "date" in df.columns:
                 df = df.set_index(pd.to_datetime(df["date"])).sort_index()
 
+            # Normalizar nomes de colunas para lowercase (Tiingo vs yfinance diferem)
+            df.columns = [c.capitalize() if c.lower() in ("open","high","low","close","volume","adj close") else c for c in df.columns]
             signals = _calc_momentum_signals(df)
             if not signals:
                 continue
 
-            # Filtros rígidos antes de buscar fundamentais (caro)
+            # Filtros rígidos antes de buscar fundamentais (caro).
+            # Sem filtro de drawdown: o scanner cobre TODOS os stocks em momentum,
+            # incluindo os que nunca estiveram em dip (crescimento contínuo tipo Sandisk).
             if signals["return_20d"] < _MIN_RETURN_20D:
                 continue
             if signals["volume_ratio_20d"] < _MIN_VOLUME_RATIO:
                 continue
             if not (_RSI_MIN <= signals["rsi_14"] <= _RSI_MAX):
-                continue
-            if signals["drawdown_20d"] < _MAX_DRAWDOWN_20D:
                 continue
 
             # Fundamentais

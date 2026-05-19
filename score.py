@@ -804,7 +804,7 @@ def format_score_v2_breakdown(
     d    = result.get("divergence_score", 0.0)
     conf = result["confidence"]
     data_cov = result.get("data_coverage", conf)
-    qual_conf = round(conf / data_cov, 2) if data_cov > 0 else 1.0
+    qual_conf = round(min(conf / data_cov, 1.0), 2) if data_cov > 0 else 1.0
     vt   = result["is_value_trap"]
     skip = result["skip_recommended"]
     miss = result["missing_fields"]

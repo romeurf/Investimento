@@ -205,10 +205,17 @@ def _detect_structural_decline(
     if delta >= 0.30:
         reasons.append(f"Win prob colapsou {delta*100:.0f}pp (entrada → {record.alert_win_prob*100:.0f}%, hoje → {new_win_prob*100:.0f}%)")
 
-    # 2. ML score territory invertido (abaixo de -3%)
-    score_today = float(feature_row_today.get("ml_score_raw", float("nan")))
-    if not __import__("math").isnan(score_today) and score_today < -0.03:
-        reasons.append(f"Modelo prevê alpha negativo ({score_today*100:.1f}%) — tese invertida")
+    # 2. ML score invertido: pred_up < -3% → modelo perdeu completamente a tese
+    # ml_score_raw é o pred_up (alpha_90d previsto) passado no feature_row pelo monitor.
+    score_today = feature_row_today.get("pred_up") or feature_row_today.get("ml_score_raw")
+    if score_today is not None:
+        try:
+            s = float(score_today)
+            import math as _math
+            if _math.isfinite(s) and s < -0.03:
+                reasons.append(f"Modelo prevê alpha negativo ({s*100:.1f}%) — tese invertida")
+        except (TypeError, ValueError):
+            pass
 
     # 3. Recovery estagnada: dias ≥ 45 e P&L ≤ -15%
     pnl = (current_price / record.alert_price - 1) if record.alert_price > 0 else 0.0
@@ -279,7 +286,11 @@ def _classify_trigger(
                 and record.days_held >= 3
                 and current_price < _trailing_high * (1 - _trailing_stop_pct)):
             return TRIGGER_STOP_LOSS  # trailing stop activado
-        # Momentum positions: sem target fixo, sem early alpha — só trailing stop e deterioração
+        # Momentum: sem target fixo, sem early alpha, sem deterioração ML
+        # (o modelo de dip não é calibrado para momentum — usá-lo causaria falsos positivos).
+        # Mas o timeout aplica-se: momentum que não entregou em 60d provavelmente falhou.
+        if record.days_held >= record.current_hold_days:
+            return TRIGGER_TIME_DECAY
         return TRIGGER_ROUTINE
 
     # ── DIP positions ──────────────────────────────────────────────────────
@@ -574,6 +585,11 @@ def _monitor_one(
     new_sell_target = pred.sell_target
     new_hold_days   = max(record.days_held + pred.hold_days, record.current_hold_days)
 
+    # Enriquecer feature_row_today com pred_up para que _detect_structural_decline
+    # possa verificar se o modelo inverteu a tese (criterion 2).
+    if pred.pred_up is not None:
+        feature_row_today["pred_up"] = pred.pred_up
+
     # ── 4. Classify trigger ───────────────────────────────────────────────────
     # Passa feature_row_today para a detecção de deterioração estrutural.
     trigger = _classify_trigger(record, current_price, new_win_prob, feature_row_today)
@@ -637,6 +653,44 @@ def _monitor_one(
             record.moonbag_target      = _moonbag_calc
             record.current_sell_target = _moonbag_calc
             # Posição continua ACTIVA — só fecha ao atingir moonbag_target ou por deterioração
+
+    # ── 6b. DIP → MOMENTUM auto-transition ───────────────────────────────────
+    # Quando EARLY_ALPHA dispara numa posição DIP, verificar se o ticker está
+    # também em momentum (scanner score >= 60). Se sim, em vez de fechar,
+    # converter para MOMENTUM e activar trailing stop.
+    # Racional: o dip recuperou rápido porque havia momentum real por baixo.
+    # Fechar aqui seria perder upside vertical (caso NOW, Micron, etc).
+    _is_early = (trigger == TRIGGER_EARLY_ALPHA)
+    _is_dip   = getattr(record, "position_type", "DIP") == "DIP"
+    if _is_early and _is_dip:
+        _momentum_score = 0.0
+        try:
+            from momentum_scanner import _calc_momentum_signals, score_momentum
+            import yfinance as _yf
+            import pandas as _pd
+            _mhist = _yf.Ticker(record.ticker).history(period="60d", auto_adjust=True)
+            if _mhist is not None and not _mhist.empty:
+                _idx = _pd.DatetimeIndex(_mhist.index)
+                if _idx.tz is not None:
+                    _mhist.index = _idx.tz_convert(None)
+                _msigs = _calc_momentum_signals(_mhist)
+                if _msigs:
+                    _sector = (record.fundamentals_snap or {}).get("sector", "Unknown") if hasattr(record, "fundamentals_snap") else "Unknown"
+                    _fund   = record.fundamentals_snap or {}
+                    _momentum_score, _ = score_momentum(_msigs, _fund)
+        except Exception as _me:
+            logger.debug(f"[monitor] Momentum check {record.ticker}: {_me}")
+
+        if _momentum_score >= 60.0:
+            # Converter DIP → MOMENTUM: activar trailing stop, cancelar target fixo
+            record.position_type    = "MOMENTUM"
+            record.trailing_high    = current_price
+            record.current_hold_days = record.days_held + 60   # 60 dias adicionais de momentum
+            logger.info(
+                f"[monitor] {record.ticker}: DIP → MOMENTUM (early alpha + momentum score {_momentum_score:.0f}). "
+                f"Trailing stop activado, target fixo desactivado."
+            )
+            trigger = TRIGGER_ROUTINE  # não enviar alerta de early alpha, enviar mensagem de transição
 
     # ── 7. Persist ────────────────────────────────────────────────────────────
     position_db.update_record(record)
