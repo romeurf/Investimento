@@ -270,7 +270,20 @@ def _load_alert_db_as_training() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    df = df[df["outcome_label"].notna() & (df["outcome_label"] != "")].copy()
+    # Incluir linhas com outcome_label preenchido OU maduras (>= 92 dias).
+    # Linhas maduras sem outcome_label entram no treino com alpha_90d=NaN;
+    # _compute_alpha_90d_inline() calcula-o via yfinance.
+    # Sem esta condição, alert_db não contribui para treino se Tiingo falhar.
+    _today = pd.Timestamp.now()
+    if "date_iso" in df.columns:
+        _age = (_today - pd.to_datetime(df["date_iso"], errors="coerce")).dt.days
+    elif "alert_date" in df.columns:
+        _age = (_today - pd.to_datetime(df["alert_date"], errors="coerce")).dt.days
+    else:
+        _age = pd.Series(0, index=df.index)
+    _outcome_ok  = df["outcome_label"].notna() & (df["outcome_label"] != "")
+    _mature_mask = _age.fillna(0) >= 92
+    df = df[_outcome_ok | _mature_mask].copy()
     if df.empty:
         return pd.DataFrame()
 

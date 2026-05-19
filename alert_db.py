@@ -289,8 +289,62 @@ def fill_db_outcomes() -> dict:
     Hold Forever nunca recebe label.
     Só actualiza linhas onde os campos ainda estão vazios.
     """
-    from tiingo_client import get_ohlcv, get_price_at, get_mfe_mae
-    from score import CATEGORY_APARTAMENTO, CATEGORY_HOLD_FOREVER
+    from score import CATEGORY_HOLD_FOREVER
+
+    # Tentar Tiingo primeiro; fallback para yfinance se indisponível.
+    # Encapsula o acesso a preços para não abortar toda a função se Tiingo falhar.
+    def _get_candles(symbol: str, start_date, end_date) -> list:
+        try:
+            from tiingo_client import get_ohlcv as _tiingo_ohlcv
+            return _tiingo_ohlcv(symbol, start_date, end_date) or []
+        except Exception:
+            pass
+        try:
+            import yfinance as yf
+            import pandas as pd
+            df_yf = yf.Ticker(symbol).history(
+                start=start_date.isoformat(), end=end_date.isoformat(), auto_adjust=True
+            )
+            if df_yf is None or df_yf.empty:
+                return []
+            idx = pd.DatetimeIndex(df_yf.index)
+            if idx.tz is not None:
+                df_yf.index = idx.tz_convert(None)
+            return [
+                {"date": str(d.date()), "adjClose": float(row["Close"])}
+                for d, row in df_yf.iterrows()
+            ]
+        except Exception as e:
+            logging.debug(f"[fill_db] yfinance fallback falhou para {symbol}: {e}")
+            return []
+
+    def _get_price_at(candles: list, target_date) -> "float | None":
+        try:
+            from tiingo_client import get_price_at as _tiingo_price
+            return _tiingo_price(candles, target_date)
+        except Exception:
+            pass
+        # fallback: procura a data mais próxima no formato {"date": str, "adjClose": float}
+        if not candles:
+            return None
+        import datetime as _dt
+        tgt = target_date if isinstance(target_date, _dt.date) else target_date.date()
+        best = min(
+            candles,
+            key=lambda c: abs((_dt.date.fromisoformat(str(c.get("date", ""))[:10]) - tgt).days)
+            if c.get("date") else 9999,
+            default=None,
+        )
+        if best and best.get("adjClose"):
+            return float(best["adjClose"])
+        return None
+
+    def _get_mfe_mae(candles: list, after_date, price_entry: float, window_days: int):
+        try:
+            from tiingo_client import get_mfe_mae as _tiingo_mfemae
+            return _tiingo_mfemae(candles, after_date=after_date, price_entry=price_entry, window_days=window_days)
+        except Exception:
+            return None, None
 
     if not _DB_PATH.exists():
         logging.info("[fill_db] Ficheiro não existe ainda.")
@@ -343,25 +397,13 @@ def fill_db_outcomes() -> dict:
             continue
 
         if symbol not in sym_cache:
-            try:
-                start   = alert_date - timedelta(days=1)
-                end     = min(today, alert_date + timedelta(days=210))
-                candles = get_ohlcv(symbol, start, end)
-                sym_cache[symbol] = candles
-            except EnvironmentError as e:
-                logging.error(f"[fill_db] {e}")
-                return {
-                    "total": len(rows),
-                    "updated": updated,
-                    "skipped": skipped,
-                    "errors": errors + 1,
-                    "abort_reason": str(e),
-                }
-            except Exception as e:
-                logging.warning(f"[fill_db] Tiingo {symbol}: {e}")
-                sym_cache[symbol] = []
+            start   = alert_date - timedelta(days=1)
+            end     = min(today, alert_date + timedelta(days=210))
+            candles = _get_candles(symbol, start, end)
+            sym_cache[symbol] = candles
+            if not candles:
+                logging.debug(f"[fill_db] Sem candles para {symbol} — a saltar")
                 errors += 1
-                continue
 
         candles = sym_cache[symbol]
         if not candles:
@@ -372,7 +414,7 @@ def fill_db_outcomes() -> dict:
 
         # ── T+1m ─────────────────────────────────────────────────────────────
         if needs_1m and days_elapsed >= 30:
-            p1m = get_price_at(candles, alert_date + timedelta(days=30))
+            p1m = _get_price_at(candles, alert_date + timedelta(days=30))
             if p1m is not None and price_entry > 0:
                 row["price_1m"]  = round(p1m, 4)
                 row["return_1m"] = round((p1m - price_entry) / price_entry * 100, 2)
@@ -380,7 +422,7 @@ def fill_db_outcomes() -> dict:
 
         # ── T+60d ─────────────────────────────────────────────────────────────
         if needs_60d and days_elapsed >= _MIN_DAYS_60D:
-            p60d = get_price_at(candles, alert_date + timedelta(days=60))
+            p60d = _get_price_at(candles, alert_date + timedelta(days=60))
             if p60d is not None and price_entry > 0:
                 row["return_60d"] = round((p60d - price_entry) / price_entry * 100, 2)
                 changed = True
@@ -389,7 +431,7 @@ def fill_db_outcomes() -> dict:
                     from tiingo_client import get_ohlcv as _get_ohlcv, get_price_at as _get_price_at
                     spy_candles = sym_cache.get("SPY")
                     if spy_candles is None:
-                        spy_candles = _get_ohlcv(
+                        spy_candles = _get_candles(
                             "SPY",
                             alert_date - timedelta(days=1),
                             min(today, alert_date + timedelta(days=70)),
@@ -406,13 +448,13 @@ def fill_db_outcomes() -> dict:
 
         # ── T+3m ─────────────────────────────────────────────────────────────
         if needs_3m and days_elapsed >= 90:
-            p3m = get_price_at(candles, alert_date + timedelta(days=91))
+            p3m = _get_price_at(candles, alert_date + timedelta(days=91))
             if p3m is not None and price_entry > 0:
                 row["price_3m"]  = round(p3m, 4)
                 row["return_3m"] = round((p3m - price_entry) / price_entry * 100, 2)
                 changed = True
                 if row.get("mfe_3m") == "":
-                    mfe, mae = get_mfe_mae(
+                    mfe, mae = _get_mfe_mae(
                         candles,
                         after_date=alert_date,
                         price_entry=price_entry,
@@ -425,7 +467,7 @@ def fill_db_outcomes() -> dict:
 
         # ── T+6m ─────────────────────────────────────────────────────────────
         if needs_6m and days_elapsed >= 180:
-            p6m = get_price_at(candles, alert_date + timedelta(days=182))
+            p6m = _get_price_at(candles, alert_date + timedelta(days=182))
             if p6m is not None and price_entry > 0:
                 row["price_6m"]  = round(p6m, 4)
                 row["return_6m"] = round((p6m - price_entry) / price_entry * 100, 2)
