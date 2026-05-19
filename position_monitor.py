@@ -159,6 +159,20 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
         return {}
 
 
+def _calc_rsi_momentum(close: "pd.Series", period: int = 14) -> float:
+    """RSI simples para confirmar reversão de momentum em posições MOMENTUM."""
+    try:
+        import pandas as pd
+        delta = close.diff().dropna()
+        gain  = delta.clip(lower=0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        loss  = (-delta.clip(upper=0)).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        rs    = gain / loss.replace(0, float("nan"))
+        rsi   = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1]) if not rsi.empty else 50.0
+    except Exception:
+        return 50.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Trigger classification
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,18 +291,55 @@ def _classify_trigger(
     _pos_type = getattr(record, "position_type", "DIP")
 
     if _pos_type == "MOMENTUM":
-        # Trailing stop: actualiza o máximo visto e verifica se caiu >12% desse máximo.
-        # Diferente do stop fixo no entry — protege lucros acumulados, não o capital inicial.
+        # Trailing stop ATR-based: adapta-se à volatilidade real do stock.
+        # Um trailing stop fixo de 12% sempre desperdiça 12% do pico — errado.
+        # Com ATR: stock de alta volatilidade (Micron, NOW) tem stop mais largo;
+        # stock de baixa volatilidade tem stop mais apertado.
+        # Safety net mínima: max(ATR-stop, 8%) para protecção extrema.
         _trailing_high = max(getattr(record, "trailing_high", 0.0) or 0.0, current_price)
         record.trailing_high = _trailing_high
-        _trailing_stop_pct = float(os.getenv("MOMENTUM_TRAILING_STOP_PCT", "0.12"))
-        if (_trailing_high > 0
-                and record.days_held >= 3
-                and current_price < _trailing_high * (1 - _trailing_stop_pct)):
-            return TRIGGER_STOP_LOSS  # trailing stop activado
-        # Momentum: sem target fixo, sem early alpha, sem deterioração ML
-        # (o modelo de dip não é calibrado para momentum — usá-lo causaria falsos positivos).
-        # Mas o timeout aplica-se: momentum que não entregou em 60d provavelmente falhou.
+
+        if _trailing_high > 0 and record.days_held >= 3:
+            # Calcular ATR-based stop via price_history
+            _atr_stop_pct = float(os.getenv("MOMENTUM_TRAILING_STOP_PCT", "0.12"))  # fallback
+            try:
+                import yfinance as _yf
+                import pandas as _pd
+                _hist_m = _yf.Ticker(record.ticker).history(period="30d", auto_adjust=True)
+                if _hist_m is not None and len(_hist_m) >= 10:
+                    _h = _hist_m["High"]
+                    _l = _hist_m["Low"]
+                    _c = _hist_m["Close"].shift(1)
+                    _tr = _pd.concat([_h - _l, (_h - _c).abs(), (_l - _c).abs()], axis=1).max(axis=1)
+                    _atr = float(_tr.iloc[-14:].mean())
+                    _price = float(_hist_m["Close"].iloc[-1])
+                    if _price > 0 and _atr > 0:
+                        _atr_stop_pct = max(2.5 * _atr / _price, 0.08)  # 2.5×ATR, min 8%
+            except Exception:
+                pass
+
+            _stop_price = _trailing_high * (1 - _atr_stop_pct)
+            if current_price < _stop_price:
+                # Confirmação por indicador: só dispara se momentum realmente reverteu
+                # (evita saídas em pullbacks normais de 1-2 dias)
+                _momentum_reversed = True
+                try:
+                    import yfinance as _yf2
+                    _hc = _yf2.Ticker(record.ticker).history(period="30d", auto_adjust=True)
+                    if _hc is not None and len(_hc) >= 20:
+                        _closes_m = _hc["Close"]
+                        _ma20 = float(_closes_m.rolling(20).mean().iloc[-1])
+                        _rsi_m = _calc_rsi_momentum(_closes_m)
+                        _below_ma20 = current_price < _ma20
+                        _rsi_weak   = _rsi_m < 48
+                        # Só confirma se RSI fraco OU abaixo da MA20 (não ambos necessários)
+                        _momentum_reversed = _below_ma20 or _rsi_weak
+                except Exception:
+                    pass  # sem confirmação → dispara mesmo assim (safety net)
+
+                if _momentum_reversed:
+                    return TRIGGER_STOP_LOSS  # trailing stop ATR confirmado
+
         if record.days_held >= record.current_hold_days:
             return TRIGGER_TIME_DECAY
         return TRIGGER_ROUTINE
@@ -702,16 +753,29 @@ def _monitor_one(
         msg = _build_take_profit_alert(record, current_price)
 
     elif trigger == TRIGGER_STOP_LOSS:
-        pnl_pct = (current_price / record.alert_price - 1) * 100
-        msg = "\n".join([
-            f"STOP-LOSS atingido — {record.ticker}  [Dia {record.days_held}]",
-            f"Preco caiu {abs(pnl_pct):.1f}% abaixo do entry (limite: {_STOP_LOSS_PCT*100:.0f}%).",
-            "",
-            f"Entry: ${record.alert_price:.2f}  |  Actual: ${current_price:.2f}  |  P&L: {_pct(pnl_pct)}",
-            "",
-            "Acao: Fechar posicao. Proteger capital para proxima oportunidade.",
-            "_O stop-loss existe para que uma posicao errada nao destrua multiplas certas._",
-        ])
+        pnl_pct  = (current_price / record.alert_price - 1) * 100
+        _is_mom  = getattr(record, "position_type", "DIP") == "MOMENTUM"
+        _t_high  = getattr(record, "trailing_high", 0.0) or 0.0
+        if _is_mom and _t_high > 0:
+            _dd_from_peak = (_t_high - current_price) / _t_high * 100
+            msg = "\n".join([
+                f"🛑 *TRAILING STOP — {record.ticker}*  [Dia {record.days_held}]",
+                f"_Momentum revertido: caiu {_dd_from_peak:.1f}% do pico ${_t_high:.2f}, confirmado por RSI/MA20._",
+                "",
+                f"Máximo: ${_t_high:.2f}  |  Actual: ${current_price:.2f}  |  P&L total: {_pct(pnl_pct)}",
+                "",
+                "💡 *Ação:* Fechar posição. O momentum esgotou-se.",
+            ])
+        else:
+            msg = "\n".join([
+                f"STOP-LOSS atingido — {record.ticker}  [Dia {record.days_held}]",
+                f"Preco caiu {abs(pnl_pct):.1f}% abaixo do entry (limite: {_STOP_LOSS_PCT*100:.0f}%).",
+                "",
+                f"Entry: ${record.alert_price:.2f}  |  Actual: ${current_price:.2f}  |  P&L: {_pct(pnl_pct)}",
+                "",
+                "Acao: Fechar posicao. Proteger capital para proxima oportunidade.",
+                "_O stop-loss existe para que uma posicao errada nao destrua multiplas certas._",
+            ])
         record.status       = "CLOSED"
         record.close_reason = "STOP_LOSS"
         record.closed_at    = datetime.utcnow().isoformat()
