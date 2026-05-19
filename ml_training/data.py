@@ -196,6 +196,7 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
         for k, v in price_feats.items():
             if not pd.notna(fv.get(k)) or fv.get(k) == _FALLBACK.get(k, 0.0):
                 fv[k] = v
+        fv["sector"] = sector  # necessário para sector-conditioned features em add_derived_features
         add_derived_features(fv, alert_date=alert_date)
         sec_hist = etf_cache.get(etf)
         sec_slice = sec_hist[sec_hist.index <= alert_date] if sec_hist is not None else None

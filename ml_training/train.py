@@ -557,7 +557,7 @@ def train_full_ensemble(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _maybe_apply_rank_target(
-    df: pd.DataFrame, *, enable: bool = True, raw_col: str = "alpha_60d"
+    df: pd.DataFrame, *, enable: bool = True, raw_col: str = "alpha_90d"
 ) -> pd.DataFrame:
     """Adiciona ``{raw_col}_rank`` cross-section por data."""
     if not enable:
@@ -567,7 +567,7 @@ def _maybe_apply_rank_target(
 
 
 def _maybe_apply_sector_neutral(
-    df: pd.DataFrame, *, enable: bool = True, target_col: str = "alpha_60d"
+    df: pd.DataFrame, *, enable: bool = True, target_col: str = "alpha_90d"
 ) -> pd.DataFrame:
     """Adiciona ``{target_col}_neutral`` e ``{target_col}_neutral_rank``.
 
@@ -862,7 +862,7 @@ def run_training(
         # IC OOF pooled (diagnóstico — não compara com per-fold mean)
         try:
             ensemble_ic_oof = float(
-                spearman_safe(ensemble_oof[valid_mask], df["alpha_60d"].values[valid_mask])
+                spearman_safe(ensemble_oof[valid_mask], df[_active_target].values[valid_mask])
             )
         except Exception:
             ensemble_ic_oof = None
@@ -870,7 +870,7 @@ def run_training(
         # também per-fold mean). Reconstroi-se test masks por fold a partir
         # de fold_specs e calcula-se Spearman dentro de cada fold.
         per_fold_ics: list[float] = []
-        y_alpha_all = df["alpha_60d"].values
+        y_alpha_all = df[_active_target].values
         for k_idx, train_end, purge_end, test_end in fold_specs:
             te_mask = (df["alert_date"] > purge_end) & (df["alert_date"] <= test_end)
             fold_mask = te_mask.values & valid_mask

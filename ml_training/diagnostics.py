@@ -26,7 +26,7 @@ import pandas as pd
 def dataset_health_check(
     df: pd.DataFrame,
     fold_results: list[dict],
-    target_col: str = "alpha_60d_rank",
+    target_col: str = "alpha_90d_rank",
     date_col: str = "alert_date",
     ticker_col: str = "ticker",
     min_alerts: int = 3000,

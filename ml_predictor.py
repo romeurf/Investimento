@@ -1,14 +1,11 @@
 """
 ml_predictor.py — Score v3: regressor dual (model_up + model_down).
 
-Champion: XGB-v2 (37 features, rho_up=0.36, rho_down≈-0.001, topk_pnl=17.9%/60d)
-
-Score final = pred_up (predicted alpha_60d = log-return excess over SPY).
-  → representa o retorno em excesso sobre o SPY esperado nos 60 dias
+Score final = pred_up (predicted alpha_90d = log-return excess over SPY em 90 dias).
+  → representa o excesso de retorno sobre o SPY esperado nos 90 dias
     seguintes ao alerta (escala log-return).
 
-Nota: versões anteriores previam max_return_60d (retorno absoluto). O modelo
-foi retreinado para prever alpha_60d — os thresholds foram recalibrados:
+Thresholds (escala alpha_90d):
   _SCORE_HIGH  = 0.06   alpha > +6pp sobre SPY → WIN_STRONG
   _SCORE_MED   = 0.03   alpha > +3pp sobre SPY → WIN
   _SCORE_FLOOR = 0.01   alpha > +1pp sobre SPY → WEAK
@@ -143,29 +140,13 @@ _BUNDLE_CANDIDATES = [
 ]
 _PKL_V3 = next((p for p in _BUNDLE_CANDIDATES if p.exists()), _BUNDLE_CANDIDATES[0])
 
-# Features esperadas pelo champion v3 (37 features — FEATURE_COLUMNS de ml_features.py)
-# Usado como fallback se o bundle não trouxer feature_cols.
-_FEATURE_COLS: list[str] = [
-    # Stage 0: Macro
-    "macro_score", "vix", "spy_drawdown_5d", "sector_drawdown_5d",
-    # Stage 1: Quality
-    "gross_margin", "de_ratio", "pe_vs_fair", "analyst_upside", "quality_score",
-    # Stage 2: Timing
-    "drop_pct_today", "drawdown_52w", "rsi_14", "atr_ratio", "volume_spike",
-    # Stage 3: Engineered
-    "rsi_oversold_strength", "vix_regime", "pe_attractive",
-    "drop_x_drawdown", "vol_x_drop",
-    # Stage 3b: Momentum
-    "return_1m", "return_3m_pre", "sector_relative", "beta_60d",
-    # Stage 3c: Dislocation
-    "quality_dislocation", "peg_implicit", "relative_drop", "month_of_year",
-    # Stage 3d: Context
-    "sector_alert_count_7d", "days_since_52w_high",
-    # Stage 3e: Short/Earnings
-    "short_interest_ratio", "earnings_surprise_avg",
-    # Stage 3f: Regime
-    "vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d",
-]
+# Features esperadas pelo bundle — importadas de ml_features para evitar duplicação.
+# Se o import falhar (ex: em testes isolados), usa lista vazia e o bundle
+# devolve erro explícito (bundle['feature_cols'] é obrigatório após retrain).
+try:
+    from ml_features import FEATURE_COLUMNS as _FEATURE_COLS
+except Exception:
+    _FEATURE_COLS = []
 
 # Aliases de features — campo externo → nome interno
 _FEATURE_MAP: dict[str, str] = {
@@ -197,24 +178,19 @@ _SCALE_FUNCS: dict[str, Any] = {
     "market_cap_b": lambda v: v / 1e9 if v is not None and float(v) > 1e6 else v,
 }
 
-# ── Thresholds de score (escala: alpha_60d = log-return excess sobre SPY) ────
+# ── Thresholds de score (escala: alpha_90d = log-return excess sobre SPY) ────
 #
-# Calibração (2026-05-08):
-#   O modelo foi retreinado para prever alpha_60d em vez de max_return_60d.
-#   alpha_60d = log1p(stock_close_60d) - log1p(spy_close_60d)
+#   alpha_90d = log1p(stock_close_90d) - log1p(spy_close_90d)
 #
-#   Distribuição típica de alpha_60d no dataset de treino (2015-2024):
-#     p25 ≈ -0.08   mediana ≈ +0.00   p75 ≈ +0.08   p90 ≈ +0.15
+#   Distribuição típica de alpha_90d no dataset de treino (2015-2024):
+#     p25 ≈ -0.10   mediana ≈ +0.00   p75 ≈ +0.10   p90 ≈ +0.18
 #
-#   Thresholds anteriores (para max_return_60d, retorno absoluto):
-#     HIGH=0.10, MED=0.05, FLOOR=0.02
+#   Thresholds (para alpha_90d, excesso sobre SPY):
+#     HIGH  = 0.06  → alpha > +6pp sobre SPY → WIN_STRONG
+#     MED   = 0.03  → alpha > +3pp sobre SPY → WIN
+#     FLOOR = 0.01  → alpha > +1pp sobre SPY → WEAK
 #
-#   Thresholds recalibrados (para alpha_60d, excesso sobre SPY):
-#     HIGH  = 0.06  → alpha > +6pp sobre SPY (top ~15% do dataset)
-#     MED   = 0.03  → alpha > +3pp sobre SPY (top ~35% do dataset)
-#     FLOOR = 0.01  → alpha > +1pp sobre SPY (top ~50% do dataset)
-#
-#   A sigmoide em _score_to_prob é re-ancorada em 0.03 (novo MED) para que
+#   A sigmoide em _score_to_prob é ancorada em 0.03 (MED) para que
 #   win_prob=0.50 corresponda ao break-even alpha vs benchmark.
 _SCORE_HIGH   = 0.06   # pred_up > +6% alpha → WIN_STRONG
 _SCORE_MED    = 0.03   # pred_up > +3% alpha → WIN
@@ -291,18 +267,15 @@ def _classify_vix(vix_value: float | None) -> str:
 
 
 def _score_to_prob(score: float, calibrator: Any | None = None) -> float:
-    """Mapeia o score (= alpha_60d previsto) para uma probabilidade calibrada [0, 1].
+    """Mapeia o score (= alpha_90d previsto) para uma probabilidade calibrada [0, 1].
 
     Se o bundle trouxer um `score_calibrator` (sklearn IsotonicRegression
     ou Platt/LogisticRegression com .predict_proba()), usa-o.
     Caso contrário cai para uma sigmoide ancorada na win threshold de 3%
-    (novo _SCORE_MED), que dá:
+    (_SCORE_MED), que dá:
       score=-0.03 → 0.18   score=0.00 → 0.32
       score=+0.03 → 0.50   score=+0.06 → 0.68   score=+0.09 → 0.82
     Steepness 15 => transição suave em torno de ±3pp de alpha.
-
-    NOTA: ancoragem alterada de 0.05 → 0.03 em 2026-05-08 para reflectir
-    que o target agora é alpha_60d (excesso sobre SPY) e não max_return_60d.
     """
     if calibrator is not None:
         try:
@@ -488,11 +461,11 @@ def ml_score(
     """
     Pontua um dip com o modelo v3 (regressor dual XGB-v2).
 
-    Score = pred_up = alpha_60d previsto = log-return excess sobre SPY.
+    Score = pred_up = alpha_90d previsto = log-return excess sobre SPY em 90d.
       pred_down é mantido em MLResult para diagnóstico mas não entra
       no score (rho_down ≈ 0 → não tem sinal útil).
 
-    Labels (ancorados em alpha_60d — excesso sobre SPY):
+    Labels (ancorados em alpha_90d — excesso sobre SPY):
       WIN_STRONG  — alpha previsto > +6pp  (top ~15% histórico)
       WIN         — alpha previsto > +3pp  (top ~35% histórico)
       WEAK        — alpha previsto > +1pp
