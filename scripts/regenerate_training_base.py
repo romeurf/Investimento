@@ -480,7 +480,7 @@ def _compute_fase5_row(
             pass
         # Earnings call tone
         try:
-            tone = _earnings_tone(ticker, lookback_days=90)
+            tone = _earnings_tone(ticker, lookback_days=90, as_of_date=alert_dt)
             if tone is not None:
                 fv["earnings_call_tone"] = float(tone)
         except Exception:
