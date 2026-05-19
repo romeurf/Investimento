@@ -1973,7 +1973,7 @@ def run_monthly_retrain() -> None:
         for _sname, _sinfo in sorted(_sreport.items()):
             _ic = _sinfo.get("ic_holdout")
             _n  = _sinfo.get("n_train", 0)
-            _ic_str = f"{_ic:.4f}" if _ic is not None and not (isinstance(_ic, float) and __import__('math').isnan(_ic)) else "N/A"
+            _ic_str = f"{_ic:.4f}" if isinstance(_ic, (int, float)) else "N/A"
             lines.append(f"  {_sname}: IC={_ic_str} (n={_n})")
         lines.append("")
 

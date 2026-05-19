@@ -1024,10 +1024,11 @@ def run_training(
         _m_prod = _scfg["factory"]()
         _m_prod.fit(_X_full, _y_full, sample_weight=_sw_full)
 
+        _ic_stored = round(_ic_holdout, 4) if not __import__("math").isnan(_ic_holdout) else None
         _sector_models[_sector_name] = {
             "model":      _m_prod,
             "n_train":    len(_df_sec),
-            "ic_holdout": round(_ic_holdout, 4),
+            "ic_holdout": _ic_stored,
         }
         log.info(
             f"[sector] {_sector_name}: n={len(_df_sec)} | "

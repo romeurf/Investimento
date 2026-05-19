@@ -119,6 +119,19 @@ TARGET_COLS: list[str] = [
     "spy_close_90d",
 ]
 
+# Features Fase 5 que são computadas point-in-time a partir de SEC EDGAR + preços.
+# Nota: short_interest_trend, short_interest_pct, analyst_rating, earnings_beat_rate
+# dependem de dados yfinance que NÃO são PIT → ficam em fallback no treino.
+# Os EDGAR-based são totalmente PIT (filed_date <= alert_date).
+FASE5_COLS: list[str] = [
+    "consecutive_red_days",    # PIT via price_cache
+    "ma_200d_ratio",           # PIT via price_cache
+    "insider_buy_recent",      # PIT via SEC Form 4 (EDGAR)
+    "insider_buy_amount_score",# PIT via SEC Form 4 (EDGAR)
+    "recent_8k_score",         # PIT via SEC 8-K (EDGAR)
+    "earnings_call_tone",      # PIT via SEC 8-K texto (EDGAR)
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # yfinance helpers
@@ -395,6 +408,89 @@ def _compute_alpha_targets_row(
     return result
 
 
+def _compute_fase5_row(
+    row: pd.Series,
+    price_cache: dict[str, pd.DataFrame],
+) -> dict[str, float]:
+    """Computa sinais Fase 5 point-in-time para uma linha do parquet.
+
+    Usa apenas EDGAR (Form 4 e 8-K) e preços — totalmente PIT.
+    yfinance-live signals (short_interest, analyst_rating) não são computados
+    aqui porque não são PIT para dados históricos.
+    """
+    from ml_features import _FALLBACK
+
+    ticker     = str(row["ticker"])
+    alert_date = pd.Timestamp(row["alert_date"])
+    if alert_date.tz is not None:
+        alert_date = alert_date.tz_localize(None)
+    alert_dt   = alert_date.date()
+
+    hist = _slice_history(price_cache.get(ticker), alert_date)
+    fv: dict[str, float] = {k: _FALLBACK.get(k, 0.0) for k in FASE5_COLS}
+
+    # Price-based: PIT via slice já existente
+    if hist is not None and len(hist) >= 2:
+        try:
+            closes = hist["Close"]
+            # consecutive_red_days: dias consecutivos em queda até alert_date
+            rets = closes.pct_change().dropna()
+            if len(rets) > 0:
+                red = 0
+                for r in reversed(rets.values.tolist()):
+                    if r < 0:
+                        red += 1
+                    else:
+                        break
+                fv["consecutive_red_days"] = float(min(red, 30))
+            # ma_200d_ratio: price / MA200 (quão abaixo da média longa)
+            if len(closes) >= 20:
+                ma200 = closes.rolling(200, min_periods=20).mean().iloc[-1]
+                last  = float(closes.iloc[-1])
+                if ma200 > 0:
+                    fv["ma_200d_ratio"] = round(last / float(ma200), 4)
+        except Exception as e:
+            log.debug(f"  fase5 price {ticker}@{alert_dt}: {e}")
+
+    # EDGAR-based: PIT via filed_date <= alert_date (caching por ticker)
+    try:
+        from fundamental_signals import (
+            insider_buy_recent,
+            insider_buy_amount_score,
+            classify_recent_8k,
+            earnings_call_tone as _earnings_tone,
+        )
+        # Form 4 insider buying
+        try:
+            fv["insider_buy_recent"] = float(insider_buy_recent(ticker, lookback_days=30, as_of_date=alert_dt) or 0.0)
+        except Exception:
+            pass
+        try:
+            score, _ = insider_buy_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
+            if score is not None:
+                fv["insider_buy_amount_score"] = float(score)
+        except Exception:
+            pass
+        # 8-K classification
+        try:
+            score_8k = classify_recent_8k(ticker, lookback_days=60, as_of_date=alert_dt)
+            if score_8k is not None:
+                fv["recent_8k_score"] = float(score_8k)
+        except Exception:
+            pass
+        # Earnings call tone
+        try:
+            tone = _earnings_tone(ticker, lookback_days=90)
+            if tone is not None:
+                fv["earnings_call_tone"] = float(tone)
+        except Exception:
+            pass
+    except ImportError as e:
+        log.debug(f"  fase5 EDGAR {ticker}: fundamental_signals não disponível ({e})")
+
+    return {k: fv.get(k, _FALLBACK.get(k, 0.0)) for k in FASE5_COLS}
+
+
 def regenerate(
     in_path: Path,
     out_path: Path,
@@ -403,6 +499,7 @@ def regenerate(
     add_fundamentals: bool = True,
     add_targets: bool = True,
     add_features: bool = True,
+    add_fase5: bool = True,
 ) -> None:
     """Pipeline principal de regeneração."""
     if not in_path.exists():
@@ -497,6 +594,31 @@ def regenerate(
             f"({n_resolved/len(df):.0%})"
         )
 
+    # ── 4. Sinais Fase 5 (EDGAR + preços) — PIT correcto ─────────────────────
+    if add_fase5 and add_features:
+        log.info("[compute] sinais Fase 5 (EDGAR Form4/8-K + preços)...")
+        log.info("  EDGAR calls com cache 30d — rápido em re-runs, ~2-4h primeira vez")
+        fase5_results = []
+        n_edgar = 0
+        t2 = time.time()
+        for i, (_, row) in enumerate(df.iterrows()):
+            r = _compute_fase5_row(row, price_cache)
+            fase5_results.append(r)
+            if r.get("insider_buy_recent", 0.0) != 0.0 or r.get("recent_8k_score", 0.0) != 0.0:
+                n_edgar += 1
+            if (i + 1) % 2000 == 0 or (i + 1) == len(df):
+                log.info(
+                    f"  [fase5] [{i+1:>5}/{len(df)}] edgar_signal={n_edgar} "
+                    f"({n_edgar/(i+1):.0%}) {time.time()-t2:.0f}s"
+                )
+        fase5_df = pd.DataFrame(fase5_results, index=df.index)
+        for col in FASE5_COLS:
+            df[col] = fase5_df[col].values
+        log.info(
+            f"[compute] Fase5: {n_edgar}/{len(df)} linhas com sinal EDGAR "
+            f"({n_edgar/len(df):.0%})"
+        )
+
     # ── Save ──────────────────────────────────────────────────────────────────
     log.info(f"[out] a escrever {out_path}...")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -506,7 +628,7 @@ def regenerate(
 
     # Sanity stats finais
     log.info("[stats] resumo das colunas novas/corrigidas:")
-    for col in NEW_FEATURE_COLS + FUNDAMENTAL_COLS + TARGET_COLS:
+    for col in NEW_FEATURE_COLS + FUNDAMENTAL_COLS + TARGET_COLS + FASE5_COLS:
         if col not in df.columns:
             continue
         s = df[col].dropna()
@@ -535,6 +657,8 @@ def main() -> int:
                    help="Só adiciona/actualiza alpha_90d")
     p.add_argument("--no-fundamentals", action="store_true",
                    help="Pula a fase de fundamentais PIT (mais rápido)")
+    p.add_argument("--no-fase5", action="store_true",
+                   help="Pula sinais Fase 5 EDGAR/preços (mais rápido, usa fallbacks)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -547,23 +671,30 @@ def main() -> int:
     add_fundamentals = not args.no_fundamentals
     add_features     = not args.fundamentals_only and not args.targets_only
     add_targets      = not args.fundamentals_only
+    add_fase5        = not getattr(args, "no_fase5", False)
 
     if args.fundamentals_only:
         add_fundamentals = True
         add_features     = False
         add_targets      = False
+        add_fase5        = False
     if args.targets_only:
         add_fundamentals = False
         add_features     = False
         add_targets      = True
+        add_fase5        = False
 
-    log.info(f"Modo: features={add_features} fundamentais={add_fundamentals} targets={add_targets}")
+    log.info(
+        f"Modo: features={add_features} fundamentais={add_fundamentals} "
+        f"targets={add_targets} fase5={add_fase5}"
+    )
 
     regenerate(
         args.in_path, args.out_path, args.cache_dir, args.start_date,
         add_fundamentals=add_fundamentals,
         add_targets=add_targets,
         add_features=add_features,
+        add_fase5=add_fase5,
     )
     return 0
 
