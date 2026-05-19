@@ -34,8 +34,8 @@ import ml_predictor
 # previsão directa de target nem horizonte óptimo, por isso usamos:
 #   sell_target = price × (1 + DEFAULT_TARGET_PCT)
 #   hold_days   = DEFAULT_HOLD_DAYS
-DEFAULT_TARGET_PCT = 0.15   # +15% recovery target
-DEFAULT_HOLD_DAYS  = 60     # alinhado com o horizonte de treino do v3
+DEFAULT_TARGET_PCT = 0.15   # floor mínimo de target (+15%) quando modelo não disponível
+DEFAULT_HOLD_DAYS  = 90     # alinhado com o horizonte do modelo (alpha_90d)
 
 
 @dataclass
@@ -105,8 +105,16 @@ def predict_dip(
             label       = result.label or "NO_MODEL",
         )
 
-    base_price  = float(current_price) if current_price else 0.0
-    sell_target = base_price * (1.0 + DEFAULT_TARGET_PCT) if base_price > 0 else 0.0
+    base_price = float(current_price) if current_price else 0.0
+    # Target = entry × (1 + alpha_previsto) com floor em DEFAULT_TARGET_PCT.
+    # pred_up é alpha_90d previsto (excesso sobre SPY). Usar como target garante que
+    # o modelo de alta confiança define alvos mais altos (ex: +25% em vez de +15%).
+    # Floor de 15% evita targets demasiado baixos em modelos conservadores.
+    if base_price > 0 and result.pred_up is not None:
+        _target_return = max(float(result.pred_up), DEFAULT_TARGET_PCT)
+    else:
+        _target_return = DEFAULT_TARGET_PCT
+    sell_target = base_price * (1.0 + _target_return) if base_price > 0 else 0.0
 
     return Prediction(
         win_prob    = float(result.win_prob),

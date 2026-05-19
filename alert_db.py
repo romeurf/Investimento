@@ -177,17 +177,17 @@ def _safe_volume_ratio(vol: float | None, avg_vol: float | None) -> float | str:
 
 
 def _resolve_outcome_label(alpha_90d: float) -> str:
-    """Classifica um alerta com base no alpha_90d (excesso sobre SPY em 90 dias).
+    """Classifica um alerta com base no alpha_90d (excesso sobre SPY em 90 dias, em %).
 
-    Thresholds alinhados com os do modelo ML (ml_predictor._SCORE_HIGH/MED):
-      WIN_STRONG : alpha >= +10pp sobre SPY (IC > SCORE_HIGH × 1.5)
-      WIN        : alpha >= +5pp sobre SPY
-      NEUTRAL    : alpha >= -5pp (perdeu menos que o mercado)
-      LOSS       : alpha < -5pp (perdeu mais que o mercado)
+    Thresholds espelham exactamente ml_predictor._SCORE_HIGH e _SCORE_MED (em %):
+      WIN_STRONG : alpha >= +6pp sobre SPY  (espelha _SCORE_HIGH = 0.06)
+      WIN        : alpha >= +3pp sobre SPY  (espelha _SCORE_MED  = 0.03)
+      NEUTRAL    : alpha >= -5pp
+      LOSS       : alpha < -5pp
     """
-    if alpha_90d >= 10.0:
+    if alpha_90d >= 6.0:
         return "WIN_STRONG"
-    elif alpha_90d >= 5.0:
+    elif alpha_90d >= 3.0:
         return "WIN"
     elif alpha_90d >= -5.0:
         return "NEUTRAL"

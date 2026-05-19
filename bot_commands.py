@@ -2641,6 +2641,23 @@ def _handle_command(text: str) -> None:
         if run_scan_fn:
             threading.Thread(target=run_scan_fn, daemon=True).start()
 
+    elif cmd == "/momentum":
+        if not _check_rate(cmd_key): return
+        _reply("_🚀 A procurar momentum plays... (pode demorar 2-3 min)_")
+        def _run_momentum():
+            try:
+                from momentum_scanner import scan_momentum_universe, format_momentum_alert
+                candidates = scan_momentum_universe(min_score=60.0, max_results=5)
+                if not candidates:
+                    _reply("Nenhum momentum play encontrado hoje.")
+                    return
+                _reply(f"🚀 *{len(candidates)} momentum play{'s' if len(candidates)>1 else ''} encontrado{'s' if len(candidates)>1 else ''}:*")
+                for c in candidates:
+                    _reply(format_momentum_alert(c))
+            except Exception as e:
+                _reply(f"_Erro no momentum scan: {e}_")
+        threading.Thread(target=_run_momentum, daemon=True).start()
+
     elif cmd == "/analisar":
         if not _check_rate(cmd_key): return
         if len(parts) < 2:

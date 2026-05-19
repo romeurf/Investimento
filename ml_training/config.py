@@ -12,7 +12,7 @@ PRIMARY_TARGET: str = "alpha_90d"           # excesso de retorno sobre SPY em 90
 RISK_TARGET: str = "max_drawdown_60d"       # drawdown máximo nos primeiros 60d
 
 # Threshold do calibrador: P(alpha_90d > CALIBRATOR_THRESHOLD)
-CALIBRATOR_THRESHOLD: float = 0.07         # 7% de alpha — ligeiramente mais alto que 60d
+CALIBRATOR_THRESHOLD: float = 0.06         # 6% de alpha — alinhado com _SCORE_HIGH em ml_predictor
 
 WINSOR_PCT: float = 0.005
 WINSOR_ABS_LO: float = -0.50

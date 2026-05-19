@@ -96,10 +96,23 @@ class PositionRecord:
     last_checked_date:    Optional[str]          = None
     thesis_health:        str                    = "STRONG"
 
+    # Tipo de posição — determina a estratégia de saída
+    # "DIP": dip recovery → target fixo + moonbag
+    # "MOMENTUM": breakout → trailing stop (sem target fixo)
+    position_type:        str                    = "DIP"
+
+    # Trailing stop para posições MOMENTUM
+    trailing_high:        float                  = 0.0   # preço máximo visto desde entrada
+
     # Alpha inicial previsto pelo ML no momento do alerta (pred_up / alpha_90d).
     # Usado pelo Early Alpha Capture: quando o retorno actual já representa
     # >70% do alpha previsto em menos de metade do tempo, sugere saída parcial.
     initial_pred_alpha:   Optional[float]        = None   # log-return excess SPY
+
+    # Moonbag: quando o primeiro target é atingido, vende 50% e mantém 50%
+    # com um target mais alto. Evita sair completamente de stocks em upside vertical.
+    moonbag_active:       bool                   = False  # True após primeira realização parcial
+    moonbag_target:       float                  = 0.0   # preço alvo para o segundo take profit
 
     # Outcome
     closed_at:            Optional[str]          = None

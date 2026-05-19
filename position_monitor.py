@@ -267,6 +267,22 @@ def _classify_trigger(
       negativo → modelo ganhou confiança → melhoria
     """
     delta = record.alert_win_prob - new_win_prob
+    _pos_type = getattr(record, "position_type", "DIP")
+
+    if _pos_type == "MOMENTUM":
+        # Trailing stop: actualiza o máximo visto e verifica se caiu >12% desse máximo.
+        # Diferente do stop fixo no entry — protege lucros acumulados, não o capital inicial.
+        _trailing_high = max(getattr(record, "trailing_high", 0.0) or 0.0, current_price)
+        record.trailing_high = _trailing_high
+        _trailing_stop_pct = float(os.getenv("MOMENTUM_TRAILING_STOP_PCT", "0.12"))
+        if (_trailing_high > 0
+                and record.days_held >= 3
+                and current_price < _trailing_high * (1 - _trailing_stop_pct)):
+            return TRIGGER_STOP_LOSS  # trailing stop activado
+        # Momentum positions: sem target fixo, sem early alpha — só trailing stop e deterioração
+        return TRIGGER_ROUTINE
+
+    # ── DIP positions ──────────────────────────────────────────────────────
 
     # 1. Preço atingiu o target → realizar lucro
     if current_price >= record.current_sell_target:
@@ -418,16 +434,32 @@ def _build_take_profit_alert(
     current_price: float,
 ) -> str:
     pnl_pct = (current_price / record.alert_price - 1) * 100
-    return "\n".join([
-        f"✅ *TAKE PROFIT — {record.ticker}*  [Dia {record.days_held}]",
-        f"_*{record.ticker}* atingiu o target com {_pct(pnl_pct)} de ganho em {record.days_held} dias. Está na hora de fechar e rodar o capital._",
-        "",
-        f"🎯 Preço actual ${current_price:.2f} atingiu o target ${record.current_sell_target:.2f}",
-        f"📈 P&L estimado: *{_pct(pnl_pct)}* desde alerta (${record.alert_price:.2f})",
-        "",
-        f"💡 *Ação sugerida:* Fecha a posição. Roda o capital.",
-        f"_Win prob final: {record.last_win_prob*100:.0f}% | Holding: {record.days_held} dias_",
-    ])
+    if record.moonbag_active:
+        # Moonbag target também atingido → fechar os restantes 50%
+        return "\n".join([
+            f"🌙 *MOONBAG TARGET — {record.ticker}*  [Dia {record.days_held}]",
+            f"_*{record.ticker}* atingiu o segundo target. Momento de fechar os restantes 50%._",
+            "",
+            f"🎯 Preço ${current_price:.2f} atingiu moonbag target ${record.moonbag_target:.2f}",
+            f"📈 P&L total estimado: *{_pct(pnl_pct)}* desde entrada (${record.alert_price:.2f})",
+            "",
+            f"💡 *Ação:* Fechar os restantes 50% da posição.",
+        ])
+    else:
+        # Primeiro target atingido → vender 50%, activar moonbag com target sector-aware
+        _sector    = (record.fundamentals_snap or {}).get("sector", "") if hasattr(record, "fundamentals_snap") else ""
+        _moonbag_t = record.moonbag_target if record.moonbag_target > 0 else round(current_price * 1.15, 2)
+        return "\n".join([
+            f"✅ *TAKE PROFIT — {record.ticker}*  [Dia {record.days_held}]",
+            f"_*{record.ticker}* atingiu o target. Realizas 50% agora e manténs 50% para mais upside._",
+            "",
+            f"🎯 Target atingido: ${record.current_sell_target:.2f}  |  Preço actual: ${current_price:.2f}",
+            f"📈 P&L: *{_pct(pnl_pct)}* em {record.days_held} dias" + (f"  |  Sector: {_sector}" if _sector else ""),
+            "",
+            f"💡 *Ação:* VENDER 50% agora.",
+            f"🌙 *Moonbag (50% restante):* target ${_moonbag_t:.2f} (ajustado ao sector)",
+            f"_Fecha pelo stop-loss, deterioração ou prazo se não atingir._",
+        ])
 
 
 def _build_time_decay_alert(
@@ -569,10 +601,42 @@ def _monitor_one(
 
     # ── 6. Handle terminal triggers ───────────────────────────────────────────
     if trigger == TRIGGER_TAKE_PROFIT:
-        record.status       = "TAKE_PROFIT"
-        record.close_reason = "TAKE_PROFIT"
-        record.closed_at    = datetime.utcnow().isoformat()
-        record.close_price  = current_price
+        if record.moonbag_active:
+            # Moonbag target atingido → fechar os restantes 50%
+            record.status       = "TAKE_PROFIT"
+            record.close_reason = "MOONBAG_TARGET"
+            record.closed_at    = datetime.utcnow().isoformat()
+            record.close_price  = current_price
+        else:
+            # Primeiro target → vender 50%, activar moonbag, continuar a monitorizar.
+            # O moonbag target é sector-aware: growth tech pode correr mais do que
+            # uma utility. Analistas servem de tecto quando disponíveis.
+            _gain    = record.current_sell_target / record.alert_price - 1 if record.alert_price > 0 else 0.15
+            _sector  = (record.fundamentals_snap or {}).get("sector", "Unknown") if hasattr(record, "fundamentals_snap") else "Unknown"
+            # Multiplicador: growth corre mais, defensive sai mais cedo
+            _MOONBAG_MULT = {
+                "Technology": 2.0, "Healthcare": 1.8, "Communication Services": 1.8,
+                "Consumer Cyclical": 1.5, "Industrials": 1.4, "Financial Services": 1.3,
+                "Financials": 1.3, "Real Estate": 1.2, "Energy": 1.3,
+                "Basic Materials": 1.2, "Consumer Defensive": 1.0, "Utilities": 0.8,
+            }
+            _mult = _MOONBAG_MULT.get(_sector, 1.3)
+            _moonbag_calc = round(current_price * (1 + _gain * _mult), 2)
+            # Analyst target como guia: se disponível e mais alto, usa-o como tecto
+            _analyst_upside = (record.fundamentals_snap or {}).get("analyst_upside") if hasattr(record, "fundamentals_snap") else None
+            if _analyst_upside and record.alert_price > 0:
+                try:
+                    _analyst_target = round(record.alert_price * (1 + float(_analyst_upside)), 2)
+                    # Usa o máximo entre o cálculo sectorial e o target de analistas
+                    # (mas não mais de 2× o target original como protecção)
+                    _max_safe = round(current_price * (1 + _gain * 2.5), 2)
+                    _moonbag_calc = min(max(_moonbag_calc, _analyst_target), _max_safe)
+                except (TypeError, ValueError):
+                    pass
+            record.moonbag_active      = True
+            record.moonbag_target      = _moonbag_calc
+            record.current_sell_target = _moonbag_calc
+            # Posição continua ACTIVA — só fecha ao atingir moonbag_target ou por deterioração
 
     # ── 7. Persist ────────────────────────────────────────────────────────────
     position_db.update_record(record)
